@@ -720,3 +720,69 @@ fn e2_journal_shapes_and_note_order() {
     );
     assert!(journal.audit().is_ok());
 }
+
+/// A failure the agent handled is never retried, even when it was the
+/// run's last step: the attempt that saw it ended ok.
+#[test]
+fn e2_handled_failures_at_the_end_of_a_run_are_not_retried() {
+    let attempts = Rc::new(Cell::new(0));
+    let agent = {
+        let attempts = attempts.clone();
+        move |ctx: &mut Ctx| -> Result<Value, Fault> {
+            let model = ctx
+                .oracle("first")
+                .unwrap_or_else(|_| Value::from("no model"));
+            let attempts = attempts.clone();
+            let tool = ctx
+                .effect("notify", "done", move |_| {
+                    attempts.set(attempts.get() + 1);
+                    Err(Fault::ToolErr("mail server down".into()))
+                })
+                .unwrap_or_else(|e| Value::from(e.to_string()));
+            Ok(Value::from(format!("{model} / {tool}")))
+        }
+    };
+    let rt = Runtime::in_memory(failing_on(3, &[1]));
+    let recorded = rt.run("handled-end", agent.clone()).unwrap();
+    assert_eq!(
+        recorded.output.as_str(),
+        "no model / tool error: mail server down"
+    );
+    let resumed = rt.resume("handled-end", agent.clone()).unwrap();
+    assert_eq!(resumed.output, recorded.output);
+    assert_eq!(
+        attempts.get(),
+        1,
+        "the handled effect failure was performed again"
+    );
+    assert_eq!(
+        rt.oracle().inner.calls(),
+        1,
+        "the handled model failure was retried"
+    );
+    assert_eq!(
+        rt.replay("handled-end", agent).unwrap().output,
+        recorded.output
+    );
+
+    // The same for a failed model call that is the run's last step.
+    let last_draw = |ctx: &mut Ctx| -> Result<Value, Fault> {
+        Ok(ctx
+            .oracle("last")
+            .unwrap_or_else(|_| Value::from("fallback")))
+    };
+    let rt = Runtime::in_memory(failing_on(3, &[1]));
+    assert_eq!(
+        rt.run("draw-end", last_draw).unwrap().output.as_str(),
+        "fallback"
+    );
+    assert_eq!(
+        rt.resume("draw-end", last_draw).unwrap().output.as_str(),
+        "fallback"
+    );
+    assert_eq!(
+        rt.oracle().inner.calls(),
+        1,
+        "the handled model failure was retried"
+    );
+}

@@ -51,6 +51,34 @@
 //! assert_eq!(audit.trace, report.trace);
 //! ```
 //!
+//! ## Attempts, branches and parallel regions
+//!
+//! Each `run`, `resume` or `replay` is one attempt ([`Runtime::begin`],
+//! [`Attempt`]): it checks the run out of its [`Backend`] (or, for replay,
+//! reads a snapshot without any lock), runs the agent against a [`Session`]
+//! and checks the run back in. Every step is persisted before its result
+//! reaches the agent, and every model call and effect is on record before it
+//! happens.
+//!
+//! [`Ctx::parallel`] and [`AsyncCtx::parallel`] run children on their own
+//! branches of the journal. Replay matches each branch on its own, so a
+//! region whose children interleaved differently when it was recorded still
+//! replays exactly, and identical requests from different children each get
+//! their own recorded response back.
+//!
+//! ```
+//! use pragmatic::{Runtime, SeededOracle, Ctx, Fault, Value};
+//!
+//! fn best_of_three(ctx: &mut Ctx) -> Result<Value, Fault> {
+//!     let drafts = ctx.parallel(3, |i, child| child.oracle(format!("draft {i}")))?;
+//!     ctx.oracle(format!("pick the best of {} drafts", drafts.len()))
+//! }
+//!
+//! let rt = Runtime::in_memory(SeededOracle::new(7));
+//! let report = rt.run("drafts", best_of_three).unwrap();
+//! assert_eq!(rt.replay("drafts", best_of_three).unwrap().trace, report.trace);
+//! ```
+//!
 //! ## The system of record
 //!
 //! - [`journal`]: journal format 2, the hash-chained record of every step:
@@ -59,6 +87,8 @@
 //!   corruption classification. Format 1 journals (0.4, 0.5) are read-only.
 //! - [`backend`]: where journals live. [`DirBackend`] keeps one file per run
 //!   with a sidecar lock; [`MemoryBackend`] keeps persisted bytes in memory.
+//! - [`session`]: the per-attempt state and the split-phase primitives
+//!   bindings use to make model calls and perform effects themselves.
 //!
 //! ## Building blocks
 //!

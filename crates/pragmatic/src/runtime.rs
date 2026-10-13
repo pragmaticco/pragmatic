@@ -330,7 +330,10 @@ impl<O: Oracle> Runtime<O> {
 
     /// Start (or continue) a durable run. If a journal for `run_id` already
     /// exists, its prefix is replayed first: `run` is safely re-enterable,
-    /// which is what makes retries idempotent.
+    /// which is what makes retries idempotent. Unlike
+    /// [`resume`](Self::resume), `run` makes no recovery decisions: a failure
+    /// recorded at the end of the prefix replays as that failure, and an
+    /// effect a crash left without a result is [`Fault::DanglingEffect`].
     pub fn run(
         &self,
         run_id: &str,

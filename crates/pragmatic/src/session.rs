@@ -575,17 +575,26 @@ impl Session {
                 frontier.insert(last);
             }
         }
+        // A failure is retried only if the agent may not have seen it: an
+        // attempt that ended ok after it observed it and carried on, even
+        // when nothing else followed on its branch.
+        let observed_upto = self.last_ok_end();
+        let retryable = |result: Cursor| observed_upto.is_none_or(|end| result > end);
         // Effect intents that need a decision, in cursor order.
         let mut effects: Vec<Cursor> = Vec::new();
         for entry in self.journal.entries() {
+            let latest = self.results.get(&entry.cursor).copied();
+            let latest_event = latest.and_then(|r| self.journal.get(r)).map(|e| &e.event);
+            let at_frontier = frontier.contains(&entry.cursor);
             match &entry.event {
                 Event::EffectIntent { .. } => {
-                    let pending = match self.results.get(&entry.cursor) {
+                    let pending = match latest {
                         None => true,
-                        Some(&r) => {
-                            frontier.contains(&entry.cursor)
+                        Some(r) => {
+                            at_frontier
+                                && retryable(r)
                                 && matches!(
-                                    self.journal.get(r).map(|e| &e.event),
+                                    latest_event,
                                     Some(Event::EffectResult {
                                         outcome: EffectOutcome::Failed,
                                         ..
@@ -597,14 +606,13 @@ impl Session {
                         effects.push(entry.cursor);
                     }
                 }
-                Event::DrawIntent { .. } if frontier.contains(&entry.cursor) => {
-                    let errored = self.results.get(&entry.cursor).is_some_and(|&r| {
-                        matches!(
-                            self.journal.get(r).map(|e| &e.event),
+                Event::DrawIntent { .. } if at_frontier => {
+                    let errored = latest.is_some_and(retryable)
+                        && matches!(
+                            latest_event,
                             Some(Event::DrawResult { meta, .. })
                                 if meta_outcome(meta).as_deref() == Some("error")
-                        )
-                    });
+                        );
                     if errored {
                         self.reissue.insert(entry.cursor);
                     }
@@ -616,6 +624,26 @@ impl Session {
             self.decide(intent, policy.as_deref_mut(), remote)?;
         }
         Ok(())
+    }
+
+    /// The cursor of the last `attempt.end` whose outcome is `ok`: every
+    /// result before it was seen by an agent that then returned normally.
+    fn last_ok_end(&self) -> Option<Cursor> {
+        self.journal
+            .entries()
+            .iter()
+            .rev()
+            .filter(|e| e.event.note_kind() == Some(note::ATTEMPT_END))
+            .find(|e| match &e.event {
+                Event::Note { data, .. } => crate::journal::strict_json_field(data)
+                    .and_then(|d| {
+                        d.get("outcome")
+                            .and_then(|o| o.as_str().map(str::to_string))
+                    })
+                    .is_some_and(|o| o == "ok"),
+                _ => false,
+            })
+            .map(|e| e.cursor)
     }
 
     /// One recovery decision: ask the policy, append the effect's new result
@@ -1852,5 +1880,171 @@ fn random_value(source: &str, args: &str) -> Result<Value, Fault> {
         _ => Err(Fault::Unsupported(format!(
             "unknown random source '{source}' (expected uuid4, random, randint or bytes)"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{Backend, MemoryBackend};
+
+    /// A recording session over a fresh in-memory run.
+    fn recording(run_id: &str, opts: &RunOptions) -> (MemoryBackend, Session) {
+        let backend = MemoryBackend::new();
+        let co = backend.checkout(run_id, true, None).unwrap();
+        let mut s = Session::new(
+            run_id,
+            Mode::Run,
+            co.journal,
+            Some((co.sink, co.guard)),
+            opts,
+            None,
+        )
+        .unwrap();
+        s.start(opts, None, None, false).unwrap();
+        (backend, s)
+    }
+
+    #[test]
+    fn desync_messages_never_carry_content() {
+        let (_b, mut s) = recording("r", &RunOptions::default());
+        let root = ROOT.to_vec();
+        let DrawStart::Fresh(i) = s
+            .draw_begin(&root, "p", vec![Value::from("SECRET PROMPT")])
+            .unwrap()
+        else {
+            panic!()
+        };
+        s.draw_end(
+            i,
+            META_OK.into(),
+            Value::default(),
+            Value::from("SECRET ANSWER"),
+        )
+        .unwrap();
+        s.effect_begin(&root, "send", Value::from("SECRET ARG"))
+            .unwrap();
+        for e in s.journal.entries() {
+            let text = describe(&e.event);
+            assert!(!text.contains("SECRET"), "{text}");
+        }
+    }
+
+    #[test]
+    fn steps_persist_before_they_return() {
+        let (backend, mut s) = recording("p", &RunOptions::default());
+        let root = ROOT.to_vec();
+        assert!(s.unpersisted().is_none());
+        s.now(&root).unwrap();
+        assert!(s.unpersisted().is_none());
+        let stored = backend.snapshot("p", None).unwrap();
+        assert_eq!(stored.len(), s.journal().len());
+    }
+
+    #[test]
+    fn an_external_persist_failure_is_sticky() {
+        let (_b, mut s) = recording("x", &RunOptions::default());
+        let root = ROOT.to_vec();
+        s.persist_failed(Fault::LeaseLost);
+        // The first failure is the one that sticks.
+        s.persist_failed(Fault::Deleted);
+        let len = s.journal().len();
+        assert_eq!(s.now(&root).unwrap_err(), Fault::LeaseLost);
+        assert_eq!(s.fork(&root, 2).unwrap_err(), Fault::LeaseLost);
+        assert_eq!(s.sync().unwrap_err(), Fault::LeaseLost);
+        assert_eq!(s.journal().len(), len, "nothing appended once failed");
+        assert_eq!(s.failure(), Some(&Fault::LeaseLost));
+        // attempt.end is not written either.
+        assert_eq!(s.end(Ok(Value::from("ok"))).unwrap_err(), Fault::LeaseLost);
+        assert_eq!(s.journal().len(), len);
+    }
+
+    #[test]
+    fn ends_of_unknown_intents_are_refused() {
+        let (_b, mut s) = recording("e", &RunOptions::default());
+        assert!(matches!(
+            s.draw_end(99, META_OK.into(), Value::default(), Value::default()),
+            Err(Fault::Unsupported(_))
+        ));
+        assert!(matches!(
+            s.effect_end(99, Ok(Value::default())),
+            Err(Fault::Unsupported(_))
+        ));
+        let root = ROOT.to_vec();
+        let EffectStart::Fresh { intent, .. } =
+            s.effect_begin(&root, "e", Value::from("a")).unwrap()
+        else {
+            panic!()
+        };
+        // A draw end for an effect intent is refused, and the effect still
+        // completes normally afterwards.
+        assert!(s
+            .draw_end(intent, META_OK.into(), Value::default(), Value::default())
+            .is_err());
+        s.effect_end(intent, Ok(Value::from("r"))).unwrap();
+        assert!(s.effect_end(intent, Ok(Value::from("r"))).is_err());
+        assert!(matches!(
+            s.draw_begin(&root, "p", Vec::new()),
+            Err(Fault::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn labels_are_checked() {
+        let ok: BTreeMap<String, String> = [("team.a-1_x".to_string(), "v".to_string())].into();
+        assert!(check_labels(&ok).is_ok());
+        for (k, v) in [
+            ("", "v"),
+            ("Upper", "v"),
+            ("has space", "v"),
+            (&"k".repeat(65)[..], "v"),
+            ("k", &"v".repeat(257)[..]),
+        ] {
+            let bad: BTreeMap<String, String> = [(k.to_string(), v.to_string())].into();
+            assert!(check_labels(&bad).is_err(), "{k:?}");
+        }
+        let many: BTreeMap<String, String> =
+            (0..33).map(|i| (format!("k{i}"), String::new())).collect();
+        assert!(check_labels(&many).is_err());
+    }
+
+    #[test]
+    fn random_values_cover_their_ranges() {
+        // The full i64 range takes the no-rejection path.
+        let v = random_value("randint", "[-9223372036854775808,9223372036854775807]").unwrap();
+        assert!(v.as_str().parse::<i64>().is_ok());
+        let one = random_value("randint", "[5,5]").unwrap();
+        assert_eq!(one.as_str(), "5");
+        assert_eq!(random_value("bytes", "[0]").unwrap().len(), 0);
+        assert!(matches!(
+            random_value("bytes", "[67108865]"),
+            Err(Fault::TooLarge { .. })
+        ));
+        for bad in ["", "{}", "[1.5]", "[1]x"] {
+            assert!(random_value("bytes", bad).is_err(), "{bad:?}");
+        }
+        for _ in 0..200 {
+            let x: f64 = random_value("random", "[]")
+                .unwrap()
+                .as_str()
+                .parse()
+                .unwrap();
+            assert!((0.0..1.0).contains(&x));
+        }
+    }
+
+    #[test]
+    fn branches_print_for_keys_and_messages() {
+        assert_eq!(branch_text(&[]), "");
+        assert_eq!(branch_text(&[3, 0, 12]), "3.0.12");
+        assert_eq!(
+            meta_outcome(r#"{"outcome":"partial"}"#).as_deref(),
+            Some("partial")
+        );
+        assert_eq!(meta_outcome("not json"), None);
+        assert_eq!(
+            object(vec![("b", Json::from(1u8)), ("a", Json::Null)]),
+            r#"{"a":null,"b":1}"#
+        );
     }
 }

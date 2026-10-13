@@ -293,7 +293,7 @@ impl<'a> Ctx<'a> {
     ///
     /// On record, appends `Program { name, hash }`. On replay, checks the
     /// recorded identity under the run's
-    /// [`OnCodeChange`](crate::OnCodeChange) policy: a changed program fails
+    /// [`OnCodeChange`] policy: a changed program fails
     /// as [`Fault::JournalDesync`] *before* any step can misreplay, turning
     /// assumption A2 ("the same term is replayed") into an enforced
     /// property.
