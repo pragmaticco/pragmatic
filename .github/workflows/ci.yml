@@ -49,22 +49,28 @@ jobs:
           kill %1
 
   python:
-    name: python bindings smoke test
+    name: python package (${{ matrix.python }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
       - uses: Swatinem/rust-cache@v2
-      - name: Build extension module
-        run: cargo build --release -p pragmatic-python
-      - name: Run Python smoke test
+      - name: Build and install the package
         run: |
-          mkdir -p /tmp/pymod
-          cp target/release/libpragmatic.so /tmp/pymod/pragmatic.so
-          PYTHONPATH=/tmp/pymod python3 crates/pragmatic-python/tests/smoke.py
+          python -m venv .venv
+          .venv/bin/pip install maturin pytest anthropic openai
+          cd crates/pragmatic-python
+          VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv PATH=$GITHUB_WORKSPACE/.venv/bin:$PATH maturin develop
+      - name: Smoke test
+        run: .venv/bin/python crates/pragmatic-python/tests/smoke.py
+      - name: SDK end-to-end tests (Anthropic + OpenAI clients, mock transport)
+        run: .venv/bin/python -m pytest crates/pragmatic-python/tests -q
 
   bindings:
     name: C++ / Java / Go / Node bindings smoke tests

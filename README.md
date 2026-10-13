@@ -6,8 +6,8 @@
 re-pays for a token, and a tamper-evident journal that proves what your
 agent actually did.**
 
-[![CI](https://github.com/pragmaticco/pragmaticMain/actions/workflows/ci.yml/badge.svg)](https://github.com/pragmaticco/pragmaticMain/actions/workflows/ci.yml)
-[![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](LICENSE)
+[![CI](https://github.com/pragmaticco/pragmatic/actions/workflows/ci.yml/badge.svg)](https://github.com/pragmaticco/pragmatic/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
 ![status: public beta](https://img.shields.io/badge/status-public%20beta-brightgreen.svg)
 
@@ -53,11 +53,46 @@ semantics, not assumed.
 3. **Replay faithfully.** Reproduce the entire run bit-for-bit for
    time-travel debugging and audit - with the model never consulted.
 
-## A real agent, durable end to end
+## Your agent, journaled - one line
 
-Not a toy prompt loop - a Messages-API tool-use agent. Claude decides when
-to call tools, each tool runs as a write-ahead journaled effect, and the
-whole loop records, resumes, and replays:
+```sh
+pip install "pragmatic-runtime[anthropic]"    # or [openai]
+```
+
+Keep your agent as it is. Wrap the SDK client and hand tool calls to
+`ctx.run_tools`; every model call and tool call is now journaled:
+
+```python
+import anthropic, pragmatic
+
+rt = pragmatic.Runtime("./journals")
+
+def research(ctx):
+    client = ctx.wrap(anthropic.Anthropic())            # the only new line
+    messages = [{"role": "user", "content": "Find papers on durable execution."}]
+    while True:
+        msg = client.messages.create(model="claude-sonnet-5-5", max_tokens=1024,
+                                     tools=TOOLS, messages=messages)
+        messages.append({"role": "assistant", "content": msg.content})
+        if msg.stop_reason != "tool_use":
+            return msg.content[0].text
+        messages += ctx.run_tools(msg, {"search_corpus": search_corpus})
+
+rt.run("research-42", research)       # record
+rt.resume("research-42", research)    # after a crash: no repeated API or tool calls
+rt.replay("research-42", research)    # audit: nothing is called at all
+rt.verify("research-42")              # tamper evidence: the hash chain is intact
+```
+
+Works with `Anthropic`, `AsyncAnthropic`, `OpenAI`, and `AsyncOpenAI`
+(Messages, Chat Completions, and Responses APIs). Details:
+[crates/pragmatic-python](crates/pragmatic-python).
+
+## In Rust
+
+The same guarantees natively. Claude decides when to call tools, each tool
+runs as a write-ahead journaled effect, and the whole loop records,
+resumes, and replays:
 
 ```rust
 use pragmatic::{Ctx, Fault, Runtime, Value};
@@ -100,9 +135,8 @@ Try the runtime without a model: `cargo run -p pragmatic --example research_agen
 
 **Async?** Same guarantees, `await`ed - executor-agnostic (tokio, smol, or
 the built-in `block_on`), still zero dependencies (`AsyncRuntime`, see
-[docs/usage.md](docs/usage.md)). **Python?** The same runtime, importable -
-`pip install pragmatic-runtime`; journals are byte-compatible with Rust and
-the CLI ([crates/pragmatic-python](crates/pragmatic-python)). **C++, Java,
+[docs/usage.md](docs/usage.md)). **Python?** The same runtime (above); journals
+are byte-compatible with Rust and the CLI. **C++, Java,
 Go, Node.js?** One C ABI ([bindings/](bindings/)), full record → resume →
 replay surface, typed faults.
 
@@ -196,15 +230,16 @@ scope. [Read the concepts doc](docs/concepts.md).
 
 ## License & commercial use
 
-Pragmatic is **source-available** under the
-[Business Source License 1.1](LICENSE) - read it, modify it, self-host it.
+The runtime, the language SDKs and bindings, the CLI, the journal format and
+its verifier are **open source under the [Apache License 2.0](LICENSE)**. Use
+them anywhere, in production, at any scale, with no permission needed.
+Anyone, including an auditor who does not trust the operator, can verify a
+journal with them.
 
-- **Free** for non-production use, and for **production use by organizations
-  under US $1M annual revenue** (and not as a competing hosted service). See
-  the [Additional Use Grant](LICENSE) for exact terms.
-- **Production use beyond that requires a commercial license** -
-  [contact us](mailto:me@aniketh.net?subject=Pragmatic%20commercial%20license).
-- Each released version automatically converts to **Apache 2.0** four years
-  after release (its Change Date), so nothing is ever locked up forever.
+Pragmatic Research, Inc. sells the commercial layer built on top: the
+Pragmatic Server (shared journal storage, independent anchoring, retention,
+erasure, access control and evidence bundles) and the hosted witness.
+[Contact us](mailto:me@aniketh.net?subject=Pragmatic%20commercial%20license)
+for design-partner access.
 
 © 2026 Pragmatic Research, Inc.

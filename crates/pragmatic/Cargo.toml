@@ -16,7 +16,7 @@ authors.workspace = true
 # the compile-time `#[pragmatic::durable]` attribute macro; disable default
 # features for a fully dependency-free build.
 [dependencies]
-pragmatic-macros = { version = "0.4.0", path = "../pragmatic-macros", optional = true }
+pragmatic-macros = { version = "0.5.0", path = "../pragmatic-macros", optional = true }
 
 [features]
 default = ["macros"]
