@@ -181,14 +181,14 @@ fn durable_run_survives_the_api_disappearing() {
 
     let recorded = {
         let oracle = OpenAiOracle::new("k").base_url(&url);
-        let mut rt = Runtime::on_dir(&dir, oracle).unwrap();
+        let rt = Runtime::on_dir(&dir, oracle).unwrap();
         rt.run("wire-run", agent).unwrap()
     };
     handle.join().unwrap(); // mock server is now GONE
 
     // New process, no server: resume replays everything from the journal.
     let oracle = OpenAiOracle::new("k").base_url("http://127.0.0.1:1");
-    let mut rt = Runtime::on_dir(&dir, oracle).unwrap();
+    let rt = Runtime::on_dir(&dir, oracle).unwrap();
     let resumed = rt.resume("wire-run", agent).unwrap();
     assert_eq!(resumed.trace, recorded.trace);
     assert_eq!(resumed.output.as_str(), "a result");
@@ -211,7 +211,7 @@ fn live_api_record_and_replay() {
     let agent = |ctx: &mut pragmatic::Ctx| -> Result<Value, Fault> {
         ctx.oracle("Reply with exactly the word: pong")
     };
-    let mut rt = Runtime::in_memory(oracle);
+    let rt = Runtime::in_memory(oracle);
     let recorded = rt.run("live", agent).expect("live call");
     assert!(!recorded.output.is_empty());
     let replayed = rt.replay("live", agent).expect("replay");

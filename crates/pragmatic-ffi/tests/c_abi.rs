@@ -305,3 +305,52 @@ fn channels_and_version() {
         assert_eq!(take(prag_version()), env!("CARGO_PKG_VERSION"));
     }
 }
+
+#[test]
+fn storage_faults_map_to_the_io_code_with_their_message() {
+    unsafe {
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rt = prag_runtime_open(
+            std::ptr::null(),
+            counting_oracle,
+            &CALLS as *const AtomicU64 as *mut c_void,
+            std::ptr::null(),
+            0,
+            &mut err,
+        );
+        assert!(!rt.is_null());
+
+        // A reserved run id is `Fault::Unsupported`, which has no code of
+        // its own: it arrives as PRAG_ERR_IO with the message intact.
+        let reserved = CString::new("pragmatic:internal").unwrap();
+        let code = prag_runtime_run(
+            rt,
+            reserved.as_ptr(),
+            research_agent,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut err,
+        );
+        assert_eq!(code, PRAG_ERR_IO);
+        let msg = take(err);
+        assert!(msg.contains("reserved"), "got: {msg}");
+
+        // Resuming a run that does not exist is an I/O fault too.
+        let missing = CString::new("never-recorded").unwrap();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let code = prag_runtime_resume(
+            rt,
+            missing.as_ptr(),
+            research_agent,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut err,
+        );
+        assert_eq!(code, PRAG_ERR_IO);
+        assert!(take(err).contains("no journal"));
+
+        prag_runtime_close(rt);
+    }
+}

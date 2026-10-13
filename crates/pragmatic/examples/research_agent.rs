@@ -1,7 +1,7 @@
 //! The landing-page example, runnable: a research agent that plans, probes,
 //! and synthesizes - then crashes on step nine of its probe loop, resumes
-//! without re-sampling a single journaled step (only the steps the crash
-//! destroyed are drawn again), and replays bit-for-bit for audit.
+//! without re-sampling a single journaled step (only the steps it never
+//! reached are drawn), and replays bit-for-bit for audit.
 //!
 //! ```sh
 //! cargo run --example research_agent
@@ -12,12 +12,17 @@ use pragmatic::{Ctx, Fault, Runtime, SeededOracle, Value};
 /// Wrap the run. Every oracle call is journaled once, and the program's
 /// identity is journaled up front - a run recorded under this version of
 /// `research` refuses to replay under a changed one.
+///
+/// `crash_at` simulates the process dying in the middle of the probe loop.
 #[pragmatic::durable]
-fn research(ctx: &mut Ctx) -> Result<Value, Fault> {
+fn research(ctx: &mut Ctx, crash_at: Option<u32>) -> Result<Value, Fault> {
     let plan = ctx.oracle("plan: survey durable execution for agents")?; // journaled
 
     let mut findings = Vec::new();
     for step in 0..12 {
+        if crash_at == Some(step) {
+            return Err(Fault::Io("the process was killed".into()));
+        }
         let f = ctx.oracle(format!("probe {step} of plan {plan}"))?; // journaled
         findings.push(f);
     }
@@ -37,27 +42,24 @@ fn main() {
     let dir = std::env::temp_dir().join("pragmatic-research-agent");
     let _ = std::fs::remove_dir_all(&dir);
 
-    // ── Record ──────────────────────────────────────────────────────────
-    let mut rt = Runtime::on_dir(&dir, SeededOracle::new(42))
+    // ── Record, and crash on step nine ──────────────────────────────────
+    let rt = Runtime::on_dir(&dir, SeededOracle::new(42))
         .expect("journal dir")
         .with_key(b"demo-signing-key");
-    let recorded = rt.run("research-42", research).expect("run");
-    println!("recorded  : {} journal entries", recorded.journal_len);
-    println!("output    : {}", recorded.output);
-
-    // ── Crash on step nine ──────────────────────────────────────────────
-    // Simulate the process dying with only 9 entries durable on disk.
-    rt.journal("research-42").unwrap().truncate(9).unwrap();
+    let crashed = rt.run("research-42", |ctx: &mut Ctx| research(ctx, Some(9)));
+    println!("recorded  : crashed with {}", crashed.unwrap_err());
     drop(rt); // the process is gone
 
     // ── Recover from any crash ──────────────────────────────────────────
-    // New process, same journal dir. The 9 surviving steps are read back
-    // from the Journal instead of paid for again; the run continues on
-    // step nine.
-    let mut rt = Runtime::on_dir(&dir, SeededOracle::new(42))
+    // New process, same journal dir. Every journaled step (the program
+    // identity, the plan and nine probes) is read back from the Journal
+    // instead of paid for again; the run continues on step nine.
+    let rt = Runtime::on_dir(&dir, SeededOracle::new(42))
         .expect("journal dir")
         .with_key(b"demo-signing-key");
-    let resumed = rt.resume("research-42", research).expect("resume");
+    let resumed = rt
+        .resume("research-42", |ctx: &mut Ctx| research(ctx, None))
+        .expect("resume");
     println!(
         "resumed   : {} steps replayed from journal, {} recorded fresh",
         resumed.replayed_steps, resumed.fresh_steps
@@ -66,7 +68,9 @@ fn main() {
 
     // ── Replay faithfully (T1) ──────────────────────────────────────────
     // Reproduce the whole run for audit. The model is never called.
-    let audit = rt.replay("research-42", research).expect("replay");
+    let audit = rt
+        .replay("research-42", |ctx: &mut Ctx| research(ctx, None))
+        .expect("replay");
     assert_eq!(
         audit.trace, resumed.trace,
         "T1: replay reproduces the run exactly"
@@ -78,6 +82,12 @@ fn main() {
 
     // ── The signed audit trail ──────────────────────────────────────────
     let verified = rt.verify("research-42").unwrap().is_ok();
+    let journal = rt.snapshot("research-42").unwrap();
+    println!(
+        "journal   : {} entries ({} agent steps, the rest attempt notes)",
+        journal.len(),
+        journal.program_entries().len()
+    );
     println!(
         "audit log : hash chain verified = {verified}, head = {}",
         audit

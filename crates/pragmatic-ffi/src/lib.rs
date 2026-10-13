@@ -499,7 +499,8 @@ pub unsafe extern "C" fn prag_report_trace_len(r: *const PragReport) -> u64 {
     report(r).map(|i| i.trace.len() as u64).unwrap_or(0)
 }
 
-/// The kind of trace label `i` (PRAG_TRACE_*), or -1 out of range.
+/// The kind of trace label `i` (PRAG_TRACE_*), or -1 out of range (or for a
+/// kind of step the C ABI does not expose).
 #[no_mangle]
 pub unsafe extern "C" fn prag_report_trace_kind(r: *const PragReport, i: u64) -> i32 {
     match report(r).and_then(|rep| rep.trace.get(i as usize)) {
@@ -508,20 +509,17 @@ pub unsafe extern "C" fn prag_report_trace_kind(r: *const PragReport, i: u64) ->
         Some(TraceLabel::Recv { .. }) => PRAG_TRACE_RECV,
         Some(TraceLabel::Clock { .. }) => PRAG_TRACE_CLOCK,
         Some(TraceLabel::Done { .. }) => PRAG_TRACE_DONE,
-        None => -1,
+        _ => -1,
     }
 }
 
 /// The journal cursor of trace label `i` (u64::MAX for Done / out of range).
 #[no_mangle]
 pub unsafe extern "C" fn prag_report_trace_cursor(r: *const PragReport, i: u64) -> u64 {
-    match report(r).and_then(|rep| rep.trace.get(i as usize)) {
-        Some(TraceLabel::Oracle { cursor, .. })
-        | Some(TraceLabel::Effect { cursor, .. })
-        | Some(TraceLabel::Recv { cursor, .. })
-        | Some(TraceLabel::Clock { cursor, .. }) => *cursor,
-        _ => u64::MAX,
-    }
+    report(r)
+        .and_then(|rep| rep.trace.get(i as usize))
+        .and_then(TraceLabel::cursor)
+        .unwrap_or(u64::MAX)
 }
 
 /// A human-readable summary of trace label `i` (caller-owned), or NULL out
@@ -534,7 +532,7 @@ pub unsafe extern "C" fn prag_report_trace_summary(r: *const PragReport, i: u64)
         Some(TraceLabel::Recv { channel, value, .. }) => format!("{channel} ? {}", value.as_str()),
         Some(TraceLabel::Clock { nanos, .. }) => nanos.to_string(),
         Some(TraceLabel::Done { output }) => output.as_str().into_owned(),
-        None => return std::ptr::null_mut(),
+        Some(_) | None => return std::ptr::null_mut(),
     };
     out_string(&summary)
 }
@@ -739,9 +737,11 @@ pub unsafe extern "C" fn prag_runtime_send(
     }
 }
 
-/// Walk the run's tamper-evident hash chain. PRAG_OK = intact;
-/// PRAG_ERR_TAMPERED sets `*bad_cursor_out` (optional) to the first
-/// tampered entry; any other code is a fault loading the journal.
+/// Verify the run's journal: every chain link and commitment, and that every
+/// erased slot is accounted for. PRAG_OK = intact; PRAG_ERR_TAMPERED sets
+/// `*bad_cursor_out` (optional) to the first bad entry; any other code is a
+/// fault loading the journal (a journal damaged in the middle cannot be
+/// read at all, and reports PRAG_ERR_IO with the cursor in the message).
 #[no_mangle]
 pub unsafe extern "C" fn prag_runtime_verify(
     rt: *mut PragRuntime,
@@ -761,12 +761,26 @@ pub unsafe extern "C" fn prag_runtime_verify(
         }
     };
     match rt.inner.verify(run_id) {
-        Ok(Ok(())) => PRAG_OK,
-        Ok(Err(cursor)) => {
+        Ok(report) if report.is_ok() => PRAG_OK,
+        Ok(report) => {
+            let (cursor, msg) = match report.first_bad {
+                Some(c) => (c, format!("hash chain broken at cursor {c}")),
+                None => {
+                    let c = report
+                        .unaccounted_erasures
+                        .iter()
+                        .chain(&report.erasure_incomplete)
+                        .map(|&(c, _)| c)
+                        .chain(report.invalid_erasure_notes.iter().copied())
+                        .min()
+                        .unwrap_or(u64::MAX);
+                    (c, format!("erasure not accounted for at cursor {c}"))
+                }
+            };
             if !bad_cursor_out.is_null() {
                 *bad_cursor_out = cursor;
             }
-            set_err(err_out, &format!("hash chain broken at cursor {cursor}"));
+            set_err(err_out, &msg);
             PRAG_ERR_TAMPERED
         }
         Err(f) => set_fault(err_out, &f),

@@ -1,13 +1,11 @@
-//! The format 1 journal written by Pragmatic 0.4 and 0.5.
+//! The format 1 journal written by Pragmatic 0.4 and 0.5, kept as a writer
+//! of test fixtures only.
 //!
-//! This is the journal the existing [`Runtime`](crate::Runtime),
-//! [`AsyncRuntime`](crate::AsyncRuntime) and [`Supervisor`](crate::Supervisor)
-//! still record into while they move to journal format 2
-//! ([`crate::journal`]). New code should use [`crate::journal`] and the
-//! storage backends in [`crate::backend`]: format 2 adds branches, salted
-//! content commitments, erasure and canonical decoding, and it is what 0.6
-//! tools read and write. [`crate::journal::Journal::parse`] reads format 1
-//! files read-only.
+//! Pragmatic 0.6 reads format 1 files read-only through
+//! [`crate::journal::Journal::parse`]; nothing records into this format any
+//! more. The module is compiled for the crate's own tests and under the
+//! `testing` feature, so test suites can build the 0.4 and 0.5 journals the
+//! read-only path must accept.
 //!
 //! Format 1 in brief: a 12-byte header (`PRAGJRNL`, version 1), then frames
 //! of `len u32 LE ‖ payload ‖ hash`, chained as

@@ -63,7 +63,7 @@ fn main() {
             }
         }]));
 
-    let mut rt = Runtime::on_dir("./journals", oracle).expect("journal dir");
+    let rt = Runtime::on_dir("./journals", oracle).expect("journal dir");
 
     let recorded = rt.run("tool-loop-demo", agent).expect("run");
     println!("answer : {}", recorded.output);

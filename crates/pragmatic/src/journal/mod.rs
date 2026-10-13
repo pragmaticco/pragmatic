@@ -1082,6 +1082,12 @@ impl Journal {
     }
 }
 
+/// Parse a JSON field (note data, draw meta, random args) with the
+/// journal's strict rules (spec 3.7): `None` if the text is not strict JSON.
+pub(crate) fn strict_json_field(text: &str) -> Option<Json> {
+    codec::strict_json(text.as_bytes()).ok()
+}
+
 /// The `run_id` of a `run.start` note.
 fn run_start_id_of(entry: &Entry) -> Option<String> {
     match &entry.event {

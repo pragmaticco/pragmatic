@@ -22,5 +22,12 @@ pragmatic-macros = { version = "0.5.0", path = "../pragmatic-macros", optional =
 [features]
 default = ["macros"]
 macros = ["dep:pragmatic-macros"]
-# Crash-simulation hooks for test suites (`Backend::crash_truncate`).
+# Crash-simulation hooks for test suites: `Backend::crash_truncate`,
+# `Runtime::crash_truncate` and `Runtime::with_journal_mut`, plus a writer
+# for format 1 fixtures.
 testing = []
+
+# The integration tests and examples simulate crashes through the `testing`
+# hooks, so they build against this crate with that feature on.
+[dev-dependencies]
+pragmatic = { path = ".", features = ["testing"] }

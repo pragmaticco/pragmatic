@@ -53,6 +53,14 @@ pub trait Backend: Send + Sync {
     /// Every run id the backend holds.
     fn list(&self) -> Result<Vec<String>, Fault>;
 
+    /// True for backends whose runs live on a server. Recovery then has no
+    /// default for an effect left without a result: a resumed run needs an
+    /// explicit policy ([`Fault::DanglingEffect`] otherwise), because other
+    /// processes may have acted on the run in the meantime.
+    fn is_remote(&self) -> bool {
+        false
+    }
+
     /// TEST ONLY: keep the first `keep` entries of the stored journal, as if
     /// the process had crashed with only that prefix durable.
     #[cfg(any(test, feature = "testing"))]

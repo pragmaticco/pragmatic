@@ -39,7 +39,7 @@
 //!     Ok(Value::from(format!("report({} findings)", out.len())))
 //! }
 //!
-//! let mut rt = Runtime::in_memory(SeededOracle::new(7));
+//! let rt = Runtime::in_memory(SeededOracle::new(7));
 //! let report = rt.run("research-42", research).unwrap();
 //!
 //! // Crash anywhere. Resume exactly, no re-sampling:
@@ -80,6 +80,7 @@ pub mod backend;
 pub mod ctx;
 pub mod fault;
 pub mod journal;
+#[cfg(any(test, feature = "testing"))]
 #[doc(hidden)]
 pub mod journal_v1;
 pub mod json;
@@ -89,8 +90,8 @@ pub mod oracle;
 pub mod rand;
 pub mod redact;
 pub mod runtime;
+pub mod session;
 pub mod sha256;
-mod store;
 pub mod supervisor;
 mod sys;
 pub mod tsp;
@@ -98,7 +99,7 @@ pub mod value;
 
 pub use async_runtime::{block_on, AsyncCtx, AsyncOracle, AsyncRuntime};
 pub use backend::{Backend, Checkout, CheckoutGuard, DirBackend, MemoryBackend, Sink, SinkError};
-pub use ctx::{Ctx, RunOptions, TraceLabel};
+pub use ctx::{Ctx, OnCodeChange, RunOptions, TraceLabel};
 pub use fault::Fault;
 pub use journal::{
     Branch, Content, Cursor, EffectOutcome, Entry, Event, Journal, SlotMeta, SlotState,
@@ -106,7 +107,8 @@ pub use journal::{
 };
 pub use memory::{Label, Store};
 pub use oracle::{CountingOracle, Oracle, RefusingOracle, RetryOracle, SeededOracle};
-pub use runtime::{Recover, RunReport, Runtime};
+pub use runtime::{Attempt, RunReport, Runtime};
+pub use session::{DrawStart, EffectStart, Mode, ProgramChange, Recover, RecoverRequest, Session};
 pub use supervisor::{Decision, Supervisor};
 pub use value::Value;
 

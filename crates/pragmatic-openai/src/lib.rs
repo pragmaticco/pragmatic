@@ -16,7 +16,7 @@
 //!     .base_url("http://localhost:11434/v1")
 //!     .model("llama3.3");
 //!
-//! let mut rt = Runtime::on_dir("./journals", oracle).unwrap();
+//! let rt = Runtime::on_dir("./journals", oracle).unwrap();
 //! let report = rt.run("research-42", |ctx| {
 //!     let plan = ctx.oracle("Plan a survey of durable execution.")?;
 //!     ctx.oracle(format!("Execute step one of: {plan}"))

@@ -4,8 +4,10 @@
 
 use std::sync::OnceLock;
 
-use pragmatic::journal_v1::{Event, Journal};
+use pragmatic::journal::{Content, EffectOutcome, Entry, Event, Journal};
 use pragmatic::sha256::hex;
+
+use crate::view;
 
 pub fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -81,7 +83,7 @@ const STYLE: &str = r#"
            padding: 0 5px; }
 
   /* column captions */
-  .cols { display: grid; grid-template-columns: 46px 132px 1fr 100px;
+  .cols { display: grid; grid-template-columns: 46px 160px 1fr 100px;
           gap: 0 18px; padding: 0 10px 6px;
           font: 600 10px/1 var(--sans); letter-spacing: .18em;
           text-transform: uppercase; color: var(--faint); }
@@ -89,7 +91,7 @@ const STYLE: &str = r#"
   /* event rows */
   details.ev { border-bottom: 1px solid var(--hair); }
   details.ev > summary { display: grid;
-      grid-template-columns: 46px 132px 1fr 100px; gap: 0 18px;
+      grid-template-columns: 46px 160px 1fr 100px; gap: 0 18px;
       padding: 7px 10px; cursor: pointer; list-style: none;
       align-items: baseline; }
   details.ev > summary::-webkit-details-marker { display: none; }
@@ -167,18 +169,8 @@ pub fn masthead(section: &str, right: &str) -> String {
     )
 }
 
-fn clip(s: &str, n: usize) -> String {
-    let s = s.replace('\n', " ");
-    if s.chars().count() > n {
-        let cut: String = s.chars().take(n).collect();
-        format!("{cut}…")
-    } else {
-        s
-    }
-}
-
 struct Row {
-    evt: &'static str,
+    evt: String,
     quiet: bool,
     summary: String,
     detail: String,
@@ -188,114 +180,158 @@ fn detail_block(label: &str, text: &str) -> String {
     format!("<div class=\"lbl\">{label}</div><pre>{}</pre>", esc(text))
 }
 
-fn row(event: &Event) -> Row {
-    match event {
-        Event::Program { name, hash } => Row {
-            evt: "program",
-            quiet: true,
-            summary: format!("<b>{}</b> source={}", esc(name), esc(hash)),
-            detail: format!(
-                "<div class=\"kv\">program identity - replay fails at this cursor with \
-                 <b>JournalDesync</b> if the source hash of <b>{}</b> no longer matches</div>",
+fn kv(text: &str) -> String {
+    format!("<div class=\"kv\">{text}</div>")
+}
+
+/// The console row of one entry: label, one-line summary, and the full
+/// content of every slot in the detail view.
+fn row(entry: &Entry) -> Row {
+    let event = &entry.event;
+    let mut detail = String::new();
+    let (quiet, note) = match event {
+        Event::DrawIntent { provenance, parts } => {
+            for (k, p) in parts.iter().enumerate() {
+                detail.push_str(&detail_block(
+                    &format!("request part {k}"),
+                    &view::content_full(p),
+                ));
+            }
+            (
+                true,
+                format!(
+                    "model call intent, durable <b>before</b> the call · provenance <b>{}</b>",
+                    esc(provenance)
+                ),
+            )
+        }
+        Event::DrawResult {
+            intent,
+            meta,
+            head,
+            body,
+        } => {
+            detail.push_str(&detail_block("response", &view::content_full(body)));
+            if !matches!(head, Content::Sealed(v) if v.is_empty()) {
+                detail.push_str(&detail_block("response head", &view::content_full(head)));
+            }
+            detail.push_str(&detail_block("meta", meta));
+            (
+                false,
+                format!(
+                    "response to the intent at cursor <b>{intent}</b> · replay serves it \
+                     without calling the model"
+                ),
+            )
+        }
+        Event::ChannelRecv { value, .. } => {
+            detail.push_str(&detail_block("value", &view::content_full(value)));
+            (false, String::new())
+        }
+        Event::EffectIntent { arg, .. } => {
+            detail.push_str(&detail_block("argument", &view::content_full(arg)));
+            (
+                true,
+                "write-ahead intent, durable <b>before</b> the effect runs; an intent \
+                 without a result marks a crash inside the effect window"
+                    .to_string(),
+            )
+        }
+        Event::EffectResult {
+            intent,
+            outcome,
+            payload,
+            ..
+        } => {
+            if let Some(p) = payload {
+                detail.push_str(&detail_block(
+                    if *outcome == EffectOutcome::Failed {
+                        "failure"
+                    } else {
+                        "result"
+                    },
+                    &view::content_full(p),
+                ));
+            }
+            let what = match outcome {
+                EffectOutcome::Ok => {
+                    "replay returns this result; the effect is not performed again"
+                }
+                EffectOutcome::Failed => "replay fails the effect again with this message",
+                EffectOutcome::Compensated => {
+                    "written off by recovery; the run performed the effect again under a new intent"
+                }
+            };
+            (
+                false,
+                format!("result of the intent at cursor <b>{intent}</b> · {what}"),
+            )
+        }
+        Event::Clock { nanos } => (
+            true,
+            format!("journaled clock read: replay sees <b>{nanos}</b>, not the current time"),
+        ),
+        Event::Program { name, .. } => (
+            true,
+            format!(
+                "program identity: replay checks the running program against <b>{}</b>",
                 esc(name)
             ),
-        },
-        Event::OracleDraw {
-            prompt,
-            outcome,
-            provenance,
-        } => Row {
-            evt: "oracle.draw",
-            quiet: false,
-            summary: format!(
-                "{} <b>→</b> {}",
-                esc(&clip(&prompt.as_str(), 60)),
-                esc(&clip(&outcome.as_str(), 48))
-            ),
-            detail: format!(
-                "{}{}<div class=\"kv\">provenance <b>{}</b> · replay serves this outcome \
-                 without calling the model</div>",
-                detail_block("prompt", &prompt.as_str()),
-                detail_block("realized outcome", &outcome.as_str()),
-                esc(provenance),
-            ),
-        },
-        Event::ChannelRecv { channel, value } => Row {
-            evt: "chan.recv",
-            quiet: false,
-            summary: format!(
-                "<b>{}</b> ? {}",
-                esc(channel),
-                esc(&clip(&value.as_str(), 72))
-            ),
-            detail: detail_block("value", &value.as_str()),
-        },
-        Event::EffectIntent { name, arg } => Row {
-            evt: "effect.intent",
-            quiet: true,
-            summary: format!("<b>{}</b>({})", esc(name), esc(&clip(&arg.as_str(), 64))),
-            detail: format!(
-                "{}<div class=\"kv\">write-ahead intent - journaled durable <b>before</b> \
-                 the effect runs; an intent without a matching commit marks a crash inside \
-                 the effect window</div>",
-                detail_block("argument", &arg.as_str())
-            ),
-        },
-        Event::EffectCommit { name, result } => Row {
-            evt: "effect.commit",
-            quiet: false,
-            summary: format!(
-                "<b>{}</b> → {}",
-                esc(name),
-                esc(&clip(&result.as_str(), 64))
-            ),
-            detail: format!(
-                "{}<div class=\"kv\">replay returns this result; the effect is not \
-                 re-performed</div>",
-                detail_block("result", &result.as_str())
-            ),
-        },
-        Event::EffectCompensated { name } => Row {
-            evt: "effect.comp",
-            quiet: false,
-            summary: format!("<b>{}</b> rolled back", esc(name)),
-            detail: "<div class=\"kv\">saga compensation - closes the open intent; replay \
-                     will not double-undo</div>"
-                .to_string(),
-        },
-        Event::Clock { nanos } => Row {
-            evt: "clock",
-            quiet: true,
-            summary: format!("{nanos} ns"),
-            detail: format!(
-                "<div class=\"kv\">journaled clock read - replay sees <b>{nanos}</b>, \
-                 not the current time</div>"
-            ),
-        },
+        ),
+        Event::Fork { .. } => (
+            true,
+            "parallel region: each child runs on its own branch".to_string(),
+        ),
+        Event::Marker { name } => (true, format!("this run took patch <b>{}</b>", esc(name))),
+        Event::Note {
+            kind,
+            data,
+            payload,
+        } => {
+            detail.push_str(&detail_block("data", data));
+            for (k, p) in payload.iter().enumerate() {
+                detail.push_str(&detail_block(
+                    &format!("payload {k}"),
+                    &view::content_full(p),
+                ));
+            }
+            (
+                true,
+                format!("note <b>{}</b> on the meta branch", esc(kind)),
+            )
+        }
+        Event::Random { value, .. } => {
+            detail.push_str(&detail_block("value", &view::content_full(value)));
+            (true, "journaled random draw".to_string())
+        }
+        _ => (false, "format 1 entry (read-only)".to_string()),
+    };
+    if !note.is_empty() {
+        detail.push_str(&kv(&note));
+    }
+    let branch = if entry.branch.is_empty() {
+        String::new()
+    } else {
+        format!("[{}] ", esc(&view::branch_label(&entry.branch)))
+    };
+    Row {
+        evt: view::label(event),
+        quiet,
+        summary: format!("{branch}{}", esc(&view::summary(event, 72))),
+        detail,
     }
 }
 
 pub fn render(run_id: &str, journal: &Journal) -> String {
-    let verified = journal.verify().is_ok();
-    let head = journal
-        .head()
-        .map(|h| hex(&h))
-        .unwrap_or_else(|| "-".to_string());
-    let dangling = journal.dangling_intents().len();
-    let draws = journal
-        .entries()
-        .iter()
-        .filter(|e| matches!(e.event, Event::OracleDraw { .. }))
-        .count();
-    let effects = journal
-        .entries()
-        .iter()
-        .filter(|e| matches!(e.event, Event::EffectCommit { .. }))
-        .count();
+    let report = journal.audit();
+    let head = hex(&journal.head());
+    let open_intents = view::open_intents(journal).len();
+    let draws = view::draws(journal);
+    let effects = view::effects_committed(journal);
 
     let mut entries = String::new();
     for e in journal.entries() {
-        let r = row(&e.event);
+        let r = row(e);
         let hash = hex(&e.hash);
         entries.push_str(&format!(
             "<details class=\"ev\"><summary>\
@@ -308,7 +344,7 @@ pub fn render(run_id: &str, journal: &Journal) -> String {
              </div></details>\n",
             cursor = e.cursor,
             quiet = if r.quiet { " quiet" } else { "" },
-            evt = r.evt,
+            evt = esc(&r.evt),
             summary = r.summary,
             hash = hash,
             hash10 = &hash[..10],
@@ -316,13 +352,19 @@ pub fn render(run_id: &str, journal: &Journal) -> String {
         ));
     }
 
-    let chain = if verified {
-        "chain <b>verified</b>".to_string()
+    let chain = if report.is_ok() {
+        "journal <b>verified</b>".to_string()
     } else {
-        "<span class=\"alarm\">CHAIN BROKEN</span>".to_string()
+        format!(
+            "<span class=\"alarm\">{}</span>",
+            esc(&view::verify_line(&report))
+        )
     };
-    let open = if dangling > 0 {
-        format!("<div><span class=\"alarm\">{dangling} OPEN INTENT(S)</span> - crashed mid-effect; resume with a recovery policy</div>")
+    let open = if open_intents > 0 {
+        format!(
+            "<div><span class=\"alarm\">{open_intents} OPEN INTENT(S)</span> - interrupted by a \
+             crash; resume decides them</div>"
+        )
     } else {
         String::new()
     };
@@ -331,8 +373,9 @@ pub fn render(run_id: &str, journal: &Journal) -> String {
         r#"{mast}
 <div class="facts">
   <div>run <b>{run}</b></div>
-  <div><b>{count}</b> steps</div>
-  <div><b>{draws}</b> oracle draws</div>
+  <div>format <b>{format}</b></div>
+  <div><b>{count}</b> entries</div>
+  <div><b>{draws}</b> model calls</div>
   <div><b>{effects}</b> effects committed</div>
   <div>{chain}</div>
   {open}
@@ -342,8 +385,9 @@ pub fn render(run_id: &str, journal: &Journal) -> String {
 {entries}"#,
         mast = masthead("runs", &esc(run_id)),
         run = esc(run_id),
+        format = journal.format(),
         count = journal.len(),
-        head_short = &head[..head.len().min(16)],
+        head_short = &head[..16],
     );
     page(&format!("{} · pragmatic", esc(run_id)), &body)
 }

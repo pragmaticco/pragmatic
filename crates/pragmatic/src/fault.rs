@@ -219,6 +219,51 @@ impl fmt::Debug for Fault {
     }
 }
 
+impl Fault {
+    /// The variant's name, the tag recorded as `fault_kind` in
+    /// `attempt.end` and used by bindings to pick an exception type.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Fault::OracleErr(_) => "OracleErr",
+            Fault::ToolErr(_) => "ToolErr",
+            Fault::Timeout => "Timeout",
+            Fault::BudgetExhausted => "BudgetExhausted",
+            Fault::ContractViol(_) => "ContractViol",
+            Fault::CapabilityDenied(_) => "CapabilityDenied",
+            Fault::Escalated(_) => "Escalated",
+            Fault::JournalDesync { .. } => "JournalDesync",
+            Fault::ReplayExhausted { .. } => "ReplayExhausted",
+            Fault::Io(_) => "Io",
+            Fault::Erased { .. } => "Erased",
+            Fault::Locked { .. } => "Locked",
+            Fault::Conflict { .. } => "Conflict",
+            Fault::Unsupported(_) => "Unsupported",
+            Fault::TooLarge { .. } => "TooLarge",
+            Fault::DanglingIntent { .. } => "DanglingIntent",
+            Fault::DanglingEffect { .. } => "DanglingEffect",
+            Fault::EffectUnrecorded { .. } => "EffectUnrecorded",
+            Fault::LeaseLost => "LeaseLost",
+            Fault::Deleted => "Deleted",
+            Fault::Unavailable(_) => "Unavailable",
+        }
+    }
+
+    /// The journal cursor the fault names, if any (`fault_cursor` in
+    /// `attempt.end`). An escalated fault reports its cause's cursor.
+    pub fn cursor(&self) -> Option<Cursor> {
+        match self {
+            Fault::JournalDesync { cursor, .. }
+            | Fault::ReplayExhausted { cursor }
+            | Fault::Erased { cursor }
+            | Fault::DanglingIntent { cursor }
+            | Fault::DanglingEffect { cursor } => Some(*cursor),
+            Fault::EffectUnrecorded { intent, .. } => Some(*intent),
+            Fault::Escalated(inner) => inner.cursor(),
+            _ => None,
+        }
+    }
+}
+
 impl std::error::Error for Fault {}
 
 impl From<std::io::Error> for Fault {
@@ -285,5 +330,15 @@ mod tests {
             assert!(fault.to_string().contains(needle), "{fault}");
             assert!(!format!("{fault:?}").is_empty());
         }
+    }
+
+    #[test]
+    fn kinds_and_cursors() {
+        assert_eq!(Fault::Erased { cursor: 3 }.kind(), "Erased");
+        assert_eq!(Fault::Erased { cursor: 3 }.cursor(), Some(3));
+        assert_eq!(Fault::Timeout.cursor(), None);
+        let nested = Fault::Escalated(Box::new(Fault::DanglingIntent { cursor: 9 }));
+        assert_eq!(nested.kind(), "Escalated");
+        assert_eq!(nested.cursor(), Some(9));
     }
 }

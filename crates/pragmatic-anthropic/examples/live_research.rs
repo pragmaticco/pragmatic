@@ -42,15 +42,16 @@ fn main() {
     let oracle = oracle.model("claude-sonnet-5").max_tokens(400);
 
     let dir = std::env::temp_dir().join("pragmatic-live");
-    let mut rt = Runtime::on_dir(&dir, oracle).expect("journal dir");
+    let rt = Runtime::on_dir(&dir, oracle).expect("journal dir");
 
     let report = rt.run("live-brief", brief).expect("run");
     println!("═══ final ═══\n{}\n", report.output);
     println!(
-        "{} steps journaled ({} replayed from a previous attempt, {} fresh)",
+        "{} journal entries ({} steps replayed from a previous attempt, {} fresh model calls)",
         report.journal_len, report.replayed_steps, report.fresh_steps
     );
-    println!("journal: {}", dir.join("live-brief.journal").display());
+    let backend = pragmatic::DirBackend::new(&dir).expect("journal dir");
+    println!("journal: {}", backend.journal_path("live-brief").display());
 
     // The audit replay never touches the API.
     let audit = rt.replay("live-brief", brief).expect("replay");

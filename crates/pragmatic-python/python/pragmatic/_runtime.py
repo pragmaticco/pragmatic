@@ -62,7 +62,7 @@ class Ctx:
         """Journal one model call made by ``sample()``. ``prompt`` must
         identify the request completely; ``sample`` runs only when the
         outcome is not already in the journal."""
-        recorded = self._native.draw_replay(prompt)
+        recorded = self._native.draw_replay(prompt, provenance)
         if recorded is not None:
             return recorded
         try:
@@ -79,7 +79,7 @@ class Ctx:
         self, prompt: str, sample: Callable[[], Awaitable[str]], *, provenance: str = "python"
     ) -> str:
         """``draw`` for an async model call."""
-        recorded = self._native.draw_replay(prompt)
+        recorded = self._native.draw_replay(prompt, provenance)
         if recorded is not None:
             return recorded
         try:
