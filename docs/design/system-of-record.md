@@ -2733,7 +2733,10 @@ Each must fail with its specific code.
 A Python agent writes to the server, crashes, resumes on a second process,
 is anchored with an OpenSSL TSA, has one message erased by `match`, is
 exported, and the bundle verifies offline with pinned anchors and fails
-with an unpinned root.
+with an unpinned root. `tests/e2e` runs this against the real binaries,
+with two TSAs of different operators, a concurrent resume refused by the
+lease, a tampered bundle, the access log, scopes and a restart, in CI and
+with outbound network blocked; `examples/demo` narrates the same steps.
 
 ---
 

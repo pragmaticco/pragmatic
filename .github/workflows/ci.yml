@@ -122,7 +122,37 @@ jobs:
             cargo test --offline -p pragmatic-server -p pragmatic-anchor -p pragmatic-console
             .venv/bin/python -m pytest crates/pragmatic-python/tests -q -rs
             python -I tools/test_verify_evidence.py
+            PRAGMATIC_E2E_SKIP_BUILD=1 .venv/bin/python -m pytest tests/e2e -q
           '
+
+  e2e:
+    name: end-to-end story and the demo
+    # The whole product story against real processes (tests/e2e): the
+    # server binary, the Python SDK under the real Anthropic and OpenAI
+    # SDKs, two local OpenSSL time-stamping authorities, the CLI and the
+    # reference verifier. Then the one-command demo, which tells the same
+    # story, so it cannot rot unnoticed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: Swatinem/rust-cache@v2
+      - name: OpenSSL for the time-stamping authorities and the verifiers
+        run: openssl version && openssl ts -help 2>&1 | grep -q -- -partial_chain
+      - name: Build the server, the CLI and the Python SDK
+        run: |
+          cargo build -p pragmatic-server -p pragmatic-cli
+          python -m venv .venv
+          .venv/bin/pip install maturin pytest anthropic openai httpx2
+          cd crates/pragmatic-python
+          VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv PATH=$GITHUB_WORKSPACE/.venv/bin:$PATH maturin develop
+      - name: End-to-end story
+        run: PRAGMATIC_E2E_SKIP_BUILD=1 .venv/bin/python -m pytest tests/e2e -v -s
+      - name: The demo, as a founder runs it
+        run: PRAGMATIC_DEMO_VENV=$GITHUB_WORKSPACE/.venv examples/demo/run.sh
 
   bindings:
     name: C++ / Java / Go / Node bindings smoke tests
