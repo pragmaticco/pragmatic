@@ -304,6 +304,13 @@ fn row(entry: &Entry) -> Row {
             detail.push_str(&detail_block("value", &view::content_full(value)));
             (true, "journaled random draw".to_string())
         }
+        Event::Refusal { fault, .. } => (
+            true,
+            format!(
+                "refused without touching the world; replay raises <b>{}</b> again",
+                esc(fault)
+            ),
+        ),
         _ => (false, "format 1 entry (read-only)".to_string()),
     };
     if !note.is_empty() {

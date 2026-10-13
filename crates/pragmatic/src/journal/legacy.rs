@@ -132,7 +132,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<LegacyEvent, &'static str> {
             String::from_utf8(self.field()?).map_err(|_| "text field is not UTF-8")
         }
         fn value(&mut self) -> Result<Value, &'static str> {
-            Ok(Value(self.field()?))
+            Ok(Value::new(self.field()?))
         }
     }
     let (&tag, rest) = bytes.split_first().ok_or("empty record")?;

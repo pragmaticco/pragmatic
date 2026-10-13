@@ -250,12 +250,21 @@ impl Json {
     /// The first key that appears twice in the same object, searching the
     /// whole document depth first. `None` means every object has unique
     /// keys, so all conforming parsers agree on what the document says.
+    ///
+    /// Each object is checked with a hash set of the keys seen so far, so
+    /// the cost is linear in the document. The check runs on every JSON
+    /// field of every journal record and on evidence bundles, both of which
+    /// can come from an adversary; a pairwise scan would let one object with
+    /// many keys stall a verifier for hours. The standard library's hasher
+    /// is randomly keyed per process, so crafted keys cannot be made to
+    /// collide.
     pub fn duplicate_key(&self) -> Option<&str> {
         match self {
             Json::Array(items) => items.iter().find_map(Json::duplicate_key),
             Json::Object(members) => {
-                for (i, (key, _)) in members.iter().enumerate() {
-                    if members[..i].iter().any(|(k, _)| k == key) {
+                let mut seen = std::collections::HashSet::with_capacity(members.len());
+                for (key, _) in members {
+                    if !seen.insert(key.as_str()) {
                         return Some(key);
                     }
                 }
@@ -892,6 +901,27 @@ mod tests {
         assert_eq!(ok(r#"{"a":{"a":1}}"#).duplicate_key(), None);
         // Serialization keeps every member, in order.
         assert_eq!(doc.to_string(), r#"{"a":1,"b":{"c":1,"c":2},"a":3}"#);
+    }
+
+    #[test]
+    fn duplicate_key_check_is_linear() {
+        // 200k distinct keys: a pairwise scan would make 2 * 10^10
+        // comparisons here; the hash set makes 200k inserts.
+        let n = 200_000;
+        let mut text = String::from("{");
+        for i in 0..n {
+            if i > 0 {
+                text.push(',');
+            }
+            text.push_str(&format!("\"k{i}\":0"));
+        }
+        let unique = ok(&format!("{text}}}"));
+        let start = std::time::Instant::now();
+        assert_eq!(unique.duplicate_key(), None);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        // The last key repeating the first is still found.
+        let repeated = ok(&format!("{text},\"k0\":1}}"));
+        assert_eq!(repeated.duplicate_key(), Some("k0"));
     }
 
     #[test]

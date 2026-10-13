@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::fault::Fault;
-use crate::journal::{header, validate_run_id, Journal, TornTail, FLAG_KEYED};
+use crate::journal::{header, validate_run_id, Journal, TornTail, VerifyReport, FLAG_KEYED};
 use crate::sha256::{sha256, Digest};
 
 use super::{check_frames, check_run_start, count_frames, Backend, Checkout, CheckoutGuard};
@@ -183,6 +183,17 @@ impl Backend for MemoryBackend {
         let mut ids: Vec<String> = self.shared.runs().keys().cloned().collect();
         ids.sort();
         Ok(ids)
+    }
+
+    fn verify(&self, run_id: &str, key: Option<&[u8]>) -> Result<VerifyReport, Fault> {
+        let bytes = self
+            .bytes(run_id)
+            .ok_or_else(|| Fault::Io(format!("no journal for run '{run_id}'")))?;
+        let (journal, report) = Journal::audit_bytes(&bytes, key)?;
+        if journal.format() != 1 {
+            check_run_start(&journal, run_id, "memory")?;
+        }
+        Ok(report)
     }
 
     #[cfg(any(test, feature = "testing"))]

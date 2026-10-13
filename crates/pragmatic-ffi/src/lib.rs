@@ -739,9 +739,9 @@ pub unsafe extern "C" fn prag_runtime_send(
 
 /// Verify the run's journal: every chain link and commitment, and that every
 /// erased slot is accounted for. PRAG_OK = intact; PRAG_ERR_TAMPERED sets
-/// `*bad_cursor_out` (optional) to the first bad entry; any other code is a
-/// fault loading the journal (a journal damaged in the middle cannot be
-/// read at all, and reports PRAG_ERR_IO with the cursor in the message).
+/// `*bad_cursor_out` (optional) to the first bad entry, wherever in the
+/// journal the damage is; any other code is a fault loading the journal
+/// (no such run, or a key mismatch).
 #[no_mangle]
 pub unsafe extern "C" fn prag_runtime_verify(
     rt: *mut PragRuntime,

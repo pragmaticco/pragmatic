@@ -14,9 +14,12 @@
 //! - `<64hex>.torn-<unix_ms>`: a torn tail moved aside by a writer.
 //! - `<64hex>.journal.tmp-*`: a temp file during creation or erasure.
 //!
-//! A format 1 journal (0.4 and 0.5) is found under its old name (the run id
-//! with every character outside `[A-Za-z0-9_-]` replaced by `_`) only when
-//! no hashed file exists, and is read-only.
+//! A format 1 journal (0.4 and 0.5) is found under its old name only when no
+//! hashed file exists, and is read-only. The old name replaced every
+//! character outside `[A-Za-z0-9_-]` with `_`, which maps distinct ids to
+//! one file (`user.42` and `user_42`), so a format 1 journal belongs only to
+//! the id that *is* its file name: that is the id `list` reports, and an id
+//! the old rule would change never reaches a format 1 file.
 //!
 //! # Locking
 //!
@@ -45,8 +48,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::fault::Fault;
 use crate::journal::{
-    header, validate_run_id, Journal, TornTail, FLAG_KEYED, FORMAT, FORMAT1_READ_ONLY, HEADER_LEN,
-    MAGIC, MAX_RECORD_BYTES,
+    header, validate_run_id, Journal, TornTail, VerifyReport, FLAG_KEYED, FORMAT,
+    FORMAT1_READ_ONLY, HEADER_LEN, MAGIC, MAX_RECORD_BYTES,
 };
 use crate::sha256::{hex, sha256, Digest, DIGEST_LEN};
 use crate::sys;
@@ -117,9 +120,25 @@ impl DirBackend {
         self.dir.join(format!("{}.journal", legacy_name(run_id)))
     }
 
-    /// True if a format 1 journal of this run exists.
-    fn has_legacy(&self, run_id: &str) -> bool {
-        is_format1(&self.legacy_path(run_id))
+    /// The format 1 journal of this run, if one exists. Only an id the old
+    /// safe-name rule leaves unchanged can own one (see the module docs).
+    fn legacy_journal(&self, run_id: &str) -> Option<PathBuf> {
+        let path = self.legacy_path(run_id);
+        (legacy_name(run_id) == run_id && is_format1(&path)).then_some(path)
+    }
+
+    /// The bytes of the run's journal (format 2, or format 1 under its old
+    /// name) and the path they came from.
+    fn read_journal(&self, run_id: &str) -> Result<(Vec<u8>, PathBuf), Fault> {
+        let path = self.journal_path(run_id);
+        match fs::read(&path) {
+            Ok(bytes) => Ok((bytes, path)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => match self.legacy_journal(run_id) {
+                Some(legacy) => Ok((fs::read(&legacy)?, legacy)),
+                None => Err(Fault::Io(format!("no journal for run '{run_id}'"))),
+            },
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -144,7 +163,7 @@ impl Backend for DirBackend {
         remove_stale_temps(&self.dir, &name);
         let exists = fs::metadata(&path).is_ok_and(|m| m.len() >= HEADER_LEN as u64);
         if !exists {
-            if self.has_legacy(run_id) {
+            if self.legacy_journal(run_id).is_some() {
                 return Err(Fault::Unsupported(FORMAT1_READ_ONLY.into()));
             }
             if !create {
@@ -197,23 +216,21 @@ impl Backend for DirBackend {
     }
 
     fn snapshot(&self, run_id: &str, key: Option<&[u8]>) -> Result<Journal, Fault> {
-        let path = self.journal_path(run_id);
-        let (bytes, path) = match fs::read(&path) {
-            Ok(bytes) => (bytes, path),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let legacy = self.legacy_path(run_id);
-                if !is_format1(&legacy) {
-                    return Err(Fault::Io(format!("no journal for run '{run_id}'")));
-                }
-                (fs::read(&legacy)?, legacy)
-            }
-            Err(e) => return Err(e.into()),
-        };
+        let (bytes, path) = self.read_journal(run_id)?;
         let journal = Journal::parse(&bytes, key)?.journal;
         if journal.format() == FORMAT {
             check_run_start(&journal, run_id, &path.display().to_string())?;
         }
         Ok(journal)
+    }
+
+    fn verify(&self, run_id: &str, key: Option<&[u8]>) -> Result<VerifyReport, Fault> {
+        let (bytes, path) = self.read_journal(run_id)?;
+        let (journal, report) = Journal::audit_bytes(&bytes, key)?;
+        if journal.format() == FORMAT {
+            check_run_start(&journal, run_id, &path.display().to_string())?;
+        }
+        Ok(report)
     }
 
     fn list(&self) -> Result<Vec<String>, Fault> {
@@ -225,14 +242,16 @@ impl Backend for DirBackend {
                 continue;
             };
             let path = entry.path();
-            if is_hashed_name(stem) {
+            if is_format1(&path) {
+                // A 0.5 run whose id happens to look like a hashed name (a
+                // content hash, say) is still a format 1 run.
+                ids.push(stem.to_string());
+            } else if is_hashed_name(stem) {
                 if let Some(id) = read_run_start(&path) {
                     if hashed_name(&id) == stem {
                         ids.push(id);
                     }
                 }
-            } else if is_format1(&path) {
-                ids.push(stem.to_string());
             }
         }
         ids.sort();
@@ -660,6 +679,34 @@ impl Sink for DirSink {
         Ok(())
     }
 
+    /// Remove the run's moved-aside torn tails (`<64hex>.torn-*`): they are
+    /// raw bytes of frames that never became entries, so no erasure can
+    /// reach inside them, and they may hold the very content being erased.
+    /// The `torn_tail` notes keep their size and SHA-256.
+    fn remove_copies(&mut self) -> Result<(), SinkError> {
+        let held = Arc::clone(&self.held);
+        if !*lock(&held) {
+            return Err(SinkError::LeaseLost);
+        }
+        let prefix = format!("{}.torn-", self.name);
+        let mut removed = false;
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(&prefix))
+            {
+                fs::remove_file(entry.path())?;
+                removed = true;
+            }
+        }
+        if removed {
+            sys::fsync_dir(&self.dir)?;
+        }
+        Ok(())
+    }
+
     fn rewrite(&mut self, file: &[u8]) -> Result<(), SinkError> {
         let held = Arc::clone(&self.held);
         let held = lock(&held);
@@ -1020,9 +1067,18 @@ mod tests {
         }
         let before = fs::read(&legacy).unwrap();
         let b = DirBackend::new(&*dir).unwrap();
-        let snap = b.snapshot("old run.1", None).unwrap();
+        // The run is known by its file name, the id `list` reports. The id
+        // it was recorded under maps to that name lossily, and so does
+        // "old.run_1": neither may claim the file.
+        let snap = b.snapshot("old_run_1", None).unwrap();
         assert_eq!((snap.format(), snap.len()), (1, 1));
         assert!(snap.verify().is_ok());
+        for lossy in ["old run.1", "old.run_1"] {
+            assert!(
+                matches!(b.snapshot(lossy, None), Err(Fault::Io(_))),
+                "{lossy}"
+            );
+        }
         assert!(matches!(
             b.checkout("old_run_1", false, None),
             Err(Fault::Unsupported(m)) if m == FORMAT1_READ_ONLY

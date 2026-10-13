@@ -31,7 +31,7 @@ use std::fmt;
 use std::io;
 
 use crate::fault::Fault;
-use crate::journal::{Cursor, EraseSelector, ErasureNote, Journal, TornTail};
+use crate::journal::{Cursor, EraseSelector, ErasureNote, Journal, TornTail, VerifyReport};
 use crate::sha256::{Digest, DIGEST_LEN};
 
 /// A store of journals, one per run id.
@@ -52,6 +52,16 @@ pub trait Backend: Send + Sync {
 
     /// Every run id the backend holds.
     fn list(&self) -> Result<Vec<String>, Fault>;
+
+    /// Verify the run's durable prefix without a lock (spec 2.5, 2.13): the
+    /// full [`Journal::audit`], with damage that makes the journal
+    /// unreadable reported as [`VerifyReport::first_bad`] rather than as an
+    /// error, so a verifier learns where tampering starts. The default
+    /// audits a snapshot; backends that hold the file bytes override it to
+    /// read past corruption.
+    fn verify(&self, run_id: &str, key: Option<&[u8]>) -> Result<VerifyReport, Fault> {
+        Ok(self.snapshot(run_id, key)?.audit())
+    }
 
     /// True for backends whose runs live on a server. Recovery then has no
     /// default for an effect left without a result: a resumed run needs an
@@ -82,6 +92,15 @@ pub trait Sink: Send {
     /// Atomically replace the whole journal with `file`. Used only by
     /// erasure and truncation.
     fn rewrite(&mut self, file: &[u8]) -> Result<(), SinkError>;
+
+    /// Remove every copy of journal bytes the store keeps outside the
+    /// journal itself (moved-aside torn tails), so erased content does not
+    /// survive there. Erasure calls it before it commits, so a failure here
+    /// leaves the journal unchanged and the erasure can simply be repeated.
+    /// The default keeps no copies.
+    fn remove_copies(&mut self) -> Result<(), SinkError> {
+        Ok(())
+    }
 }
 
 /// Why a sink could not persist.
@@ -235,15 +254,23 @@ impl Checkout {
         Ok(())
     }
 
-    /// Erase slots (spec 2.13): build and validate the new file, commit it
-    /// atomically through the sink, and continue with the erased journal.
-    /// Returns the slots that changed from sealed to erased.
+    /// Erase slots (spec 2.13): build and validate the new file, remove the
+    /// copies of unacknowledged frames the store kept aside (torn tails,
+    /// which may hold the same content and which no erasure can reach
+    /// inside), commit the new file atomically through the sink, and
+    /// continue with the erased journal. Returns the slots that changed from
+    /// sealed to erased.
     pub fn erase(
         &mut self,
         what: &EraseSelector,
         note: &ErasureNote,
     ) -> Result<Vec<(Cursor, u8)>, Fault> {
         let erasure = self.journal.erase(what, note, self.journal.now())?;
+        self.sink.remove_copies().map_err(|e| {
+            Fault::Io(format!(
+                "a moved-aside torn tail could not be removed, so nothing was erased: {e}"
+            ))
+        })?;
         self.sink
             .rewrite(&erasure.file)
             .map_err(|e| e.into_fault(erasure.file.len() as u64))?;

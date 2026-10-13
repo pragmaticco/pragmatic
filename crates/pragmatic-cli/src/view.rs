@@ -154,6 +154,10 @@ pub fn summary(event: &Event, width: usize) -> String {
             args,
             value,
         } => format!("{source}{args} ⟶ {}", content(value, width)),
+        Event::Refusal { step, name, fault } if name.is_empty() => {
+            format!("{step} refused: {fault}")
+        }
+        Event::Refusal { step, name, fault } => format!("{step} '{name}' refused: {fault}"),
         Event::Legacy(l) => legacy_summary(l, width),
         other => other.kind_name().to_string(),
     }

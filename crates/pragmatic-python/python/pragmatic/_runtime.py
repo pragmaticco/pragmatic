@@ -12,6 +12,7 @@ from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional
 from . import _native
 from ._clients import JournaledClient, wrap as _wrap
 from ._codec import canonical, to_jsonable
+from ._failures import type_name as _type_name
 from ._tools import arun_tools as _arun_tools, run_tools as _run_tools
 
 Agent = Callable[["Ctx"], Any]
@@ -61,19 +62,26 @@ class Ctx:
     def draw(self, prompt: str, sample: Callable[[], str], *, provenance: str = "python") -> str:
         """Journal one model call made by ``sample()``. ``prompt`` must
         identify the request completely; ``sample`` runs only when the
-        outcome is not already in the journal."""
+        outcome is not already in the journal.
+
+        A ``sample()`` that raises is recorded too (the exception's type and
+        message), so an agent that catches the exception replays the same
+        way: replay raises ``DrawFailed``, which is also an instance of the
+        original exception type."""
         recorded = self._native.draw_replay(prompt, provenance)
         if recorded is not None:
             return recorded
         try:
             outcome = sample()
+        except Exception as e:
+            self._native.draw_fail(_type_name(e), str(e))
+            raise
         except BaseException:
+            # Interrupted or cancelled: like a crash, the call stays open
+            # and a resumed run makes it again.
             self._native.draw_abort()
             raise
-        if not isinstance(outcome, str):
-            self._native.draw_abort()
-            raise TypeError("draw's sample() must return str")
-        return self._native.draw_commit(prompt, outcome, provenance)
+        return self._commit_draw(prompt, outcome, provenance, "draw's sample()")
 
     async def adraw(
         self, prompt: str, sample: Callable[[], Awaitable[str]], *, provenance: str = "python"
@@ -84,12 +92,19 @@ class Ctx:
             return recorded
         try:
             outcome = await sample()
+        except Exception as e:
+            self._native.draw_fail(_type_name(e), str(e))
+            raise
         except BaseException:
             self._native.draw_abort()
             raise
+        return self._commit_draw(prompt, outcome, provenance, "adraw's sample()")
+
+    def _commit_draw(self, prompt: str, outcome: Any, provenance: str, what: str) -> str:
         if not isinstance(outcome, str):
-            self._native.draw_abort()
-            raise TypeError("adraw's sample() must return str")
+            err = TypeError(f"{what} must return str")
+            self._native.draw_fail(_type_name(err), str(err))
+            raise err
         return self._native.draw_commit(prompt, outcome, provenance)
 
     def oracle(self, prompt: str) -> str:
@@ -130,7 +145,12 @@ class Ctx:
     def effect(self, name: str, arg: str, perform: Callable[[str], str]) -> str:
         """A durable effect under the write-ahead discipline: the intent is
         journaled before ``perform(arg)`` runs and the result after. Replay
-        returns the recorded result without calling ``perform``."""
+        returns the recorded result without calling ``perform``.
+
+        A ``perform`` that raises is recorded too (the exception's type and
+        message) and its exception propagates; replay raises
+        ``EffectFailed``, which is also an instance of the original
+        exception type, so the agent's ``except`` clause behaves the same."""
         return self._native.effect(name, arg, perform)
 
     async def aeffect(self, name: str, arg: str, perform: Callable[[str], Awaitable[str]]) -> str:
@@ -139,11 +159,18 @@ class Ctx:
         if recorded is not None:
             return recorded
         self._native.effect_begin(name, arg)
-        # A failure here leaves the intent dangling on purpose: resume's
-        # recovery policy decides whether the world saw the effect.
-        result = await perform(arg)
+        # An interrupted or cancelled perform leaves the intent open on
+        # purpose: resume's recovery policy decides whether the world saw
+        # the effect. A perform that raised is a recorded failure.
+        try:
+            result = await perform(arg)
+        except Exception as e:
+            self._native.effect_fail(name, _type_name(e), str(e))
+            raise
         if not isinstance(result, str):
-            raise TypeError("aeffect's perform must return str")
+            err = TypeError("aeffect's perform must return str")
+            self._native.effect_fail(name, _type_name(err), str(err))
+            raise err
         return self._native.effect_commit(name, result)
 
     # -- other journaled inputs ------------------------------------------

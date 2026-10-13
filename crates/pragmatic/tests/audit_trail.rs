@@ -43,8 +43,9 @@ fn chain_verifies_and_flags_tampering() {
     assert_eq!(journal.verify(), Err(first_result));
     assert_eq!(journal.audit().first_bad, Some(first_result));
 
-    // The same forgery written to storage: the next reader refuses the file
-    // as corrupt at that cursor and never truncates it.
+    // The same forgery written to storage: a reader refuses the file as
+    // corrupt at that cursor and never truncates it, and a verifier gets a
+    // report naming the cursor.
     rt.with_journal_mut("audit", |j| {
         j.tamper(first_result, |e| {
             if let Event::DrawResult { body, .. } = &mut e.event {
@@ -53,12 +54,15 @@ fn chain_verifies_and_flags_tampering() {
         })
     })
     .unwrap();
-    let err = rt.verify("audit").unwrap_err();
+    let err = rt.snapshot("audit").unwrap_err();
     assert!(
         err.to_string()
             .contains(&format!("corrupt at cursor {first_result}")),
         "{err}"
     );
+    let report = rt.verify("audit").unwrap();
+    assert_eq!(report.first_bad, Some(first_result));
+    assert!(!report.is_ok());
     assert!(rt.replay("audit", agent).is_err());
 }
 
@@ -209,24 +213,37 @@ fn supervisor_compensates_committed_effects_in_reverse() {
     assert!(matches!(err, Fault::ContractViol(_)));
     // Reverse order: hotel undone before flight.
     assert_eq!(*undone.borrow(), vec!["book_hotel", "book_flight"]);
-    // Compensations are journaled as recovery notes, so a later saga never
-    // undoes twice, and program replay of the run is unchanged.
-    let compensations = |rt: &Runtime<SeededOracle>| {
+    // Compensations are journaled as recovery notes, one before the
+    // compensator runs and one after, so a later saga never undoes twice
+    // (even one that died in between), and program replay of the run is
+    // unchanged.
+    let compensations = |rt: &Runtime<SeededOracle>| -> Vec<String> {
         rt.snapshot("trip")
             .unwrap()
             .entries()
             .iter()
-            .filter(|e| e.event.note_kind() == Some(note::RECOVERY))
-            .count()
+            .filter_map(|e| match &e.event {
+                Event::Note { kind, data, .. } if kind == note::RECOVERY => Some(data.clone()),
+                _ => None,
+            })
+            .collect()
     };
-    assert_eq!(compensations(&rt), 2);
+    let notes = compensations(&rt);
+    assert_eq!(notes.len(), 4);
+    for (note, phase) in notes.iter().zip(["begin", "done", "begin", "done"]) {
+        assert!(
+            note.contains("\"decision\":\"compensate\"")
+                && note.contains(&format!("\"saga\":\"{phase}\"")),
+            "{note}"
+        );
+    }
     let mut again = Supervisor::new()
         .on_fault(|_| Decision::Compensate)
         .compensate_with(|name, _| panic!("{name} undone twice"));
     again
         .supervise(&rt, "trip", RunOptions::default(), agent)
         .unwrap_err();
-    assert_eq!(compensations(&rt), 2);
+    assert_eq!(compensations(&rt).len(), 4);
     assert!(matches!(
         rt.replay("trip", agent).unwrap_err(),
         Fault::ContractViol(_)

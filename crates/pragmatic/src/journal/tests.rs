@@ -69,7 +69,7 @@ fn every_kind() -> Vec<(Branch, Event)> {
             },
         ),
         (
-            vec![1],
+            vec![0, 3],
             Event::EffectResult {
                 intent: 4,
                 outcome: EffectOutcome::Failed,
@@ -78,7 +78,7 @@ fn every_kind() -> Vec<(Branch, Event)> {
             },
         ),
         (
-            vec![],
+            vec![0, 3],
             Event::EffectResult {
                 intent: 4,
                 outcome: EffectOutcome::Compensated,
@@ -121,6 +121,14 @@ fn every_kind() -> Vec<(Branch, Event)> {
                 source: "bytes".into(),
                 args: "[3]".into(),
                 value: Content::from(vec![0u8, 255, 7]),
+            },
+        ),
+        (
+            vec![2],
+            Event::Refusal {
+                step: refusal::RECV.into(),
+                name: "approvals".into(),
+                fault: refusal::TIMEOUT.into(),
             },
         ),
         (
@@ -619,6 +627,7 @@ fn valid(kind: u8) -> Rec {
         9 => Rec::new(9, vec![s("patch")], vec![]),
         10 => Rec::new(10, vec![s("attempt.start"), s("{}")], vec![]),
         11 => Rec::new(11, vec![s("uuid4"), s("[]")], vec![p()]),
+        12 => Rec::new(12, vec![s("recv"), s("c"), s("Timeout")], vec![]),
         _ => unreachable!(),
     }
 }
@@ -651,7 +660,7 @@ fn rejects(rec: &Rec, reason: &str) {
 
 #[test]
 fn valid_records_of_every_kind_decode() {
-    for kind in 1..=11 {
+    for kind in 1..=12 {
         assert!(
             decode(&valid(kind).bytes(), 0, &[], false).is_ok(),
             "kind {kind}"
@@ -661,7 +670,7 @@ fn valid_records_of_every_kind_decode() {
 
 #[test]
 fn record_must_be_consumed_exactly() {
-    for kind in 1..=11 {
+    for kind in 1..=12 {
         let mut r = valid(kind);
         r.trailing = vec![0];
         rejects(&r, "trailing bytes in record");
@@ -676,7 +685,7 @@ fn record_must_be_consumed_exactly() {
 
 #[test]
 fn unknown_kinds_are_rejected() {
-    for kind in [0u8, 12, 13, 99, 255] {
+    for kind in [0u8, 13, 99, 255] {
         let mut r = valid(6);
         r.kind = kind;
         rejects(&r, "unknown record kind");
@@ -684,8 +693,43 @@ fn unknown_kinds_are_rejected() {
 }
 
 #[test]
+fn refusals_name_a_step_and_the_fault_it_raises() {
+    for (step, name, fault) in [
+        ("recv", "inbox", "Timeout"),
+        ("recv", "", "Timeout"),
+        ("draw", "", "BudgetExhausted"),
+        ("effect", "send", "CapabilityDenied"),
+    ] {
+        let r = Rec::new(12, vec![s(step), s(name), s(fault)], vec![]);
+        assert!(decode(&r.bytes(), 0, &[], false).is_ok(), "{step} {fault}");
+    }
+    rejects(
+        &Rec::new(12, vec![s("sleep"), s(""), s("Timeout")], vec![]),
+        "refusal of an unknown step",
+    );
+    for (step, name, fault) in [
+        ("recv", "inbox", "BudgetExhausted"),
+        ("draw", "model", "BudgetExhausted"),
+        ("effect", "send", "Timeout"),
+    ] {
+        rejects(
+            &Rec::new(12, vec![s(step), s(name), s(fault)], vec![]),
+            "refusal fault or name does not fit its step",
+        );
+    }
+    let mut j = journal(None);
+    let bad = Event::Refusal {
+        step: "draw".into(),
+        name: String::new(),
+        fault: "Timeout".into(),
+    };
+    assert!(matches!(j.append(ROOT, bad), Err(Fault::Unsupported(_))));
+    assert!(j.is_empty());
+}
+
+#[test]
 fn field_counts_must_match_the_kind() {
-    for kind in 1..=11 {
+    for kind in 1..=12 {
         let r = valid(kind);
         for n in [r.fields.len() as u8 + 1, r.fields.len() as u8 - 1] {
             let mut bad = r.clone();
@@ -1267,12 +1311,25 @@ fn damage_to_the_last_frame() {
     let all = frames(&file);
     let n = all.len() as u64;
     let (start, len) = *all.last().unwrap();
-    // Content damage with no successor is indistinguishable from a torn
-    // write, so it is a tail.
+    // A flipped content byte in a frame whose hash still verifies: the
+    // writer wrote the whole frame, so the content was damaged afterwards
+    // (bit rot, tampering). Corruption, never a tail a writer may cut off.
     let mut content = file.clone();
     content[start + 4 + len - 1] ^= 0x01;
-    let parsed = Journal::parse(&content, None).unwrap();
-    assert_eq!(parsed.journal.len(), n - 1);
+    let (at, reason) = corrupt_at(Journal::parse(&content, None));
+    assert_eq!(at, n - 1);
+    assert!(reason.contains("commitment"), "{reason}");
+    // The same content reading back as zeros, the way a block the
+    // filesystem extended but never wrote does when a crash kept the
+    // block with the hash: a torn tail.
+    let body = "the last content".len();
+    let mut unwritten = file.clone();
+    unwritten[start + 4 + len - body..start + 4 + len].fill(0);
+    let parsed = Journal::parse(&unwritten, None).unwrap();
+    assert_eq!(
+        (parsed.journal.len(), parsed.tail_len),
+        (n - 1, (len + 36) as u64)
+    );
     // An intact frame whose link fails is not something a crash leaves
     // behind: a changed field, or a changed stored hash, is corruption.
     let mut field = file.clone();

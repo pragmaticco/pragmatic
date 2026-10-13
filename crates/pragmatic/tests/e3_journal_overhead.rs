@@ -7,9 +7,10 @@
 //!     a latency-injected oracle replay is orders of magnitude faster than
 //!     recording.
 //!
-//! Each appended entry is a format 2 `DrawResult`: two content slots, each
-//! salted from the operating system's CSPRNG and committed with SHA-256,
-//! then chained. Run with `--release` for the headline numbers (the long
+//! The log alternates format 2 `DrawIntent` and `DrawResult` entries (one
+//! and two content slots), as model calls write them: every slot salted
+//! from the operating system's CSPRNG and committed with SHA-256, every
+//! result checked against its intent, every entry chained. Run with `--release` for the headline numbers (the long
 //! log is 1M entries there; unoptimized SHA-256 is slow enough that debug
 //! builds measure flatness at 100k). The assertions are deliberately loose
 //! so the suite stays green under debug builds and CI noise: E3 asserts
@@ -20,12 +21,21 @@ use std::time::{Duration, Instant};
 use pragmatic::journal::ROOT;
 use pragmatic::{Content, Ctx, Event, Fault, Journal, Oracle, Runtime, Value};
 
-fn result_event(i: u64) -> Event {
-    Event::DrawResult {
-        intent: i,
-        meta: r#"{"outcome":"ok"}"#.to_string(),
-        head: Content::from(format!("head-{i}")),
-        body: Content::from(format!("outcome-{i}")),
+/// Entry `i` of the log: a draw intent at even cursors, its result at odd
+/// ones.
+fn draw_event(i: u64) -> Event {
+    if i.is_multiple_of(2) {
+        Event::DrawIntent {
+            provenance: "bench".to_string(),
+            parts: vec![Content::from(format!("prompt-{i}"))],
+        }
+    } else {
+        Event::DrawResult {
+            intent: i - 1,
+            meta: r#"{"outcome":"ok"}"#.to_string(),
+            head: Content::from(format!("head-{i}")),
+            body: Content::from(format!("outcome-{i}")),
+        }
     }
 }
 
@@ -36,7 +46,7 @@ fn mean_append_nanos(n: u64) -> f64 {
     let mut j = Journal::new(None);
     // Build events up front so the measurement isolates the append path
     // itself (salt, commitments, encode, chain hash, push), not `format!`.
-    let events: Vec<Event> = (0..n).map(result_event).collect();
+    let events: Vec<Event> = (0..n).map(draw_event).collect();
     let start = Instant::now();
     for (i, ev) in events.into_iter().enumerate() {
         j.append(ROOT, ev).unwrap();

@@ -43,7 +43,7 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use crate::backend::{Backend, MemoryBackend};
 use crate::ctx::{
-    effect_failure, error_body, error_meta, lowest_failure, replayed_draw, RunOptions,
+    effect_fault, failed_draw, failed_effect, lowest_failure, replayed_draw, RunOptions,
 };
 use crate::fault::Fault;
 use crate::journal::{Branch, Journal, VerifyReport, ROOT};
@@ -135,17 +135,7 @@ impl<'a, O: AsyncOracle> AsyncCtx<'a, O> {
                 })?;
                 Ok(outcome)
             }
-            Err(fault) => {
-                self.with(|s, _| {
-                    s.draw_end(
-                        intent,
-                        error_meta(&fault),
-                        Value::default(),
-                        error_body(&fault),
-                    )
-                })?;
-                Err(fault)
-            }
+            Err(fault) => Err(self.with(|s, _| failed_draw(s, intent, &fault))?),
         }
     }
 
@@ -164,7 +154,7 @@ impl<'a, O: AsyncOracle> AsyncCtx<'a, O> {
         let start = self.with(|s, b| s.effect_begin(b, name, arg.clone()))?;
         let intent = match start {
             EffectStart::Replayed(result) => return Ok(result),
-            EffectStart::Failed { message, .. } => return Err(Fault::ToolErr(message)),
+            EffectStart::Failed { kind, message } => return Err(effect_fault(&kind, message)),
             EffectStart::Fresh { intent, .. } => intent,
         };
         match perform(&arg).await {
@@ -172,10 +162,7 @@ impl<'a, O: AsyncOracle> AsyncCtx<'a, O> {
                 self.with(|s, _| s.effect_end(intent, Ok(result.clone())))?;
                 Ok(result)
             }
-            Err(fault) => {
-                self.with(|s, _| s.effect_end(intent, Err(effect_failure(&fault))))?;
-                Err(fault)
-            }
+            Err(fault) => Err(self.with(|s, _| failed_effect(s, intent, &fault))?),
         }
     }
 

@@ -150,6 +150,22 @@ pub mod note {
     pub const SERVER_ONLY: [&str; 3] = [ERASURE, CUSTODY, TORN_TAIL];
 }
 
+/// The steps and faults of a [`Event::Refusal`] (spec 2.6).
+pub mod refusal {
+    /// A model call refused by the run's budget.
+    pub const DRAW: &str = "draw";
+    /// An effect refused because the run holds no capability for it.
+    pub const EFFECT: &str = "effect";
+    /// A receive that found the channel's inbox empty.
+    pub const RECV: &str = "recv";
+    /// The fault of a refused draw.
+    pub const BUDGET_EXHAUSTED: &str = "BudgetExhausted";
+    /// The fault of a refused effect.
+    pub const CAPABILITY_DENIED: &str = "CapabilityDenied";
+    /// The fault of a refused receive.
+    pub const TIMEOUT: &str = "Timeout";
+}
+
 /// The content of one slot as a reader sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Content {
@@ -287,6 +303,18 @@ pub enum Event {
         args: String,
         value: Content,
     },
+    /// A step the runtime refused without touching the world, raising
+    /// `fault`: a receive on `name` that found its inbox empty
+    /// ([`refusal::RECV`], `Timeout`), a draw over the budget
+    /// ([`refusal::DRAW`], `BudgetExhausted`) or an effect `name` the run
+    /// holds no capability for ([`refusal::EFFECT`], `CapabilityDenied`).
+    /// It is journaled once the agent carries on past the fault, so replay
+    /// raises the same fault at the same step.
+    Refusal {
+        step: String,
+        name: String,
+        fault: String,
+    },
     /// An entry of a format 1 journal, which is read-only.
     Legacy(LegacyEvent),
 }
@@ -306,6 +334,7 @@ impl Event {
             Event::Marker { .. } => "Marker",
             Event::Note { .. } => "Note",
             Event::Random { .. } => "Random",
+            Event::Refusal { .. } => "Refusal",
             Event::Legacy(_) => "Legacy",
         }
     }
@@ -675,7 +704,9 @@ impl Journal {
     ///   fallback;
     /// - anything else malformed (counts, non-strict JSON, a note off the
     ///   meta branch, a branch deeper than 32, a fork whose children would
-    ///   reach index `0xFFFF_FFFF`, a server-only note kind, a format 1
+    ///   reach index `0xFFFF_FFFF`, a result that does not complete an
+    ///   earlier intent of its kind on its own branch, a refusal whose fault
+    ///   does not fit its step, a server-only note kind, a format 1
     ///   journal) is [`Fault::Unsupported`].
     ///
     /// The new frame is pending until [`mark_persisted`](Self::mark_persisted).
@@ -737,12 +768,14 @@ impl Journal {
     /// Encode, salt, deduplicate, chain and buffer one entry. All checks
     /// happen before any state changes, so a failed append leaves the
     /// journal exactly as it was.
-    fn push(&mut self, at: u64, branch: &[u32], event: Event) -> Result<Cursor, Fault> {
+    fn push(&mut self, at: u64, branch: &[u32], mut event: Event) -> Result<Cursor, Fault> {
         if self.format != FORMAT {
             return Err(Fault::Unsupported(FORMAT1_READ_ONLY.into()));
         }
         check_append(branch, &event)?;
         let cursor = self.len();
+        codec::check_completion(&event, branch, cursor, &self.entries)
+            .map_err(|why| Fault::Unsupported(why.to_string()))?;
 
         // Dedup decisions first, so salts are drawn only for slots that are
         // actually sealed.
@@ -753,6 +786,15 @@ impl Journal {
             refs.push(self.find_duplicate(value.as_bytes()));
         }
         drop(contents);
+        // A ref slot holds its target's bytes, so share the target's buffer
+        // and let the caller's copy go: an agent that resends a long
+        // conversation on every call then keeps one copy of each message.
+        for (content, r) in event.slot_contents_mut().into_iter().zip(&refs) {
+            if let Some((c, s, _)) = r {
+                let target = self.entries[*c as usize].event.slot_contents()[*s as usize];
+                *content = target.clone();
+            }
+        }
 
         // The size is known once the dedup decisions are made, so an
         // oversized record is refused before any content is hashed.
@@ -930,9 +972,9 @@ impl Journal {
     // Verification
     // -----------------------------------------------------------------
 
-    /// Check every commitment, every ref and every chain link. `Err` names
-    /// the first bad cursor. Erasure accounting is in
-    /// [`audit`](Self::audit).
+    /// Check every commitment, every ref, every completion's intent
+    /// reference and every chain link. `Err` names the first bad cursor.
+    /// Erasure accounting is in [`audit`](Self::audit).
     pub fn verify(&self) -> Result<(), Cursor> {
         let key = self.key.as_deref();
         let mut prev = self.genesis;
@@ -941,7 +983,13 @@ impl Journal {
             let expect = match &entry.event {
                 Event::Legacy(ev) => legacy::link(key, &prev, cursor, &legacy::encode(ev)),
                 _ => {
-                    if !self.slots_consistent(i) {
+                    let completes = codec::check_completion(
+                        &entry.event,
+                        &entry.branch,
+                        cursor,
+                        &self.entries[..i],
+                    );
+                    if !self.slots_consistent(i) || completes.is_err() {
                         return Err(cursor);
                     }
                     codec::link(key, &prev, cursor, &codec::skeleton(entry))
@@ -1162,6 +1210,8 @@ fn check_append(branch: &[u32], event: &Event) -> Result<(), Fault> {
             }
         }
         Event::Random { args, .. } => json_field(args, "random args")?,
+        Event::Refusal { step, name, fault } => codec::check_refusal(step, name, fault)
+            .map_err(|why| Fault::Unsupported(why.to_string()))?,
         _ => {}
     }
     Ok(())

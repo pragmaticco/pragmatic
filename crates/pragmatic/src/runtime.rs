@@ -145,6 +145,9 @@ impl Core {
         policy: Option<RecoverPolicy<'_>>,
     ) -> Result<Session, Fault> {
         validate_run_id(run_id)?;
+        // Before the checkout, which creates the run: a run refused for its
+        // options must leave nothing behind to list or resume.
+        crate::session::check_options(opts)?;
         let inbox = Some(self.inbox(run_id));
         if mode == Mode::Replay {
             let journal = self.backend.snapshot(run_id, self.key())?;
@@ -173,7 +176,7 @@ impl Core {
     }
 
     pub(crate) fn verify(&self, run_id: &str) -> Result<VerifyReport, Fault> {
-        Ok(self.snapshot(run_id)?.audit())
+        self.backend.verify(run_id, self.key())
     }
 
     pub(crate) fn runs(&self) -> Result<Vec<String>, Fault> {
@@ -354,10 +357,13 @@ impl<O: Oracle> Runtime<O> {
 
     /// Resume a crashed run: replay the journaled prefix (zero model calls,
     /// no duplicate effects), then continue recording where it stopped.
-    /// Effects the crash left without a result are written off and performed
-    /// again (on a server-backed runtime, an explicit policy is required);
-    /// a failed effect at the end of a branch is retried. Errors if no
-    /// journal exists for `run_id`.
+    /// Effects the crash left without a result at the end of their branch
+    /// are written off and performed again (on a server-backed runtime, an
+    /// explicit policy is required); one left open with later steps
+    /// recorded after it is [`Fault::DanglingEffect`] until a policy commits
+    /// or fails it. A failure nothing observed (at the end of its branch and
+    /// of every branch above it) is retried. Errors if the run has not
+    /// started.
     pub fn resume(
         &self,
         run_id: &str,
@@ -373,8 +379,10 @@ impl<O: Oracle> Runtime<O> {
     /// for effects a crash left without a result ([Eff-recover]): for each,
     /// decide whether it completed (`Recover::Commit(result)`, for example
     /// after checking the world) or must be written off
-    /// (`Recover::Compensate`: the resumed run performs it again). Failed
-    /// effects at the end of a branch are retried, as by
+    /// (`Recover::Compensate`: the resumed run performs it again). An effect
+    /// left open while later steps were recorded on its branch (concurrent
+    /// calls) cannot be written off; only `Commit` or `Fail` decides it.
+    /// Failed effects at the end of a branch are retried, as by
     /// [`resume`](Self::resume); use [`begin_with`](Self::begin_with) to
     /// decide those too.
     pub fn resume_with(
@@ -424,7 +432,11 @@ impl<O: Oracle> Runtime<O> {
     }
 
     /// Verify the run's durable journal: every chain link, commitment and
-    /// ref, plus erasure accounting.
+    /// ref, plus erasure accounting. Damage, including tampering in the
+    /// middle of the journal, is a report whose
+    /// [`first_bad`](VerifyReport::first_bad) names the first bad cursor;
+    /// an error means the journal could not be judged at all (missing, not
+    /// a journal, or the wrong key).
     pub fn verify(&self, run_id: &str) -> Result<VerifyReport, Fault> {
         self.core.verify(run_id)
     }

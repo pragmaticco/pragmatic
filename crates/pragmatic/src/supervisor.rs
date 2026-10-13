@@ -129,9 +129,11 @@ impl Supervisor {
                 Decision::Restart if attempt < self.max_restarts => {
                     attempt += 1;
                     // [Sup-restart]: re-enter the term against J↾id. Effects
-                    // a crash left open are written off (performed again on
-                    // re-entry), and a failed effect at the end of a branch
-                    // is retried.
+                    // a crash left open at the end of their branch are
+                    // written off (performed again on re-entry), and a
+                    // failure nothing observed is retried. An effect left
+                    // open with later steps after it cannot be written off:
+                    // the attempt stops with DanglingEffect for a decision.
                     outcome = rt.resume_with(
                         run_id,
                         opts.clone(),
@@ -153,9 +155,17 @@ impl Supervisor {
     /// [Sup-comp]: compensations run in reverse commit order against the
     /// effects whose latest result is `ok`. The saga checks the run out
     /// (taking its write lock, like any writer) and records each
-    /// compensation as a `recovery` note with decision `compensate` on the
-    /// meta branch, so program replay of the run is unchanged and a later
-    /// saga never undoes the same effect twice.
+    /// compensation as `recovery` notes with decision `compensate` on the
+    /// meta branch, so program replay of the run is unchanged.
+    ///
+    /// The first note (`"saga": "begin"`) is persisted *before* the
+    /// compensator runs and the second (`"saga": "done"`) after it returns.
+    /// An effect with a `begin` note is never compensated again, so a later
+    /// saga never undoes the same effect twice, even when this one dies
+    /// between its note and its compensator; a `begin` without a `done`
+    /// shows an operator a compensation that may not have finished. If a
+    /// note cannot be persisted, the saga stops with that fault before
+    /// undoing anything more.
     fn run_saga<O: Oracle>(&mut self, rt: &Runtime<O>, run_id: &str) -> Result<(), Fault> {
         let mut co = rt.checkout(run_id)?;
         let entries = co.journal.entries();
@@ -202,28 +212,31 @@ impl Supervisor {
         }
         committed.sort_by_key(|c| c.0);
         for (result_cursor, intent, branch, name, result) in committed.into_iter().rev() {
-            if let Some(f) = self.compensator.as_mut() {
-                f(&name, &result);
-            }
-            let data = Json::Object(vec![
-                (
-                    "branch".into(),
-                    Json::Array(branch.iter().map(|&i| Json::from(i)).collect()),
-                ),
-                ("decision".into(), "compensate".into()),
-                ("intent".into(), intent.into()),
-                ("name".into(), name.as_str().into()),
-                ("result".into(), result_cursor.into()),
-            ])
-            .to_string();
-            co.journal.append(
-                META,
+            let note = |phase: &str| {
+                let data = Json::Object(vec![
+                    (
+                        "branch".into(),
+                        Json::Array(branch.iter().map(|&i| Json::from(i)).collect()),
+                    ),
+                    ("decision".into(), "compensate".into()),
+                    ("intent".into(), intent.into()),
+                    ("name".into(), name.as_str().into()),
+                    ("result".into(), result_cursor.into()),
+                    ("saga".into(), phase.into()),
+                ])
+                .to_string();
                 Event::Note {
                     kind: note::RECOVERY.into(),
                     data,
                     payload: Vec::new(),
-                },
-            )?;
+                }
+            };
+            co.journal.append(META, note("begin"))?;
+            co.persist()?;
+            if let Some(f) = self.compensator.as_mut() {
+                f(&name, &result);
+            }
+            co.journal.append(META, note("done"))?;
             co.persist()?;
         }
         Ok(())

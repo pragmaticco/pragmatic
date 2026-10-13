@@ -26,6 +26,19 @@
 //! `attempt.end` is written, and the next attempt starts from what was
 //! durable.
 //!
+//! # Refusals (spec 2.6)
+//!
+//! Some steps fail without touching the world: a receive that finds its
+//! inbox empty, a draw over the budget, an effect the run has no
+//! capability for. An agent may handle such a fault and carry on (wait for
+//! an approval, else proceed; draw until the budget runs out), so the fault
+//! is part of what the agent observed and replay must raise it again. It is
+//! journaled as a `Refusal`, but only once the agent carries on past it:
+//! just before the next start event on its branch or on an ancestor branch,
+//! or before `attempt.end` when the agent returns ok. A refusal the agent
+//! did not carry on past is never written, so a resumed run tries the step
+//! again (the message may have arrived, the budget may have been raised).
+//!
 //! # Notes (spec 2.11)
 //!
 //! A recording attempt writes `run.start` (only into an empty journal),
@@ -41,7 +54,7 @@ use crate::backend::{CheckoutGuard, Sink};
 use crate::ctx::{OnCodeChange, RunOptions, TraceLabel};
 use crate::fault::Fault;
 use crate::journal::{
-    note, Branch, Content, Cursor, EffectOutcome, Entry, Event, Journal, TornTail, FORMAT,
+    note, refusal, Branch, Content, Cursor, EffectOutcome, Entry, Event, Journal, TornTail, FORMAT,
     FORMAT1_READ_ONLY, MAX_DEPTH, MAX_SLOT_BYTES, META, META_ID, ROOT,
 };
 use crate::json::Json;
@@ -121,7 +134,10 @@ pub enum Recover {
     Commit(Value),
     /// Write the effect off. The replayed program performs it again under a
     /// new intent. For a failed effect this is the default, and is recorded
-    /// as a `retry`.
+    /// as a `retry`. It applies only to an intent at the frontier of its
+    /// branch ([`RecoverRequest::at_frontier`]); one away from it is left
+    /// undecided, and the replayed program meets it as
+    /// [`Fault::DanglingEffect`].
     Compensate,
     /// Let a recorded failure stand, so replay fails the effect again. For
     /// an effect that has no result at all, record it as failed.
@@ -144,6 +160,12 @@ pub struct RecoverRequest<'a> {
     /// effect ran); `Some((error_kind, message))` for an intent whose latest
     /// result is a failure.
     pub failure: Option<(&'a str, &'a str)>,
+    /// True if no step was recorded after the intent on its branch or on
+    /// any branch above it. An intent away from the frontier can only be
+    /// decided with [`Recover::Commit`] or [`Recover::Fail`]: steps recorded
+    /// after it are in the way of a retry under a new intent, so
+    /// [`Recover::Compensate`] leaves it undecided.
+    pub at_frontier: bool,
 }
 
 /// A recovery policy: one decision per effect intent that needs one.
@@ -237,6 +259,7 @@ fn describe(event: &Event) -> String {
         Event::Marker { name } => format!("Marker({name}): this run took patch '{name}'"),
         Event::Note { kind, .. } => format!("Note({kind})"),
         Event::Random { source, args, .. } => format!("Random({source}, {args})"),
+        Event::Refusal { step, name, fault } => format!("Refusal({step} '{name}': {fault})"),
         other => other.kind_name().to_string(),
     }
 }
@@ -286,6 +309,12 @@ pub(crate) const META_OK: &str = r#"{"outcome":"ok"}"#;
 pub(crate) fn meta_outcome(meta: &str) -> Option<String> {
     let doc = crate::journal::strict_json_field(meta)?;
     doc.get("outcome")?.as_str().map(str::to_string)
+}
+
+/// Check the options of an attempt before anything is checked out or
+/// created, so a refused run leaves nothing behind.
+pub(crate) fn check_options(opts: &RunOptions) -> Result<(), Fault> {
+    check_labels(&opts.labels)
 }
 
 /// Check run labels against spec 2.11: at most 32 pairs, keys
@@ -355,6 +384,9 @@ pub struct Session {
     /// Branches that ended in a fault: exempt from completeness, with their
     /// descendants.
     faulted: HashSet<Branch>,
+    /// Refusals not journaled yet, in the order they happened, with their
+    /// branches (see the module documentation).
+    refusals: Vec<(Branch, Event)>,
 }
 
 impl fmt::Debug for Session {
@@ -424,6 +456,7 @@ impl Session {
             program_changes: Vec::new(),
             attempt: 0,
             faulted: HashSet::new(),
+            refusals: Vec::new(),
         };
         session.index();
         Ok(session)
@@ -446,7 +479,13 @@ impl Session {
             }
             match &entry.event {
                 Event::DrawResult { intent, .. } | Event::EffectResult { intent, .. } => {
-                    self.results.insert(*intent, entry.cursor);
+                    // Reading and appending both refuse a result that names
+                    // anything but an earlier intent of its kind on its
+                    // branch; skipping one here keeps a journal built some
+                    // other way from handing a step another step's record.
+                    if completes(&self.journal, entry) {
+                        self.results.insert(*intent, entry.cursor);
+                    }
                 }
                 event if is_start(event) => {
                     if matches!(event, Event::DrawIntent { .. }) {
@@ -477,6 +516,15 @@ impl Session {
             return Ok(());
         }
         if self.journal.is_empty() {
+            if self.mode == Mode::Resume {
+                // Only a run that started can be resumed. An empty journal is
+                // what a run refused before its first entry (or a torn first
+                // write) leaves behind; `run` starts it.
+                return Err(Fault::Io(format!(
+                    "run '{}' has not started (its journal has no entries); use run to start it",
+                    self.run_id
+                )));
+            }
             let event = self.run_start(opts)?;
             self.append(META, event)?;
         }
@@ -564,30 +612,30 @@ impl Session {
     /// Decide every effect intent an earlier attempt left without a result,
     /// every frontier effect whose latest result failed, and mark frontier
     /// draws whose latest result is an error for re-issue.
+    ///
+    /// Only a failure nothing observed is retried. A failure is observed
+    /// when the agent recorded a step after it on its own branch, or on a
+    /// branch above it (a parallel child that handled a failed call and
+    /// returned, after which the parent carried on with the child's value),
+    /// or when an attempt that saw it ended ok. Retrying an observed failure
+    /// would change what the agent saw while the steps it took because of
+    /// it stay in the journal, so the run could never replay again.
     fn recover(
         &mut self,
         mut policy: Option<RecoverPolicy<'_>>,
         remote: bool,
     ) -> Result<(), Fault> {
-        let mut frontier: HashSet<Cursor> = HashSet::new();
-        for state in self.branches.values() {
-            if let Some(&last) = state.starts.last() {
-                frontier.insert(last);
-            }
-        }
-        // A failure is retried only if the agent may not have seen it: an
-        // attempt that ended ok after it observed it and carried on, even
-        // when nothing else followed on its branch.
         let observed_upto = self.last_ok_end();
         let retryable = |result: Cursor| observed_upto.is_none_or(|end| result > end);
-        // Effect intents that need a decision, in cursor order.
-        let mut effects: Vec<Cursor> = Vec::new();
+        // Effect intents that need a decision, in cursor order, with
+        // whether each is at the frontier.
+        let mut effects: Vec<(Cursor, bool)> = Vec::new();
         for entry in self.journal.entries() {
             let latest = self.results.get(&entry.cursor).copied();
             let latest_event = latest.and_then(|r| self.journal.get(r)).map(|e| &e.event);
-            let at_frontier = frontier.contains(&entry.cursor);
             match &entry.event {
                 Event::EffectIntent { .. } => {
+                    let at_frontier = self.at_frontier(entry.cursor, &entry.branch);
                     let pending = match latest {
                         None => true,
                         Some(r) => {
@@ -603,10 +651,10 @@ impl Session {
                         }
                     };
                     if pending {
-                        effects.push(entry.cursor);
+                        effects.push((entry.cursor, at_frontier));
                     }
                 }
-                Event::DrawIntent { .. } if at_frontier => {
+                Event::DrawIntent { .. } if self.at_frontier(entry.cursor, &entry.branch) => {
                     let errored = latest.is_some_and(retryable)
                         && matches!(
                             latest_event,
@@ -620,10 +668,22 @@ impl Session {
                 _ => {}
             }
         }
-        for intent in effects {
-            self.decide(intent, policy.as_deref_mut(), remote)?;
+        for (intent, at_frontier) in effects {
+            self.decide(intent, at_frontier, policy.as_deref_mut(), remote)?;
         }
         Ok(())
+    }
+
+    /// True if no start event follows `cursor` on `branch` or on any branch
+    /// above it (spec 2.12): nothing the agent recorded can have depended on
+    /// how the step at `cursor` ended.
+    fn at_frontier(&self, cursor: Cursor, branch: &[u32]) -> bool {
+        (0..=branch.len()).all(|k| {
+            self.branches
+                .get(&branch[..k])
+                .and_then(|state| state.starts.last())
+                .is_none_or(|&last| last <= cursor)
+        })
     }
 
     /// The cursor of the last `attempt.end` whose outcome is `ok`: every
@@ -648,9 +708,18 @@ impl Session {
 
     /// One recovery decision: ask the policy, append the effect's new result
     /// (if any) and the `recovery` note.
+    ///
+    /// An intent left without a result away from the frontier cannot be
+    /// written off: its retry would be a fresh intent at the end of the
+    /// branch, while replay meets the steps recorded after it first. Only
+    /// an explicit `Commit` or `Fail` decides it; otherwise nothing is
+    /// appended, the replayed program meets it as
+    /// [`Fault::DanglingEffect`], and a later resume with a policy can
+    /// still decide it.
     fn decide<'p>(
         &mut self,
         intent: Cursor,
+        at_frontier: bool,
         policy: Option<&mut (dyn FnMut(&RecoverRequest<'_>) -> Recover + 'p)>,
         remote: bool,
     ) -> Result<(), Fault> {
@@ -683,17 +752,20 @@ impl Session {
                 branch: &entry.branch,
                 intent,
                 failure: failure.as_ref().map(|(k, m)| (k.as_str(), m.as_str())),
+                at_frontier,
             };
             match policy {
                 Some(p) => p(&request),
                 None if failure.is_none() && remote => {
                     return Err(Fault::DanglingEffect { cursor: intent })
                 }
+                None if !at_frontier => return Ok(()),
                 None => Recover::Compensate,
             }
         };
         let (result, label) = match (decision, &failure) {
             (Recover::Commit(v), _) => (self.effect_result(intent, Ok(v))?, "commit"),
+            (Recover::Compensate, None) if !at_frontier => return Ok(()),
             (Recover::Compensate, None) => (self.effect_compensated(intent)?, "compensate"),
             (Recover::Compensate, Some(_)) => (self.effect_compensated(intent)?, "retry"),
             (Recover::Fail, None) => (
@@ -772,10 +844,21 @@ impl Session {
 
     /// Append an entry and keep the indexes current. The branch of a start
     /// event must already be indexed (it is the branch being stepped).
+    ///
+    /// A start event first journals the pending refusals it follows: those
+    /// on its own branch and on the branches below it.
     fn append(&mut self, branch: &[u32], event: Event) -> Result<Cursor, Fault> {
         if let Some(f) = &self.failed {
             return Err(f.clone());
         }
+        if branch != META && is_start(&event) {
+            self.flush_refusals(Some(branch))?;
+        }
+        self.append_entry(branch, event)
+    }
+
+    /// [`append`](Self::append) without journaling pending refusals.
+    fn append_entry(&mut self, branch: &[u32], event: Event) -> Result<Cursor, Fault> {
         let start = branch != META && is_start(&event);
         let completes = match &event {
             Event::DrawResult { intent, .. } | Event::EffectResult { intent, .. } => Some(*intent),
@@ -794,6 +877,62 @@ impl Session {
             self.results.insert(intent, cursor);
         }
         Ok(cursor)
+    }
+
+    /// Journal the pending refusals on `scope` and every branch below it
+    /// (all of them for `None`), in the order they happened.
+    fn flush_refusals(&mut self, scope: Option<&[u32]>) -> Result<(), Fault> {
+        let (due, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.refusals)
+            .into_iter()
+            .partition(|(b, _)| scope.is_none_or(|s| b.starts_with(s)));
+        self.refusals = kept;
+        for (b, event) in due {
+            self.append_entry(&b, event)?;
+        }
+        Ok(())
+    }
+
+    /// Raise `fault` for a step refused without effect at the end of branch
+    /// `b`, and remember the refusal so it is journaled once the agent
+    /// carries on past it (see the module documentation). A refusal in the
+    /// middle of a recorded branch, or in strict replay, is raised but never
+    /// journaled: the branch is not being recorded there.
+    fn refuse(&mut self, b: &Branch, step: &str, name: &str, fault: Fault) -> Fault {
+        if !self.strict() && self.peek(b).is_none() {
+            let event = Event::Refusal {
+                step: step.to_string(),
+                name: name.to_string(),
+                fault: fault.kind().to_string(),
+            };
+            self.refusals.push((b.clone(), event));
+        }
+        fault
+    }
+
+    /// If the next start on `b` is a refusal of this step, consume it and
+    /// return the fault it recorded, which the step raises again.
+    fn replayed_refusal(&mut self, b: &Branch, step: &str, name: &str) -> Option<Fault> {
+        let c = self.peek(b)?;
+        let Event::Refusal {
+            step: s,
+            name: n,
+            fault,
+        } = self.event(c)
+        else {
+            return None;
+        };
+        if s != step || n != name {
+            return None;
+        }
+        let fault = match fault.as_str() {
+            refusal::TIMEOUT => Fault::Timeout,
+            refusal::BUDGET_EXHAUSTED => Fault::BudgetExhausted,
+            refusal::CAPABILITY_DENIED => Fault::CapabilityDenied(name.to_string()),
+            _ => return Some(self.desync(c, format!("a refusal of {step}"))),
+        };
+        self.consume(b);
+        self.replayed += 1;
+        Some(fault)
     }
 
     /// Append and persist: the result of a step is released only after
@@ -939,7 +1078,8 @@ impl Session {
     ///
     /// A fresh intent is refused with [`Fault::BudgetExhausted`] when the
     /// draws in the journal at checkout plus those opened in this attempt
-    /// reach the budget. Replayed draws never charge the budget.
+    /// reach the budget. Replayed draws never charge the budget; a recorded
+    /// refusal replays as the same fault.
     pub fn draw_begin(
         &mut self,
         b: &Branch,
@@ -951,6 +1091,9 @@ impl Session {
             return Err(Fault::Unsupported(
                 "a draw needs at least one request part".into(),
             ));
+        }
+        if let Some(fault) = self.replayed_refusal(b, refusal::DRAW, "") {
+            return Err(fault);
         }
         if let Some(c) = self.peek(b) {
             let Event::DrawIntent {
@@ -996,7 +1139,7 @@ impl Session {
                 meta, head, body, ..
             } = self.event(r)
             else {
-                unreachable!("draw intents are completed by draw results")
+                return Err(self.desync(r, format!("the DrawResult of the intent at {c}")));
             };
             let head = Self::sealed(head, r)?.clone();
             let body = Self::sealed(body, r)?.clone();
@@ -1022,7 +1165,7 @@ impl Session {
         }
         if let Some(limit) = self.budget {
             if self.draws_at_checkout + self.fresh_intents >= limit {
-                return Err(Fault::BudgetExhausted);
+                return Err(self.refuse(b, refusal::DRAW, "", Fault::BudgetExhausted));
             }
         }
         let cursor = self.append(
@@ -1065,8 +1208,13 @@ impl Session {
                 "the intent at cursor {intent} is not a draw"
             )));
         }
-        let ok = meta_outcome(&meta).as_deref() != Some("error");
-        self.append(
+        let Some(outcome) = meta_outcome(&meta) else {
+            return Err(Fault::Unsupported(
+                "draw meta must be strict JSON with an outcome".into(),
+            ));
+        };
+        let ok = outcome != "error";
+        let appended = self.append(
             &branch,
             Event::DrawResult {
                 intent,
@@ -1074,7 +1222,13 @@ impl Session {
                 head: Content::Sealed(head),
                 body: Content::Sealed(body.clone()),
             },
-        )?;
+        );
+        if let Err(fault) = appended {
+            // The call was made (and paid for) but cannot be recorded: the
+            // attempt cannot go on as if it had been (spec 2.15).
+            self.failed = Some(fault.clone());
+            return Err(fault);
+        }
         self.open.remove(&intent);
         self.fresh += 1;
         self.sync()?;
@@ -1109,10 +1263,12 @@ impl Session {
         arg: Value,
     ) -> Result<EffectStart, Fault> {
         self.enter(b)?;
-        if let Some(caps) = &self.caps {
-            if !caps.contains(name) {
-                return Err(Fault::CapabilityDenied(name.to_string()));
-            }
+        if let Some(fault) = self.replayed_refusal(b, refusal::EFFECT, name) {
+            return Err(fault);
+        }
+        if self.caps.as_ref().is_some_and(|caps| !caps.contains(name)) {
+            let denied = Fault::CapabilityDenied(name.to_string());
+            return Err(self.refuse(b, refusal::EFFECT, name, denied));
         }
         while let Some(c) = self.peek(b) {
             let Event::EffectIntent { name: n, arg: a } = self.event(c) else {
@@ -1140,7 +1296,7 @@ impl Session {
                 ..
             } = self.event(r)
             else {
-                unreachable!("effect intents are completed by effect results")
+                return Err(self.desync(r, format!("the EffectResult of the intent at {c}")));
             };
             match outcome {
                 EffectOutcome::Compensated => {
@@ -1195,17 +1351,18 @@ impl Session {
     /// message))` when perform raised. The result is appended and persisted
     /// before this returns.
     ///
-    /// If `perform` succeeded but its result cannot be persisted, this
+    /// If `perform` succeeded but its result cannot be recorded, this
     /// returns [`Fault::EffectUnrecorded`] carrying the result, so the
-    /// caller can log or reconcile what the world now holds.
+    /// caller can log or reconcile what the world now holds (spec 3.2). That
+    /// covers a failed persist, a session another branch's persist failed
+    /// while the effect ran, and a result over the slot limit. In each case
+    /// the session is failed: the effect is on record only as an intent,
+    /// which the next attempt's recovery decides.
     pub fn effect_end(
         &mut self,
         intent: Cursor,
         outcome: Result<Value, (String, String)>,
     ) -> Result<(), Fault> {
-        if let Some(f) = &self.failed {
-            return Err(f.clone());
-        }
         let Some(branch) = self.open.get(&intent).cloned() else {
             return Err(Fault::Unsupported(format!(
                 "no effect is open at cursor {intent}"
@@ -1217,18 +1374,25 @@ impl Session {
             )));
         };
         let name = name.clone();
+        let unrecorded = |fault: Fault, outcome: Option<Value>| match outcome {
+            Some(result) => Fault::EffectUnrecorded {
+                name: name.clone(),
+                intent,
+                result,
+            },
+            None => fault,
+        };
         let ok = outcome.as_ref().ok().cloned();
-        self.effect_result(intent, outcome)?;
+        if let Some(f) = self.failed.clone() {
+            return Err(unrecorded(f, ok));
+        }
+        if let Err(fault) = self.effect_result(intent, outcome) {
+            self.failed = Some(fault.clone());
+            return Err(unrecorded(fault, ok));
+        }
         self.open.remove(&intent);
         if let Err(fault) = self.sync() {
-            return Err(match ok {
-                Some(result) => Fault::EffectUnrecorded {
-                    name,
-                    intent,
-                    result,
-                },
-                None => fault,
-            });
+            return Err(unrecorded(fault, ok));
         }
         if let Some(result) = ok {
             self.label(TraceLabel::Effect {
@@ -1246,9 +1410,17 @@ impl Session {
     // -----------------------------------------------------------------
 
     /// Receive on `channel`: replayed from the journal, or taken from the
-    /// run's inbox and recorded. An empty inbox is [`Fault::Timeout`].
+    /// run's inbox and recorded. An empty inbox is [`Fault::Timeout`], and a
+    /// recorded refusal replays as one.
+    ///
+    /// The message stays in the inbox until its `ChannelRecv` is durable: a
+    /// receive over the slot limit, or one whose persist fails, leaves it
+    /// for the next receive or the next attempt.
     pub fn recv(&mut self, b: &Branch, channel: &str) -> Result<Value, Fault> {
         self.enter(b)?;
+        if let Some(fault) = self.replayed_refusal(b, refusal::RECV, channel) {
+            return Err(fault);
+        }
         if let Some(c) = self.peek(b) {
             let Event::ChannelRecv { channel: ch, value } = self.event(c) else {
                 return Err(self.desync(c, format!("ChannelRecv({channel})")));
@@ -1270,17 +1442,15 @@ impl Session {
         if self.strict() {
             return Err(self.exhausted());
         }
-        let value = self
-            .inbox
-            .as_ref()
-            .and_then(|inbox| {
-                inbox
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get_mut(channel)
-                    .and_then(VecDeque::pop_front)
-            })
-            .ok_or(Fault::Timeout)?;
+        let front = self.inbox.as_ref().and_then(|inbox| {
+            lock_inbox(inbox)
+                .get(channel)
+                .and_then(VecDeque::front)
+                .cloned()
+        });
+        let Some(value) = front else {
+            return Err(self.refuse(b, refusal::RECV, channel, Fault::Timeout));
+        };
         let cursor = self.append_synced(
             b,
             Event::ChannelRecv {
@@ -1288,6 +1458,13 @@ impl Session {
                 value: Content::Sealed(value.clone()),
             },
         )?;
+        // Durable now, so take it. Only the attempt holding the run receives
+        // on its inbox, so the front is still this message.
+        if let Some(inbox) = &self.inbox {
+            lock_inbox(inbox)
+                .get_mut(channel)
+                .and_then(VecDeque::pop_front);
+        }
         self.label(TraceLabel::Recv {
             branch: b.clone(),
             cursor,
@@ -1687,6 +1864,13 @@ impl Session {
         if self.strict() {
             return result;
         }
+        // The agent returned ok, so it carried on past every refusal it saw.
+        // A failed attempt drops them: the resumed run tries those steps
+        // again.
+        let result = match result {
+            Ok(v) => self.flush_refusals(None).map(|()| v),
+            Err(e) => Err(e),
+        };
         let event = self.attempt_end(&result);
         let written = self.append(META, event).and_then(|_| self.sync());
         match (result, written) {
@@ -1769,6 +1953,29 @@ impl Session {
             program_changes: std::mem::take(&mut self.program_changes),
         }
     }
+}
+
+fn lock_inbox(inbox: &Inbox) -> std::sync::MutexGuard<'_, HashMap<String, VecDeque<Value>>> {
+    inbox.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// True if `entry` is a result that completes an earlier intent of its kind
+/// on its own branch (the rule [`Journal::append`] and [`Journal::parse`]
+/// enforce).
+fn completes(journal: &Journal, entry: &Entry) -> bool {
+    let (intent, draw) = match &entry.event {
+        Event::DrawResult { intent, .. } => (*intent, true),
+        Event::EffectResult { intent, .. } => (*intent, false),
+        _ => return false,
+    };
+    journal
+        .get(intent)
+        .filter(|t| t.cursor < entry.cursor && t.branch == entry.branch)
+        .is_some_and(|t| match t.event {
+            Event::DrawIntent { .. } => draw,
+            Event::EffectIntent { .. } => !draw,
+            _ => false,
+        })
 }
 
 /// `(cursor, to)` of a `program.change` note's data.
@@ -1987,6 +2194,122 @@ mod tests {
             s.draw_begin(&root, "p", Vec::new()),
             Err(Fault::Unsupported(_))
         ));
+    }
+
+    fn refusal_cursors(s: &Session) -> Vec<(Cursor, Branch)> {
+        s.journal()
+            .entries()
+            .iter()
+            .filter(|e| matches!(e.event, Event::Refusal { .. }))
+            .map(|e| (e.cursor, e.branch.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn refusals_are_journaled_once_the_agent_carries_on() {
+        let (_b, mut s) = recording("refuse", &RunOptions::default());
+        let root = ROOT.to_vec();
+        let kids = s.fork(&root, 2).unwrap();
+        // The session has no inbox at all: every receive finds it empty.
+        assert_eq!(s.recv(&kids[0], "approval"), Err(Fault::Timeout));
+        // A sibling's steps do not carry child 0 past its refusal.
+        s.now(&kids[1]).unwrap();
+        assert!(refusal_cursors(&s).is_empty());
+        s.join(&root, &kids, &[false, true]).unwrap();
+        // The parent's next step does, and the refusal lands before it, on
+        // the child's branch.
+        s.now(&root).unwrap();
+        let clock = s.journal().len() - 1;
+        assert_eq!(refusal_cursors(&s), vec![(clock - 1, kids[0].clone())]);
+        assert!(s.unpersisted().is_none(), "persisted with the step");
+    }
+
+    #[test]
+    fn a_failed_attempt_drops_its_refusals() {
+        let (_b, mut s) = recording("dropped", &RunOptions::default());
+        let root = ROOT.to_vec();
+        assert_eq!(s.recv(&root, "approval"), Err(Fault::Timeout));
+        assert_eq!(s.end(Err(Fault::Timeout)), Err(Fault::Timeout));
+        assert!(refusal_cursors(&s).is_empty());
+        // Returning ok after handling it journals it before attempt.end.
+        let (_b, mut s) = recording("kept", &RunOptions::default());
+        assert_eq!(s.recv(&root, "approval"), Err(Fault::Timeout));
+        s.end(Ok(Value::from("default"))).unwrap();
+        let refusals = refusal_cursors(&s);
+        assert_eq!(refusals.len(), 1);
+        assert_eq!(
+            s.journal()
+                .get(refusals[0].0 + 1)
+                .unwrap()
+                .event
+                .note_kind(),
+            Some(note::ATTEMPT_END)
+        );
+    }
+
+    #[test]
+    fn a_draw_response_that_cannot_be_recorded_fails_the_attempt() {
+        let (_b, mut s) = recording("big", &RunOptions::default());
+        let root = ROOT.to_vec();
+        let DrawStart::Fresh(i) = s.draw_begin(&root, "p", vec![Value::from("q")]).unwrap() else {
+            panic!()
+        };
+        // Malformed meta is the caller's mistake: refused, nothing changes.
+        assert!(matches!(
+            s.draw_end(i, "{}".into(), Value::default(), Value::default()),
+            Err(Fault::Unsupported(_))
+        ));
+        assert!(s.failure().is_none());
+        // A response over the slot limit was paid for and cannot be
+        // recorded: the attempt cannot go on.
+        let huge = Value::from(vec![0u8; (MAX_SLOT_BYTES + 1) as usize]);
+        let err = s
+            .draw_end(i, META_OK.into(), Value::default(), huge)
+            .unwrap_err();
+        assert!(matches!(err, Fault::TooLarge { .. }), "{err:?}");
+        assert_eq!(s.now(&root).unwrap_err(), err);
+    }
+
+    #[test]
+    fn a_result_of_the_other_kind_is_never_matched() {
+        // Appending and parsing both refuse such a result; a journal built
+        // around them (only the tamper hook can) must still fault, not
+        // panic.
+        let mut j = Journal::new(None);
+        let draw = j
+            .append(
+                ROOT,
+                Event::DrawIntent {
+                    provenance: "p".into(),
+                    parts: vec![Content::from("q")],
+                },
+            )
+            .unwrap();
+        j.append(
+            ROOT,
+            Event::DrawResult {
+                intent: draw,
+                meta: META_OK.into(),
+                head: Content::from(""),
+                body: Content::from("a"),
+            },
+        )
+        .unwrap();
+        j.tamper(draw + 1, |e| {
+            e.event = Event::EffectResult {
+                intent: draw,
+                outcome: EffectOutcome::Ok,
+                error_kind: String::new(),
+                payload: Some(Content::from("forged")),
+            };
+        });
+        let opts = RunOptions::default();
+        let mut s = Session::new("r", Mode::Replay, j, None, &opts, None).unwrap();
+        let root = ROOT.to_vec();
+        assert_eq!(
+            s.draw_begin(&root, "p", vec![Value::from("q")]),
+            Err(Fault::ReplayExhausted { cursor: draw })
+        );
     }
 
     #[test]

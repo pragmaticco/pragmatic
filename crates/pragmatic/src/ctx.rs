@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::fault::Fault;
 use crate::journal::{Branch, Cursor};
+use crate::json::Json;
 use crate::oracle::Oracle;
 use crate::session::{meta_outcome, DrawStart, EffectStart, Session, META_OK};
 use crate::value::Value;
@@ -167,44 +168,82 @@ impl RunOptions {
     }
 }
 
-/// The `meta` of a draw whose model call failed.
+/// The `meta` of a draw whose model call failed with `fault`: outcome
+/// `error`, the fault's kind as `error_type` so replay raises the same
+/// fault, and for a timeout the transport class `error_kind` (spec 2.6).
 pub(crate) fn error_meta(fault: &Fault) -> String {
-    match fault {
-        Fault::Timeout => r#"{"error_kind":"timeout","outcome":"error"}"#.to_string(),
-        _ => r#"{"outcome":"error"}"#.to_string(),
+    let mut members = Vec::new();
+    if *fault == Fault::Timeout {
+        members.push(("error_kind".to_string(), Json::from("timeout")));
     }
+    members.push(("error_type".to_string(), Json::from(fault.kind())));
+    members.push(("outcome".to_string(), Json::from("error")));
+    Json::Object(members).to_string()
 }
 
 /// The message recorded in the body of a failed draw.
 pub(crate) fn error_body(fault: &Fault) -> Value {
-    match fault {
-        Fault::OracleErr(m) => Value::from(m.as_str()),
-        other => Value::from(other.to_string()),
-    }
+    Value::from(fault.recorded_message())
 }
 
-/// The fault a recorded failed draw replays as.
+/// The fault a recorded failed draw raises: the recorded fault when its
+/// `error_type` is a core fault kind that carries no more than a message,
+/// a timeout for the transport class `timeout`, and otherwise (other
+/// faults, or a draw recorded by an SDK with its own error types)
+/// [`Fault::OracleErr`] with the recorded message.
 pub(crate) fn draw_failure(meta: &str, body: &Value) -> Fault {
-    let timeout = crate::journal::strict_json_field(meta)
-        .and_then(|m| {
-            m.get("error_kind")
-                .and_then(|k| k.as_str().map(str::to_string))
-        })
-        .is_some_and(|k| k == "timeout");
-    if timeout {
-        Fault::Timeout
-    } else {
-        Fault::OracleErr(body.as_str().into_owned())
+    let meta = crate::journal::strict_json_field(meta);
+    let field = |key: &str| {
+        meta.as_ref()
+            .and_then(|m| m.get(key).and_then(|v| v.as_str().map(str::to_string)))
+    };
+    let message = body.as_str();
+    if let Some(fault) = field("error_type").and_then(|t| Fault::from_recorded(&t, &message)) {
+        return fault;
     }
+    if field("error_kind").as_deref() == Some("timeout") {
+        return Fault::Timeout;
+    }
+    Fault::OracleErr(message.into_owned())
+}
+
+/// Record a failed model call at `intent` and return the fault the agent
+/// gets: the one replay will raise, so the agent takes the same path on
+/// record and on replay (T1). For every fault that carries no more than a
+/// message that is the oracle's own fault.
+pub(crate) fn failed_draw(
+    session: &mut Session,
+    intent: Cursor,
+    fault: &Fault,
+) -> Result<Fault, Fault> {
+    let (meta, body) = (error_meta(fault), error_body(fault));
+    session.draw_end(intent, meta.clone(), Value::default(), body.clone())?;
+    Ok(draw_failure(&meta, &body))
 }
 
 /// The recorded `(error_kind, message)` of a fault raised by `perform`.
 pub(crate) fn effect_failure(fault: &Fault) -> (String, String) {
-    let message = match fault {
-        Fault::ToolErr(m) => m.clone(),
-        other => other.to_string(),
-    };
-    (fault.kind().to_string(), message)
+    (fault.kind().to_string(), fault.recorded_message())
+}
+
+/// The fault a recorded failed effect raises: the recorded fault when its
+/// `error_kind` is a core fault kind that carries no more than a message,
+/// otherwise (other faults, or an exception type recorded by another SDK)
+/// [`Fault::ToolErr`] with the recorded message (spec 2.12).
+pub(crate) fn effect_fault(kind: &str, message: String) -> Fault {
+    Fault::from_recorded(kind, &message).unwrap_or(Fault::ToolErr(message))
+}
+
+/// Record a failed effect at `intent` and return the fault the agent gets:
+/// the one replay will raise (see [`failed_draw`]).
+pub(crate) fn failed_effect(
+    session: &mut Session,
+    intent: Cursor,
+    fault: &Fault,
+) -> Result<Fault, Fault> {
+    let (kind, message) = effect_failure(fault);
+    session.effect_end(intent, Err((kind.clone(), message.clone())))?;
+    Ok(effect_fault(&kind, message))
 }
 
 /// The response of a replayed draw: the body, or the recorded failure.
@@ -250,8 +289,10 @@ impl<'a> Ctx<'a> {
     /// `let x ⇐ oracle(e)`: one model call, journaled once.
     ///
     /// The intent is persisted before the model is called and the response
-    /// after; a failed call is recorded too, so an agent that handles the
-    /// error replays identically. Replay reads the recorded response back
+    /// after; a failed call is recorded too, and the agent gets the fault
+    /// replay will raise (the oracle's own, for any fault that carries no
+    /// more than a message), so an agent that handles the error replays
+    /// identically. Replay reads the recorded response back
     /// and never calls the model ([O-rep]); a resumed run switches from
     /// replay to recording exactly where the branch's journal ends
     /// ([O-resume]).
@@ -273,15 +314,7 @@ impl<'a> Ctx<'a> {
                     )?;
                     Ok(outcome)
                 }
-                Err(fault) => {
-                    self.session.draw_end(
-                        intent,
-                        error_meta(&fault),
-                        Value::default(),
-                        error_body(&fault),
-                    )?;
-                    Err(fault)
-                }
+                Err(fault) => Err(failed_draw(self.session, intent, &fault)?),
             },
         }
     }
@@ -310,8 +343,9 @@ impl<'a> Ctx<'a> {
     ///    failure if `perform` returned an error.
     ///
     /// Replay reuses the recorded result and does **not** re-perform
-    /// ([Eff-rep]); a recorded failure replays as [`Fault::ToolErr`] with
-    /// the recorded message. A crash between 1 and 3 leaves an intent
+    /// ([Eff-rep]); a recorded failure replays as the fault `perform`
+    /// returned (or, for a fault that carries more than a message,
+    /// [`Fault::ToolErr`] with its text, on record and replay alike). A crash between 1 and 3 leaves an intent
     /// without a result, which [`Runtime::resume`](crate::Runtime::resume)
     /// decides before re-entering: the no-orphaned-effect property.
     pub fn effect(
@@ -336,7 +370,7 @@ impl<'a> Ctx<'a> {
         let arg = arg.into();
         match self.session.effect_begin(&self.branch, name, arg.clone())? {
             EffectStart::Replayed(result) => Ok(result),
-            EffectStart::Failed { message, .. } => Err(Fault::ToolErr(message)),
+            EffectStart::Failed { kind, message } => Err(effect_fault(&kind, message)),
             EffectStart::Fresh {
                 intent,
                 idempotency_key,
@@ -345,11 +379,7 @@ impl<'a> Ctx<'a> {
                     self.session.effect_end(intent, Ok(result.clone()))?;
                     Ok(result)
                 }
-                Err(fault) => {
-                    self.session
-                        .effect_end(intent, Err(effect_failure(&fault)))?;
-                    Err(fault)
-                }
+                Err(fault) => Err(failed_effect(self.session, intent, &fault)?),
             },
         }
     }

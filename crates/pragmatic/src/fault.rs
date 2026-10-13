@@ -248,6 +248,49 @@ impl Fault {
         }
     }
 
+    /// The text a journal records for this fault when a model call or an
+    /// effect fails with it: the message of a variant that carries only a
+    /// message, the display text otherwise. Together with
+    /// [`kind`](Self::kind) it is what [`from_recorded`](Self::from_recorded)
+    /// rebuilds the fault from.
+    pub fn recorded_message(&self) -> String {
+        match self {
+            Fault::OracleErr(m)
+            | Fault::ToolErr(m)
+            | Fault::ContractViol(m)
+            | Fault::CapabilityDenied(m)
+            | Fault::Io(m)
+            | Fault::Unsupported(m)
+            | Fault::Unavailable(m) => m.clone(),
+            other => other.to_string(),
+        }
+    }
+
+    /// Rebuild a fault from its recorded [`kind`](Self::kind) tag and
+    /// [`recorded_message`](Self::recorded_message), so a recorded failure
+    /// replays as the very fault the agent saw when it was recorded. `None`
+    /// for tags that are not fault kinds, and for the variants that carry
+    /// more than a message (cursors, sizes, nested faults), which the
+    /// journal does not keep; callers fall back to a fault of their own
+    /// (and use the same fallback when recording, so both sides agree).
+    pub fn from_recorded(kind: &str, message: &str) -> Option<Fault> {
+        let m = || message.to_string();
+        Some(match kind {
+            "OracleErr" => Fault::OracleErr(m()),
+            "ToolErr" => Fault::ToolErr(m()),
+            "ContractViol" => Fault::ContractViol(m()),
+            "CapabilityDenied" => Fault::CapabilityDenied(m()),
+            "Io" => Fault::Io(m()),
+            "Unsupported" => Fault::Unsupported(m()),
+            "Unavailable" => Fault::Unavailable(m()),
+            "Timeout" => Fault::Timeout,
+            "BudgetExhausted" => Fault::BudgetExhausted,
+            "LeaseLost" => Fault::LeaseLost,
+            "Deleted" => Fault::Deleted,
+            _ => return None,
+        })
+    }
+
     /// The journal cursor the fault names, if any (`fault_cursor` in
     /// `attempt.end`). An escalated fault reports its cause's cursor.
     pub fn cursor(&self) -> Option<Cursor> {
@@ -330,6 +373,36 @@ mod tests {
             assert!(fault.to_string().contains(needle), "{fault}");
             assert!(!format!("{fault:?}").is_empty());
         }
+    }
+
+    #[test]
+    fn recorded_faults_round_trip() {
+        let simple = [
+            Fault::OracleErr("overloaded".into()),
+            Fault::ToolErr("card declined".into()),
+            Fault::ContractViol("x".into()),
+            Fault::CapabilityDenied("send".into()),
+            Fault::Io("disk".into()),
+            Fault::Unsupported("u".into()),
+            Fault::Unavailable("503".into()),
+            Fault::Timeout,
+            Fault::BudgetExhausted,
+            Fault::LeaseLost,
+            Fault::Deleted,
+        ];
+        for f in simple {
+            assert_eq!(
+                Fault::from_recorded(f.kind(), &f.recorded_message()),
+                Some(f.clone()),
+                "{f:?}"
+            );
+        }
+        // Variants with more than a message are not rebuilt; their text is
+        // kept for the caller's fallback.
+        let structured = Fault::Erased { cursor: 4 };
+        assert_eq!(Fault::from_recorded(structured.kind(), ""), None);
+        assert!(structured.recorded_message().contains("cursor 4"));
+        assert_eq!(Fault::from_recorded("ValueError", "m"), None);
     }
 
     #[test]

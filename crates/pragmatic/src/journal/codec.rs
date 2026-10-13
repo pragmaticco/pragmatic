@@ -57,6 +57,7 @@ pub(crate) mod tag {
     pub const MARKER: u8 = 9;
     pub const NOTE: u8 = 10;
     pub const RANDOM: u8 = 11;
+    pub const REFUSAL: u8 = 12;
 }
 
 /// The type of one structural field, which fixes how its bytes are checked.
@@ -91,6 +92,7 @@ fn fields_of_kind(kind: u8) -> Option<(&'static [Ty], u8, u8)> {
         tag::MARKER => (&[Str], 0, 0),
         tag::NOTE => (&[Str, Json], 0, 2),
         tag::RANDOM => (&[Str, Json], 1, 1),
+        tag::REFUSAL => (&[Str, Str, Str], 0, 0),
         _ => return None,
     })
 }
@@ -247,6 +249,9 @@ pub(crate) fn event_parts(event: &Event) -> Option<(u8, Vec<Field<'_>>, Vec<&Con
             args,
             value,
         } => (tag::RANDOM, vec![s(source), s(args)], vec![value]),
+        Event::Refusal { step, name, fault } => {
+            (tag::REFUSAL, vec![s(step), s(name), s(fault)], vec![])
+        }
         Event::Legacy(_) => return None,
     })
 }
@@ -648,6 +653,59 @@ pub(crate) fn resolve_ref(
         .unwrap_or(Content::Erased))
 }
 
+/// Check the fields of a `Refusal` (spec 2.6): a known step, the fault that
+/// step raises without effect, and no name for a draw (a receive names its
+/// channel and an effect its name, either of which may be empty).
+pub(crate) fn check_refusal(step: &str, name: &str, fault: &str) -> Result<(), &'static str> {
+    use super::refusal;
+    let fits = match step {
+        refusal::DRAW => fault == refusal::BUDGET_EXHAUSTED && name.is_empty(),
+        refusal::RECV => fault == refusal::TIMEOUT,
+        refusal::EFFECT => fault == refusal::CAPABILITY_DENIED,
+        _ => return Err("refusal of an unknown step"),
+    };
+    if fits {
+        Ok(())
+    } else {
+        Err("refusal fault or name does not fit its step")
+    }
+}
+
+/// Check what a completion names (spec 2.4): a `DrawResult` completes an
+/// earlier `DrawIntent`, an `EffectResult` an earlier `EffectIntent`, on
+/// the same branch. Replay finds completions through this reference, so a
+/// result that pointed anywhere else would hand one kind of step the record
+/// of another.
+pub(crate) fn check_completion(
+    event: &Event,
+    branch: &[u32],
+    cursor: Cursor,
+    prior: &[Entry],
+) -> Result<(), &'static str> {
+    let (intent, draw) = match event {
+        Event::DrawResult { intent, .. } => (*intent, true),
+        Event::EffectResult { intent, .. } => (*intent, false),
+        _ => return Ok(()),
+    };
+    let target = usize::try_from(intent)
+        .ok()
+        .filter(|&i| (i as u64) < cursor)
+        .and_then(|i| prior.get(i))
+        .ok_or("result does not name an earlier entry")?;
+    let fits = match target.event {
+        Event::DrawIntent { .. } => draw,
+        Event::EffectIntent { .. } => !draw,
+        _ => false,
+    };
+    if !fits {
+        return Err("result names an entry that is not an intent of its kind");
+    }
+    if target.branch != branch {
+        return Err("result is not on its intent's branch");
+    }
+    Ok(())
+}
+
 fn text(bytes: &[u8]) -> String {
     // Fields were checked by `decode_raw`, so this never replaces anything.
     String::from_utf8_lossy(bytes).into_owned()
@@ -733,6 +791,11 @@ fn build_event(kind: u8, f: &[&[u8]], contents: Vec<Content>) -> Result<Event, &
             args: text(f[1]),
             value: one(),
         },
+        tag::REFUSAL => {
+            let (step, name, fault) = (text(f[0]), text(f[1]), text(f[2]));
+            check_refusal(&step, &name, &fault)?;
+            Event::Refusal { step, name, fault }
+        }
         _ => return Err("unknown record kind"),
     };
     Ok(event)

@@ -151,21 +151,21 @@ impl Event {
         let mut r = R(rest);
         let ev = match tag {
             1 => Event::OracleDraw {
-                prompt: Value(r.field()?),
-                outcome: Value(r.field()?),
+                prompt: Value::new(r.field()?),
+                outcome: Value::new(r.field()?),
                 provenance: String::from_utf8(r.field()?).ok()?,
             },
             2 => Event::ChannelRecv {
                 channel: String::from_utf8(r.field()?).ok()?,
-                value: Value(r.field()?),
+                value: Value::new(r.field()?),
             },
             3 => Event::EffectIntent {
                 name: String::from_utf8(r.field()?).ok()?,
-                arg: Value(r.field()?),
+                arg: Value::new(r.field()?),
             },
             4 => Event::EffectCommit {
                 name: String::from_utf8(r.field()?).ok()?,
-                result: Value(r.field()?),
+                result: Value::new(r.field()?),
             },
             5 => Event::EffectCompensated {
                 name: String::from_utf8(r.field()?).ok()?,
