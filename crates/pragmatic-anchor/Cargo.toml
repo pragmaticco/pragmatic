@@ -1,0 +1,31 @@
+[package]
+name = "pragmatic-anchor"
+description = "Anchoring for Pragmatic Server: the cumulative RFC 6962 anchor log, C2SP checkpoints, RFC 3161 time-stamps and tlog-witness cosigning."
+keywords = ["transparency-log", "rfc3161", "merkle", "witness", "anchoring"]
+categories = ["cryptography"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+# Part of the commercial layer (design section 1.5): the source is public
+# so auditors can read it, under the Business Source License 1.1 in this
+# directory's LICENSE file. It ships inside Pragmatic Server and is never
+# published to a registry, which also keeps it out of
+# `cargo publish --workspace`.
+license = "BUSL-1.1"
+publish = false
+
+[dependencies]
+# The formats (leaf hashes, proofs, checkpoints, signed notes, cosignatures,
+# time-stamp requests and tokens, strict JSON) come from the core so the
+# server, the CLI and the verifier can never drift apart.
+pragmatic = { version = "0.5.0", path = "../pragmatic", default-features = false }
+# Signing: the core only verifies. Only the server holds private keys, and
+# it signs with an audited implementation.
+ed25519-dalek = "2.2"
+# HTTP to TSAs and witnesses: blocking, small, rustls with webpki roots.
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+# A fresh 0700 directory per `openssl ts -verify` invocation.
+tempfile = "3.20"

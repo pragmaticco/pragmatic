@@ -9,6 +9,7 @@ members = [
     "crates/pragmatic-python",
     "crates/pragmatic-ffi",
     "crates/pragmatic-openai",
+    "crates/pragmatic-anchor",
 ]
 
 [workspace.package]
