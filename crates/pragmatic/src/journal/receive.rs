@@ -36,6 +36,14 @@
 //! about earlier entries is needed to encode one. [`decode_frame`] reads one
 //! frame back on its own, for serving records from such a journal by
 //! offset.
+//!
+//! The same tail reads such a journal back without holding it:
+//! [`NoteAppender::follow`] checks each stored frame in turn against the
+//! tail (canonical decoding, commitments and the chain link) and advances
+//! it, and [`NoteAppender::classify_tail`] tells a torn tail from corruption
+//! (spec 2.14) when a frame does not follow, from the bytes after the last
+//! frame that did. A reader therefore needs memory for one frame and, after
+//! a crash, for the tail, never for the file.
 
 use std::fmt;
 use std::hash::BuildHasher;
@@ -47,6 +55,7 @@ use crate::sha256::{Digest, DIGEST_LEN};
 use crate::value::Value;
 
 use super::codec::{self, DecodeOpts, RawBody, SALT_LEN};
+use super::parse::{self, Failure, Scan, MIN_FRAME_V2};
 use super::{
     check_append, note, Content, Cursor, Entry, Event, Journal, SlotMeta, SlotState,
     DEDUP_MIN_BYTES, FORMAT, HEADER_LEN, MAX_RECORD_BYTES, META, META_ID,
@@ -455,12 +464,132 @@ impl NoteAppender {
         self.byte_len += frame.len() as u64;
         Ok((cursor, frame))
     }
+
+    /// Read the next stored frame of the journal this tail belongs to:
+    /// check it and advance past it. Start from [`NoteAppender::new`] (with
+    /// the journal's key) right after the header, and offer the frames in
+    /// file order.
+    ///
+    /// The frame is decoded canonically (re-encoded and byte-compared),
+    /// every sealed slot's commitment is recomputed, and its chain link is
+    /// recomputed from the tail, as [`Journal::parse`] does. What needs the
+    /// earlier entries is not checked, because they are not held: a ref
+    /// keeps its target in [`SlotMeta::ref_target`] and reads as
+    /// [`Content::Erased`], and a completion's intent is not looked up. A
+    /// journal of notes, which [`NoteAppender::append`] writes, has neither.
+    ///
+    /// On `Err` the tail is unchanged; [`classify_tail`](Self::classify_tail)
+    /// then says what the refused bytes are.
+    pub fn follow(&mut self, frame: &[u8]) -> Result<Entry, &'static str> {
+        let (entry, end) = self.next_frame(frame, 0, 0).map_err(|f| f.reason)?;
+        if end != frame.len() {
+            return Err("expected exactly one frame");
+        }
+        self.entries += 1;
+        self.head = entry.hash;
+        self.byte_len += frame.len() as u64;
+        Ok(entry)
+    }
+
+    /// Classify the end of a stored journal that stopped following the
+    /// chain: `tail` is every byte from the first frame
+    /// [`follow`](Self::follow) refused to the end of the file, and
+    /// `offset` is where it starts in the file (the 512-byte block
+    /// alignment of the file matters to the rules).
+    ///
+    /// `None` means a torn tail: what a crash during an append leaves, which
+    /// a writer holding the journal's lock may move aside and truncate.
+    /// `Some(reason)` means corruption, which is never truncated. The rules
+    /// are those of [`Journal::parse`] (spec 2.14), and like it this leans
+    /// towards corruption whenever the damage could have reached written
+    /// entries. A tail whose first frame does follow was not a tail at all,
+    /// and is reported as corruption rather than risk truncating it.
+    pub fn classify_tail(&self, tail: &[u8], offset: u64) -> Option<String> {
+        let fail = match self.next_frame(tail, 0, offset) {
+            Ok(_) => {
+                return Some("the bytes offered as a tail start with a frame that follows".into())
+            }
+            Err(f) => f,
+        };
+        let opts = DecodeOpts {
+            allow_withheld: false,
+            probe: true,
+        };
+        let scan = Scan {
+            bytes: tail,
+            tail_start: 0,
+            failing: self.entries,
+            min_frame: MIN_FRAME_V2,
+            key: self.key.as_deref(),
+            link: codec::link,
+        };
+        scan.classify(&fail, |p| parse::probe_frame(&[], tail, p, opts))
+    }
+
+    /// Check the frame at `pos` of `bytes` (which start at file offset
+    /// `base`) against the tail, as [`Journal::parse`] checks the next
+    /// frame, without the earlier entries (see [`follow`](Self::follow)).
+    /// The failure says what the classifier needs.
+    fn next_frame(&self, bytes: &[u8], pos: usize, base: u64) -> Result<(Entry, usize), Failure> {
+        let cursor = self.entries;
+        let (rec, stored, end) = parse::read_frame(bytes, pos).map_err(Failure::plain)?;
+        let raw = codec::decode_raw(rec).map_err(Failure::plain)?;
+        let opts = DecodeOpts {
+            allow_withheld: false,
+            probe: true,
+        };
+        let (mut entry, salts) =
+            codec::build_entry(&raw, cursor, &[], opts).map_err(Failure::plain)?;
+        let mut again = Vec::with_capacity(rec.len());
+        codec::encode_record(&mut again, &entry, &salts);
+        if again != rec {
+            return Err(Failure::plain("record is not canonically encoded"));
+        }
+        let implied = codec::link(
+            self.key.as_deref(),
+            &self.head,
+            cursor,
+            &codec::skeleton(&entry),
+        );
+        let linked = implied == stored;
+        for slot in &raw.slots {
+            let RawBody::Sealed { salt, content } = &slot.body else {
+                continue;
+            };
+            if codec::commitment(salt, content) == slot.commitment {
+                continue;
+            }
+            // The rules of `Journal::parse`: a fully formed frame whose
+            // content no longer matches was damaged after it was written,
+            // unless the damage is a block the filesystem never wrote.
+            let intact = if linked {
+                let start = parse::offset_in(bytes, content);
+                !parse::shows_unwritten_block(bytes, start, start + content.len(), base)
+            } else {
+                !parse::hash_possibly_unwritten(&stored, &implied)
+            };
+            return Err(Failure {
+                reason: "slot content does not match its commitment",
+                implied: Some((end, implied)),
+                intact,
+            });
+        }
+        if !linked {
+            return Err(Failure {
+                reason: "chain link does not verify (wrong key, tampering or corruption)",
+                implied: Some((end, implied)),
+                intact: !parse::hash_possibly_unwritten(&stored, &implied),
+            });
+        }
+        entry.hash = stored;
+        Ok((entry, end))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::journal::{note as kinds, EraseSelector, ErasureNote, ROOT};
+    use crate::journal::{note as kinds, EraseSelector, ErasureNote, JournalError, ROOT};
 
     fn run_start(id: &str) -> Event {
         Event::Note {
@@ -698,6 +827,150 @@ mod tests {
         assert_eq!(a.entries(), 0);
         let keyed = NoteAppender::new(Some(b"k"));
         assert_eq!(keyed.head(), Journal::new(Some(b"k")).head());
+    }
+
+    /// A file of notes written by an appender, with payloads of the given
+    /// sizes.
+    fn note_file(sizes: &[usize]) -> Vec<u8> {
+        let mut file = super::super::header(0).to_vec();
+        let mut a = NoteAppender::new(None);
+        for (i, n) in sizes.iter().enumerate() {
+            let payload = [Value::from(vec![b'a' + (i % 26) as u8; *n])];
+            let (_, frame) = a
+                .append(i as u64, "access", &format!("{{\"i\":{i}}}"), &payload)
+                .unwrap();
+            file.extend_from_slice(&frame);
+        }
+        file
+    }
+
+    /// Read `file` frame by frame from its tail alone: the entries that
+    /// followed, the offset where following stopped, and the verdict on the
+    /// rest (`Ok(())` for a clean end or a torn tail).
+    fn follow_file(file: &[u8]) -> (u64, usize, Result<(), String>) {
+        let mut tail = NoteAppender::new(None);
+        let mut pos = HEADER_LEN;
+        while pos < file.len() {
+            let frame = match split_frames(&file[pos..]) {
+                Ok(frames) => frames[0],
+                Err((0, _)) => break,
+                Err(_) => {
+                    let len = u32::from_le_bytes(file[pos..pos + 4].try_into().unwrap()) as usize;
+                    &file[pos..pos + 4 + len + DIGEST_LEN]
+                }
+            };
+            match tail.follow(frame) {
+                Ok(e) => {
+                    assert_eq!(e.cursor, tail.entries() - 1);
+                    pos += frame.len();
+                }
+                Err(_) => break,
+            }
+        }
+        if pos == file.len() {
+            return (tail.entries(), pos, Ok(()));
+        }
+        let verdict = match tail.classify_tail(&file[pos..], pos as u64) {
+            None => Ok(()),
+            Some(reason) => Err(reason),
+        };
+        (tail.entries(), pos, verdict)
+    }
+
+    #[test]
+    fn follow_reads_a_journal_back_from_its_tail_alone() {
+        let file = note_file(&[10, 300, 0, 5000]);
+        let (n, end, verdict) = follow_file(&file);
+        assert_eq!((n, end, verdict), (4, file.len(), Ok(())));
+        let parsed = Journal::parse(&file, None).unwrap().journal;
+        let mut tail = NoteAppender::new(None);
+        let frames = split_frames(&file[HEADER_LEN..]).unwrap();
+        for (frame, want) in frames.iter().zip(parsed.entries()) {
+            assert_eq!(&tail.follow(frame).unwrap(), want);
+        }
+        assert_eq!(tail.head(), parsed.head());
+        assert_eq!(tail.byte_len(), file.len() as u64);
+
+        // A frame from elsewhere does not follow, and changes nothing.
+        let before = (tail.entries(), tail.head(), tail.byte_len());
+        assert!(tail.follow(frames[1]).unwrap_err().contains("chain link"));
+        assert_eq!((tail.entries(), tail.head(), tail.byte_len()), before);
+        let two = [frames[0], frames[1]].concat();
+        assert!(NoteAppender::new(None).follow(&two).is_err());
+    }
+
+    #[test]
+    fn classify_tail_agrees_with_parse_on_torn_and_corrupt_files() {
+        let clean = note_file(&[40, 700, 20, 1200, 30]);
+        let frames: Vec<usize> = split_frames(&clean[HEADER_LEN..])
+            .unwrap()
+            .iter()
+            .map(|f| f.len())
+            .collect();
+        let start_of = |i: usize| HEADER_LEN + frames[..i].iter().sum::<usize>();
+        let last = start_of(4);
+        let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
+        // Torn: cut inside the last frame, inside its length, inside its
+        // hash; a zero-filled extension; a hash cut off with zeros.
+        cases.push(("cut frame", clean[..last + 20].to_vec()));
+        cases.push(("cut length", clean[..last + 2].to_vec()));
+        cases.push(("cut hash", clean[..clean.len() - 5].to_vec()));
+        let mut zeros = clean.clone();
+        zeros.extend_from_slice(&[0u8; 700]);
+        cases.push(("zero extension", zeros));
+        let mut zero_hash = clean.clone();
+        let n = zero_hash.len();
+        zero_hash[n - 8..].fill(0);
+        cases.push(("zeroed hash end", zero_hash));
+        // Corrupt: a flipped byte in a middle frame's content, a flipped
+        // stored hash, and a destroyed middle frame whose successors chain.
+        let mut flip = clean.clone();
+        flip[start_of(1) + 60] ^= 1;
+        cases.push(("flipped content", flip));
+        let mut flip_hash = clean.clone();
+        flip_hash[start_of(2) - 1] ^= 0x40;
+        cases.push(("flipped hash", flip_hash));
+        let mut wiped = clean.clone();
+        wiped[start_of(2)..start_of(3)].fill(0);
+        cases.push(("wiped frame", wiped));
+        for (name, file) in cases {
+            let (n, pos, verdict) = follow_file(&file);
+            match Journal::parse(&file, None) {
+                Ok(p) => {
+                    assert_eq!(verdict, Ok(()), "{name}: parse says torn");
+                    assert_eq!((n, pos as u64), (p.journal.len(), p.valid_len), "{name}");
+                }
+                Err(JournalError::Corrupt { cursor, .. }) => {
+                    assert!(verdict.is_err(), "{name}: parse says corrupt at {cursor}");
+                    assert_eq!(n, cursor, "{name}");
+                }
+                Err(e) => panic!("{name}: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_tail_uses_file_alignment_for_unwritten_blocks() {
+        // A frame whose hash is whole but whose content reads as zeros over a
+        // whole aligned block: torn when the zeros cover a file block,
+        // corrupt when the same zeros straddle two blocks.
+        let file = note_file(&[10, 3000]);
+        let second = HEADER_LEN + split_frames(&file[HEADER_LEN..]).unwrap()[0].len();
+        let block = (second / 512 + 2) * 512;
+        let mut torn = file.clone();
+        torn[block..block + 512].fill(0);
+        assert!(Journal::parse(&torn, None).is_ok());
+        let (_, pos, verdict) = follow_file(&torn);
+        assert_eq!((pos, verdict), (second, Ok(())));
+        let mut corrupt = file.clone();
+        corrupt[block + 100..block + 400].fill(0);
+        assert!(Journal::parse(&corrupt, None).is_err());
+        assert!(follow_file(&corrupt).2.is_err());
+        // A tail that starts with a frame that follows is not a tail.
+        let tail = NoteAppender::new(None);
+        assert!(tail
+            .classify_tail(&file[HEADER_LEN..], HEADER_LEN as u64)
+            .is_some());
     }
 
     #[test]
