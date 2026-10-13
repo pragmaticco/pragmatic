@@ -18,11 +18,7 @@ import pragmatic
 anthropic = pytest.importorskip("anthropic")
 openai = pytest.importorskip("openai")
 
-# Newer SDK releases ship on `httpx2`; older ones on `httpx`.
-try:
-    import httpx2 as httpx
-except ImportError:
-    import httpx
+httpx = pytest.importorskip("httpx2")
 
 
 class Crash(Exception):
@@ -363,19 +359,6 @@ def test_openai_responses(tmp_path):
     assert audit.output == "Done." and len(api.requests) == 2
 
 
-def test_streaming_is_refused_not_silently_unjournaled(tmp_path):
-    api = MockAPI([])
-    rt = pragmatic.Runtime(tmp_path)
-
-    def agent(ctx):
-        client = ctx.wrap(anthropic.Anthropic(api_key="test", http_client=api.sync_client()))
-        client.messages.create(model="m", max_tokens=1, messages=[], stream=True)
-
-    with pytest.raises(NotImplementedError):
-        rt.run("r1", agent)
-    assert api.requests == []
-
-
 def test_durable_marker_rejects_changed_program(tmp_path):
     rt = pragmatic.Runtime(tmp_path)
 
@@ -402,7 +385,10 @@ def test_budget_and_caps(tmp_path):
         rt.run("r2", anthropic_agent(MockAPI(ANTHROPIC_SCRIPT), Tools()), caps=["tool:fetch"])
 
 
-def test_concurrent_steps_are_refused(tmp_path):
+def test_steps_from_tasks_the_attempt_does_not_own_are_refused(tmp_path):
+    # asyncio.gather wraps each coroutine in a task of its own. Those tasks
+    # do not own the attempt (spec 6.2): concurrent work goes through
+    # ctx.gather, which gives each child a branch of its own.
     rt = pragmatic.Runtime(tmp_path)
 
     async def agent(ctx):
@@ -415,7 +401,7 @@ def test_concurrent_steps_are_refused(tmp_path):
             ctx.adraw("b", lambda: slow(2)),
         )
 
-    with pytest.raises(pragmatic.PragmaticError, match="one at a time"):
+    with pytest.raises(pragmatic.NotInRun, match="ctx.gather"):
         rt.run("r1", agent)
 
 

@@ -7,7 +7,10 @@ returns the messages to append to the conversation. On resume and replay
 the recorded results are reused and the tools are not called again.
 
 A tool that raises is recorded as an error result and reported back to the
-model, the way the provider APIs expect; the run keeps going.
+model, the way the provider APIs expect; the run keeps going. A tool that
+takes an ``idempotency_key`` argument gets the effect's key
+(``<run_id>/<branch>/<intent cursor>``), so a service it calls can
+deduplicate the retry of an effect a crash interrupted.
 """
 
 from __future__ import annotations
@@ -88,10 +91,23 @@ def tool_calls(response: Any) -> list[ToolCall]:
     return calls
 
 
-def _invoke(fn: Callable, arguments: Any) -> Any:
+def accepts_key(fn: Callable) -> bool:
+    """True if ``fn`` takes an ``idempotency_key`` argument by name."""
+    try:
+        param = inspect.signature(fn).parameters.get("idempotency_key")
+    except (TypeError, ValueError):
+        return False
+    return param is not None and param.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
+
+
+def _invoke(fn: Callable, arguments: Any, key: str) -> Any:
+    extra = {"idempotency_key": key} if accepts_key(fn) else {}
     if isinstance(arguments, dict):
-        return fn(**arguments)
-    return fn(arguments)
+        return fn(**arguments, **extra)
+    return fn(arguments, **extra)
 
 
 def _content(result: Any) -> str:
@@ -144,9 +160,9 @@ def run_tools(ctx: "Ctx", response: Any, tools: Mapping[str, Callable]) -> list[
     for call in calls:
         fn = _lookup(tools, call)
 
-        def perform(_arg: str, fn=fn, call=call) -> str:
+        def perform(_arg: str, idempotency_key: str = "", fn=fn, call=call) -> str:
             try:
-                out = _invoke(fn, call.input)
+                out = _invoke(fn, call.input, idempotency_key)
             except Exception as e:  # reported to the model, not raised
                 return _record(error=e)
             if inspect.isawaitable(out):
@@ -165,9 +181,9 @@ async def arun_tools(ctx: "Ctx", response: Any, tools: Mapping[str, Callable]) -
     for call in calls:
         fn = _lookup(tools, call)
 
-        async def perform(_arg: str, fn=fn, call=call) -> str:
+        async def perform(_arg: str, idempotency_key: str = "", fn=fn, call=call) -> str:
             try:
-                out = _invoke(fn, call.input)
+                out = _invoke(fn, call.input, idempotency_key)
                 if inspect.isawaitable(out):
                     out = await out
             except Exception as e:

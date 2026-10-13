@@ -131,6 +131,11 @@ pub struct RunOptions {
     /// information. It does not make replay stricter; see
     /// [`Ctx::program_marker`] for that.
     pub program: Option<(String, String)>,
+    /// The names of the request-normalization rules an SDK matches model
+    /// calls under (spec 6.6), recorded in `attempt.start` so an auditor
+    /// can see what replay loosened. Empty when requests are compared
+    /// exactly, which is all the core does on its own.
+    pub normalization: Vec<String>,
 }
 
 impl RunOptions {
@@ -164,6 +169,14 @@ impl RunOptions {
 
     pub fn with_program(mut self, name: impl Into<String>, hash: impl Into<String>) -> Self {
         self.program = Some((name.into(), hash.into()));
+        self
+    }
+
+    pub fn with_normalization<I: IntoIterator<Item = S>, S: Into<String>>(
+        mut self,
+        rules: I,
+    ) -> Self {
+        self.normalization = rules.into_iter().map(Into::into).collect();
         self
     }
 }
