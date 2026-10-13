@@ -3,7 +3,8 @@
 Status: design, revision 3 (2026-10-13), after an adversarial review across
 cryptography, replay correctness, storage and failure handling, compliance,
 developer experience and completeness, amended after the review of the core
-runtime (2.4, 2.6 to 2.8, 2.11, 2.12, 2.14, 3.1 to 3.3, 6.7). This document
+runtime (2.4, 2.6 to 2.8, 2.11, 2.12, 2.14, 3.1 to 3.3, 6.7) and after
+building the server (4.1 to 4.5, 4.7 to 4.9, 4.13, 4.17). This document
 is the contract
 between the components built for 0.6. Everything marked MUST is
 normative; where code and this document disagree, one of them is a bug.
@@ -899,14 +900,16 @@ Full TOML schema with defaults, in `deploy/pragmatic.example.toml` and
 `docs/server.md`:
 
 ```toml
+name = ""                            # origin pragmatic/<name>; empty = host name
 listen = "127.0.0.1:7272"
 data_dir = "/var/lib/pragmatic"
 allow_plain_http = false
 trusted_proxy_header = ""            # e.g. "x-forwarded-for"
-lease_ttl_secs = 60
+lease_ttl_secs = 60                  # 1 to 3600
 max_request_bytes = 268435456
 max_clock_skew_secs = 300
 public_url = ""
+verify_interval_hours = 24
 
 [keys]
 signing_key_file = "/etc/pragmatic/server.ed25519"   # refused inside data_dir unless allow_key_in_data_dir
@@ -916,11 +919,12 @@ allow_key_in_data_dir = false
 admin_token_sha256 = ""              # first admin; all other tokens are issued through the API
 
 [anchoring]
-interval_secs = 60
-tsa = [ { url = "https://freetsa.org/tsr", roots_pem = "/etc/pragmatic/tsa/freetsa-root.pem" } ]
-witness = [ { url = "https://witness.pragmatic.example", public_key = "hex", token_file = "..." } ]
+interval_secs = 600                  # 60 to 3600 (4.7)
+tsa = [ { url = "https://freetsa.org/tsr", roots_pem = "/etc/pragmatic/tsa/freetsa-root.pem", operator = "freetsa" } ]
+witness = [ { url = "https://witness.pragmatic.example", public_key = "hex", token_file = "...", name = "", operator = "" } ]
 allow_self_anchoring = false
 anchor_run_ids = "plain"             # or "hmac"
+min_independent_operators = 2
 
 [[retention]]
 match = { prefix = "", labels = {} }
@@ -940,7 +944,7 @@ events = ["chain_broken", "anchor_failed", "regressed", "erasure", "retention", 
 
 [witness_mode]
 enabled = false
-origins = [ { name = "acme", token_sha256 = "hex" } ]
+origins = [ { name = "acme", token_sha256 = "hex", public_key = "<signed-note vkey>" } ]
 
 [license]
 licensee = ""
@@ -957,6 +961,10 @@ licensee = ""
   runs/<hh>/<64hex>.meta.json         {"format":1, run_id, created_at, updated_at, entries, byte_len, head,
                                        anchored_entries, last_anchor_leaf, leases, holds, open_intents, status}
   runs/<hh>/<64hex>.tombstone.json    {run_id, deleted_at, entries, head, policy}
+  runs/<hh>/<64hex>.torn-<unix_ms>    torn tails moved aside (removed by erasure)
+  holds.json                          legal holds (atomic writes)
+  keys.json                           every signing key and its validity window
+  index.key                           the subjects index HMAC key (32 bytes)
   anchors/log.leaves                  the cumulative anchor log, append-only
   anchors/sth/<seq 20-digit>.json     one per batch, create_new, never overwritten
   audit/access.journal                the access log, journal format 2
@@ -968,8 +976,8 @@ licensee = ""
   fsync, under the run's lock.
 - `meta.json` is rewritten at most once per second per run, and at clean
   shutdown.
-- At startup a journal whose size equals `meta.byte_len` is trusted;
-  otherwise it is parsed again.
+- At startup a journal whose size equals `meta.byte_len` and whose last 32
+  bytes equal `meta.head` is trusted; otherwise it is parsed again (4.17).
 - `/healthz` is live at once. `/readyz` and every run endpoint return 503
   `starting` until the index is ready. Full verification runs in the
   background.
@@ -1020,23 +1028,25 @@ All under `/v1`. Bearer auth. Errors are
 | `GET /v1/keys` | any | every server signing key `{key_id, public_key, not_before, not_after}` |
 | `GET /v1/runs?prefix=&q=&label.k=v&program=&status=&since=&until=&limit=&after=` | any | `{runs: [RunSummary], next}`. `q` matches run id and label values only, never content |
 | `GET /v1/runs/{id}` | any | `RunSummary` + `{verify: VerifyReport (cached, incremental)}` |
-| `GET /v1/runs/{id}/entries?from=&limit=` | any | Entry JSON (below); content redacted unless `view_raw`; slots over 64 KiB truncated |
+| `GET /v1/runs/{id}/entries?from=&limit=` | any | `{entries: [Entry JSON (below)], next, total}`; content redacted unless `view_raw`; slots over 64 KiB truncated |
 | `GET /v1/runs/{id}/entries/{cursor}/slots/{k}` | any | one slot's content, redaction rules apply |
 | `GET /v1/runs/{id}/journal` | agent (with its lease), admin, auditor+view_raw | journal bytes, `Pragmatic-Entries`, `Pragmatic-Head` |
-| `PUT /v1/runs/{id}` | agent, admin | body: the 16-byte header (flags 0). Creates the run and grants a lease atomically: 201 `{lease, ttl_secs}`; or `run_exists`, `run_deleted` |
-| `POST /v1/runs/{id}/lease` | agent, admin | body `{"holder": client uuid}`. Acquire, or renew if same holder: 200 `{lease, ttl_secs}`; `run_locked` with `Retry-After` and `{holder_expires_in}` |
+| `PUT /v1/runs/{id}` | agent, admin | body: the 16-byte header (flags 0); optional header `Pragmatic-Holder`. Creates the run and grants a lease atomically: 201 `{lease, ttl_secs, entries}`; or `run_exists`, `run_deleted` |
+| `POST /v1/runs/{id}/lease` | agent, admin | body `{"holder": client uuid}`, optional header `Pragmatic-Lease`. Acquire, or renew if same holder and token: 200 `{lease, ttl_secs, entries}`; `run_locked` with `Retry-After` and `{holder_expires_in}` (4.17) |
 | `DELETE /v1/runs/{id}/lease` | agent, admin | header `Pragmatic-Lease`; appends the `custody` note; 204 |
 | `POST /v1/runs/{id}/frames?at=N` | agent, admin | headers `Pragmatic-Lease`, `Pragmatic-Frames: k`, `Pragmatic-Head`; body = k frames. 200 `{entries, head, duplicate}` |
 | `GET /v1/runs/{id}/evidence?redact=&anchor=now` | auditor, admin | evidence bundle; `anchor=now` forces a batch and waits for it |
 | `POST /v1/runs/{id}/erase` | admin | `{"slots": [[c, s], ...] \| "match": "<text>" \| "all", "reason_code", "reason", "force": false, "allow_unfinished": false}` |
 | `POST /v1/holds`, `DELETE /v1/holds/{id}`, `GET /v1/holds` | admin | `{matter, scope: {run_ids} \| {prefix}}` |
+| `POST /v1/runs/{id}/accept-regression` | admin | accept a regressed run's journal as its history; logged before it acts (4.2) |
 | `POST /v1/subjects/search` | admin | body `{"subject": "..."}`; returns run ids from the subject index |
 | `POST /v1/retention/run` | admin | run retention now; report |
+| `POST /v1/verify-data` | admin | run verify-data now (4.13); report |
 | `GET /v1/anchors?after=&limit=`, `GET /v1/anchors/{seq}` | auditor, admin | signed tree heads and witness results; leaves filtered by scope |
 | `GET /v1/anchors/log?from=&to=` | auditor, admin | raw leaves (admin: all; auditor: in-scope leaves with inclusion proofs) |
-| `GET /v1/audit?run_id=&after=&limit=` | admin; auditor for in-scope runs | access-log records |
+| `GET /v1/audit?run_id=&after=&limit=` | admin; auditor for in-scope runs | `{records, next}`; an auditor without `run_id` gets the records of its in-scope runs |
 | `POST /v1/tokens`, `DELETE /v1/tokens/{id}`, `GET /v1/tokens` | admin | token lifecycle |
-| `POST /v1/witness` | witness_client | 4.8 |
+| `POST /v1/witness`, `POST /add-checkpoint` | witness_client | 4.8 |
 | `GET /v1/witness/log/{origin}?after=` | that origin's auditors, admin | 4.8 |
 | `GET /healthz`, `GET /readyz`, `GET /metrics` | none | `/metrics` carries no run ids or label values |
 
@@ -1062,12 +1072,14 @@ len}], hash}`. `text` is used when the bytes are valid UTF-8, otherwise
 | `lease_lost`, `lease_expired` | 409 | fail the session; raise `Locked` |
 | `conflict` | 409 | reconcile through the duplicate rule, otherwise fail |
 | `regressed` | 409 | fail; an admin must act |
+| `chain_broken` | 409 | fail; an admin must act (the stored journal is damaged or missing) |
 | `on_hold`, `retention_locked` | 409 | erasure refused (admin) |
 | `run_deleted` | 410 | raise `Deleted`; never recreate |
 | `invalid_frames` | 422 | fail; never retry |
 | `payload_too_large` | 413 | fail; raise `TooLarge` |
 | `starting`, `storage_unavailable` | 503 + `Retry-After` | resend the identical request until the lease deadline |
 | `bad_request` | 400 | fail |
+| `not_implemented` | 501 | fail (a component is not part of this build) |
 
 ### 4.5 Leases
 
@@ -1083,9 +1095,13 @@ len}], hash}`. `text` is used when the bytes are valid UTF-8, otherwise
   `lease_lost` fails the session.
 - When a lease ends (release, takeover, or lazy-expiry takeover), the
   server appends a `custody` note for it under the run lock before
-  granting the next lease.
+  granting the next lease. A run with no entries yet gets no custody note:
+  its first entry must be `run.start`.
 - `dangling_effect` and status `dangling` require that no renewal has
   happened for more than `2 × ttl`.
+- A holder whose lease was taken over after it expired gets
+  `lease_expired`; a released, revoked (forced erasure) or unknown lease
+  is `lease_lost`.
 
 ### 4.6 Append protocol
 
@@ -1199,8 +1215,9 @@ Rules:
   for 3 intervals.
 - Each TSA request times out after 30 s.
 
-**Key rotation:** `keygen --rotate` appends a `key.rotate` record (old and
-new key ids, signed by both) to the access log. `GET /v1/keys` lists every
+**Key rotation:** `keygen --rotate` (server stopped) appends a `key.rotate`
+record (old and new key ids, signed by both) to the access log. A key id
+is the lowercase hex SHA-256 of the 32-byte public key. `GET /v1/keys` lists every
 key with its validity window.
 
 ### 4.8 Witness mode
@@ -1226,7 +1243,9 @@ can cosign checkpoints for other logs and join the public witness network.
 - **Its own record:** the witness appends every cosigned checkpoint to its
   own journal, which it anchors to its own TSAs.
   `GET /v1/witness/log/{origin}?after=` returns the cosigned history for
-  audits.
+  audits. The record is the server-written run `pragmatic:witness:<origin>`
+  (a reserved id no client can write), so it is anchored like any run, and
+  the last cosigned size is read from it under the run's lock.
 
 Pragmatic Research runs the hosted witness with this same binary. The CLI
 ships its public keys, an empty list until it launches.
@@ -1256,13 +1275,20 @@ ships its public keys, an empty list until it launches.
   - When several policies match, each value is the most restrictive one:
     the largest `retain_min_days`, `deny` over `allow`.
   - Ages count from `updated_at`, and runs with a live lease are skipped.
-  - Shred erases every content slot (reason_code `retention`). Delete
-    removes the journal and writes a tombstone. Tombstoned ids can never
-    be recreated (410).
+  - Shred erases every content slot (reason_code `retention`, `by`
+    `server:retention`). Delete removes the journal and writes a
+    tombstone. Tombstoned ids can never be recreated (410). Both are
+    erasure-ledger records.
+  - Runs with reserved `pragmatic:` ids are never touched by retention.
   - Retention runs hourly and on demand.
   - Validation: shred and delete must each be at least `retain_min`.
+  - Combining `shred_after_days` and `delete_after_days` across policies:
+    the smallest non-zero value, but never earlier than the combined
+    `retain_min_days` (0 only when every matching policy says never).
 - **Subjects index:** HMAC(index_key, subject) → run ids, from `run.start`
-  payload slots. Entries are removed when the slot is erased. It is
+  payload slots. Entries are removed when the slot is erased. The hashes
+  are kept in each run's `meta.json` and searched there; `index_key` is
+  `<data_dir>/index.key`. It is
   queried only through admin `POST /v1/subjects/search`, with the
   identifier in the body (never logged).
 
@@ -1322,14 +1348,18 @@ Custody for each run is written into the run's own journal as the
     erasure rename is safe), plus meta, anchors, access log, tokens and
     the erasure ledger.
   - Writes `manifest.json` signed by the server key.
-- **`restore --from DIR [--erasure-ledger FILE]`**
+- **`restore --from DIR [--erasure-ledger FILE]`** (server stopped, empty
+  data directory)
+  - Verifies the manifest signature (its key must be in the backup's key
+    ring) and every file's SHA-256.
   - Re-applies every ledger entry newer than the snapshot.
   - Marks runs whose `entries` are fewer than their anchored length as
     `regressed`.
   - Appends a `restore` access record.
   - The docs require streaming the erasure ledger off the host.
 - **`verify-data`** runs every `verify_interval_hours` (default 24) and on
-  demand. It re-verifies every chain, every commitment and every anchor
+  demand (`POST /v1/verify-data`, which the subcommand calls; `--offline`
+  works on a stopped server's data directory). It re-verifies every chain, every commitment and every anchor
   inclusion and consistency proof, and records the results in the access
   log.
 - **`migrate`** upgrades `data_format`. The server refuses to start on an
@@ -1372,6 +1402,76 @@ SSD:
 - At least 1,000 appends per second across 200 concurrent runs.
 - Startup ≤ 30 s with 1 million runs.
 - Journals up to 1 GiB.
+
+### 4.17 Implementation notes and resolutions
+
+Decisions made while building the server, where the sections above were
+silent or disagreed:
+
+- **Configuration additions (4.1).** `name` (the anchoring origin and the
+  witness cosigner name; default the host name), `verify_interval_hours`
+  (4.13), `[anchoring] min_independent_operators` (4.7), `operator` on TSAs
+  and `name` and `operator` on witnesses (4.7), and `public_key` on
+  witness-mode origins (4.8 requires the log's key). `interval_secs`
+  defaults to 600 as 4.7 states (4.1 previously showed 60). Unknown keys
+  are refused.
+- **The holder of a PUT lease (4.4, 4.5).** `PUT` names no holder, so its
+  lease has none until the first `POST lease` that presents the lease id
+  in `Pragmatic-Lease`, which records its holder (`PUT` may also name one
+  in `Pragmatic-Holder`). A `POST lease` naming a holder without that
+  proof is a different holder, so another process using the same token
+  cannot adopt a live lease. Renewal also requires the same token.
+- **Agents read entries.** The endpoint table makes entries readable by
+  any role and the SDK's `rt.entries(id)` needs them, so agents may read
+  the entries and slots of in-scope runs (redacted unless `view_raw`). Raw
+  journal bytes still need the agent's lease.
+- **Custody notes (2.11, 4.5).** `principal` is the token id (2.11 forbids
+  names in notes), `lease` is the hex SHA-256 of the lease id, times are
+  Unix nanoseconds, and an `end` field says `released`, `expired` or
+  `revoked`.
+- **Status.** `dangling` means an `EffectIntent` without a result and no
+  lease activity (renewal or append) for more than `2 × ttl`; dangling
+  draws are re-issued on resume and do not count. `updated_at` moves only
+  on client appends (and creation), so server-written notes (custody,
+  erasure) do not postpone retention.
+- **Erasure of an unfinished run** without `allow_unfinished` is
+  `400 bad_request` with `"unfinished": true`. A run with an expired (not
+  live) lease is erasable; its lease is ended with a custody note first.
+- **Damaged journals.** A journal that fails to parse at startup, fails
+  background verification, or no longer matches its index is marked
+  damaged: reads serve its valid prefix, writes and erasure answer
+  `409 chain_broken`, and the `chain_broken` webhook and metric fire. It is
+  never truncated or rewritten.
+- **The startup shortcut.** A journal is trusted without parsing only when
+  its size equals `meta.byte_len` and its last 32 bytes equal `meta.head`,
+  because an erasure can change the head without changing the size.
+  `meta.json` is written by a flusher, never on the append path, so it lags
+  appends by up to a second; lease changes, creation and erasure write it
+  at once, and a trusted `meta.json` is not rewritten at startup.
+- **Access log records (4.11).** Each record is a note whose `data` holds
+  the structural fields and whose single payload slot holds `principal`,
+  `source_ip` and `user_agent`, so those can be erased. Request records
+  have kind `request`; operations that must be durable before they act
+  first write an `intent` record, whose cursor an erasure note's
+  `access_log_cursor` names. `trusted_proxy_header` uses the last address
+  in the header. A failed write fails closed for every authenticated
+  request until restart; unauthenticated requests still get 401. The log
+  is appended through the core's `NoteAppender` and is never held in
+  memory.
+- **Backup (4.13).** A live backup copies each journal up to
+  `meta.byte_len` (or the last whole frame before it), so it may omit the
+  last second of appends. The manifest is signed over SHA-256 of its
+  canonical JSON without the signature. `restore` takes anchored lengths
+  from the restored metas, the newer ledger records and the anchoring
+  library, and drops leases from the backup.
+- **Integration points.** Anchoring, evidence bundles and the console
+  renderer plug in through `pragmatic_server::hooks` (`Anchoring`,
+  `EvidenceBuilder`, `ConsoleRenderer`). Until they are integrated the
+  server runs with stubs that anchor nothing and answer `501
+  not_implemented`, and `verify-evidence` defers to the CLI.
+- **Console sessions** live in memory: a restart signs everyone out.
+- **Webhook deliveries** waiting for a retry live in memory; the erasure
+  ledger is the durable record to stream off the host.
 
 ---
 
