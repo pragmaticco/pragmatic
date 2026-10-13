@@ -149,6 +149,63 @@ def test_anthropic_record_crash_resume_replay(tmp_path):
     assert rt.verify("r1")
 
 
+class ProcessDeath(BaseException):
+    """Simulated process death inside a tool. Not an ``Exception``, so
+    ``run_tools`` does not report it to the model: the attempt ends as a
+    crash, with the tool's intent recorded and its result not."""
+
+
+class DyingTools(Tools):
+    """``search`` performs, then the process dies, while ``die`` is set."""
+
+    def __init__(self):
+        super().__init__()
+        self.die = True
+
+    def registry(self):
+        tools = super().registry()
+        search = tools["search"]
+
+        def dying_search(q):
+            out = search(q)
+            if self.die:
+                raise ProcessDeath()
+            return out
+
+        tools["search"] = dying_search
+        return tools
+
+
+def test_a_receipt_committed_by_recovery_reaches_the_model_as_the_tool_result(tmp_path):
+    api, tools = MockAPI(ANTHROPIC_SCRIPT), DyingTools()
+    rt = pragmatic.Runtime(tmp_path)
+    with pytest.raises(ProcessDeath):
+        rt.run("r1", anthropic_agent(api, tools))
+    assert tools.calls == [("search", "durable")]
+
+    tools.die = False
+    decided = []
+
+    def recover(name, arg):
+        decided.append((name, json.loads(arg)))
+        return pragmatic.Recover.commit("2 hits; the search already ran")
+
+    report = rt.resume("r1", anthropic_agent(api, tools), recover=recover)
+    assert report.output == "Two papers found."
+    assert decided == [("tool:search", {"id": "toolu_1", "input": {"q": "durable"}})]
+    # The search was settled by the policy, not performed again.
+    assert tools.calls == [("search", "durable"), ("fetch", "a://1")]
+    assert api.requests[1]["messages"][-1]["content"][0] == {
+        "type": "tool_result",
+        "tool_use_id": "toolu_1",
+        "content": "2 hits; the search already ran",
+    }
+
+    audit = rt.replay("r1", anthropic_agent(api, tools))
+    assert audit.output == report.output
+    assert len(api.requests) == 3 and len(tools.calls) == 2
+
+
 def test_replay_detects_changed_request(tmp_path):
     api, tools = MockAPI(ANTHROPIC_SCRIPT), Tools()
     rt = pragmatic.Runtime(tmp_path)

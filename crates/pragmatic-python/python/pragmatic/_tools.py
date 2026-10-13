@@ -4,7 +4,10 @@
 ``Message``, an OpenAI ``ChatCompletion``, or an OpenAI Responses
 ``Response``, performs each one as a write-ahead journaled effect, and
 returns the messages to append to the conversation. On resume and replay
-the recorded results are reused and the tools are not called again.
+the recorded results are reused and the tools are not called again. A call
+a crash cut off is settled by the ``recover`` policy of ``rt.resume``, and
+the result it commits (a receipt, as text) is what the model receives as
+the tool's result.
 
 A tool that raises is recorded as an error result and reported back to the
 model, the way the provider APIs expect; the run keeps going. A tool that
@@ -120,6 +123,29 @@ def _record(result: Any = None, error: BaseException | None = None) -> str:
     return canonical({"content": _content(to_jsonable(result)), "is_error": False})
 
 
+def _recorded(stored: str) -> dict:
+    """The tool result a call's effect recorded, as ``{"content", "is_error"}``.
+
+    A perform records exactly that. A call a crash cut off is settled by the
+    ``recover`` policy instead, which commits what it found out (a receipt
+    from the service the tool called, in whatever form the service gives
+    it), not this record: that text reaches the model as the tool's
+    content. Both are decided from the recorded bytes alone, so a replay
+    sends the model what the recorded run sent."""
+    try:
+        doc = json.loads(stored)
+    except ValueError:
+        doc = None
+    if (
+        isinstance(doc, dict)
+        and set(doc) == {"content", "is_error"}
+        and isinstance(doc["content"], str)
+        and isinstance(doc["is_error"], bool)
+    ):
+        return doc
+    return {"content": stored, "is_error": False}
+
+
 def _messages(kind: str, calls: list[ToolCall], results: list[dict]) -> list[dict]:
     if not calls:
         return []
@@ -170,7 +196,7 @@ def run_tools(ctx: "Ctx", response: Any, tools: Mapping[str, Callable]) -> list[
             return _record(out)
 
         stored = ctx.effect(f"tool:{call.name}", canonical({"id": call.id, "input": call.input}), perform)
-        results.append(json.loads(stored))
+        results.append(_recorded(stored))
     return _messages(kind, calls, results)
 
 
@@ -193,5 +219,5 @@ async def arun_tools(ctx: "Ctx", response: Any, tools: Mapping[str, Callable]) -
         stored = await ctx.aeffect(
             f"tool:{call.name}", canonical({"id": call.id, "input": call.input}), perform
         )
-        results.append(json.loads(stored))
+        results.append(_recorded(stored))
     return _messages(kind, calls, results)

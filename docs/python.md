@@ -441,7 +441,10 @@ rt.resume("research-42", research, recover=recover)
 ```
 
 Without a policy, local runs perform such tools again; runs on a server
-raise `DanglingEffect` until a policy decides.
+raise `DanglingEffect` until a policy decides. For a tool call made through
+`ctx.run_tools`, the policy's `name` is `tool:<tool name>`, its `arg` is the
+JSON `{"id", "input"}` of the call, and the result it commits is what the
+model receives as the tool's result.
 
 On a server, a write whose answer was lost is resent until the server
 answers (a repeat is recognized as a duplicate), and the store looks at
