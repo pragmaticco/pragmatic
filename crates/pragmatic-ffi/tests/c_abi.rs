@@ -305,3 +305,112 @@ fn channels_and_version() {
         assert_eq!(take(prag_version()), env!("CARGO_PKG_VERSION"));
     }
 }
+
+#[test]
+fn storage_faults_map_to_the_io_code_with_their_message() {
+    unsafe {
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rt = prag_runtime_open(
+            std::ptr::null(),
+            counting_oracle,
+            &CALLS as *const AtomicU64 as *mut c_void,
+            std::ptr::null(),
+            0,
+            &mut err,
+        );
+        assert!(!rt.is_null());
+
+        // A reserved run id is `Fault::Unsupported`, which has no code of
+        // its own: it arrives as PRAG_ERR_IO with the message intact.
+        let reserved = CString::new("pragmatic:internal").unwrap();
+        let code = prag_runtime_run(
+            rt,
+            reserved.as_ptr(),
+            research_agent,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut err,
+        );
+        assert_eq!(code, PRAG_ERR_IO);
+        let msg = take(err);
+        assert!(msg.contains("reserved"), "got: {msg}");
+
+        // Resuming a run that does not exist is an I/O fault too.
+        let missing = CString::new("never-recorded").unwrap();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let code = prag_runtime_resume(
+            rt,
+            missing.as_ptr(),
+            research_agent,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut err,
+        );
+        assert_eq!(code, PRAG_ERR_IO);
+        assert!(take(err).contains("no journal"));
+
+        prag_runtime_close(rt);
+    }
+}
+
+/// Tampering in the middle of a journal is reported as PRAG_ERR_TAMPERED
+/// with the cursor of the damaged entry, not as an I/O error.
+#[test]
+fn verify_reports_tampering_with_its_cursor() {
+    unsafe {
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("prag-ffi-tamper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dir_c = CString::new(dir.to_str().unwrap()).unwrap();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rt = prag_runtime_open(
+            dir_c.as_ptr(),
+            counting_oracle,
+            &CALLS as *const AtomicU64 as *mut c_void,
+            std::ptr::null(),
+            0,
+            &mut err,
+        );
+        assert!(!rt.is_null());
+        let run_id = CString::new("ffi-tamper-1").unwrap();
+        let mut report: *mut PragReport = std::ptr::null_mut();
+        let code = prag_runtime_run(
+            rt,
+            run_id.as_ptr(),
+            research_agent,
+            std::ptr::null_mut(),
+            &mut report,
+            &mut err,
+        );
+        assert_eq!(code, PRAG_OK);
+        prag_report_free(report);
+
+        let backend = pragmatic::DirBackend::new(&dir).unwrap();
+        let first_answer = pragmatic::Backend::snapshot(&backend, "ffi-tamper-1", None)
+            .unwrap()
+            .entries()
+            .iter()
+            .find(|e| matches!(e.event, pragmatic::Event::DrawResult { .. }))
+            .unwrap()
+            .cursor;
+        let path = backend.journal_path("ffi-tamper-1");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = bytes
+            .windows(13)
+            .position(|w| w == b"completion#0(")
+            .unwrap();
+        bytes[at] ^= 0x20;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut bad: u64 = u64::MAX;
+        let code = prag_runtime_verify(rt, run_id.as_ptr(), &mut bad, &mut err);
+        assert_eq!(code, PRAG_ERR_TAMPERED);
+        assert_eq!(bad, first_answer);
+        assert!(take(err).contains(&format!("cursor {first_answer}")));
+
+        prag_runtime_close(rt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

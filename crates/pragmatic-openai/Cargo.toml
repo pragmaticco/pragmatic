@@ -5,6 +5,7 @@ keywords = ["openai", "llm", "agents", "durable-execution", "ollama"]
 categories = ["api-bindings"]
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

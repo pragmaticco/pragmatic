@@ -23,11 +23,17 @@ fn research(ctx: &mut Ctx) -> Result<Value, Fault> {
     )
 }
 
-fn crashy(ctx: &mut Ctx) -> Result<Value, Fault> {
+fn failing(ctx: &mut Ctx) -> Result<Value, Fault> {
     let x = ctx.oracle("draw")?;
     ctx.effect("charge_card", x.as_str().into_owned(), |_| {
         Err(Fault::ToolErr("connection dropped mid-flight".into()))
     })
+}
+
+fn parallel(ctx: &mut Ctx) -> Result<Value, Fault> {
+    let picks = ctx.parallel(3, |i, c| c.oracle(format!("candidate {i}")))?;
+    let joined: Vec<String> = picks.iter().map(|v| v.as_str().into_owned()).collect();
+    ctx.oracle(format!("pick the best of: {}", joined.join(" | ")))
 }
 
 fn main() {
@@ -35,11 +41,13 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "./demo-journals".to_string());
 
-    let mut rt = Runtime::on_dir(&dir, SeededOracle::new(42)).expect("journal dir");
+    let rt = Runtime::on_dir(&dir, SeededOracle::new(42)).expect("journal dir");
     rt.run("research-42", research).expect("run");
-    let _ = rt.run("payment-7", crashy); // faults on purpose: dangling intent
+    let _ = rt.run("payment-7", failing); // fails on purpose: a failed effect
+    rt.run("best-of-3", parallel).expect("run");
 
     println!("seeded {dir} with:");
     println!("  research-42  - a completed run");
-    println!("  payment-7    - crashed inside an effect window (dangling intent)");
+    println!("  payment-7    - a tool call that failed, recorded as a failed effect");
+    println!("  best-of-3    - a parallel region of three branches");
 }

@@ -1,11 +1,16 @@
 //! `#[pragmatic::durable]` - mark an agent function as a durable program.
 //!
-//! The macro does one thing, and it matters: it computes a stable hash of the
-//! function's source tokens and injects a `program_marker` call at the top of
-//! the body. The marker is journaled on record and *verified* on replay, so a
-//! run recorded under one version of your agent refuses to replay under
-//! another - assumption A2 ("the same term is replayed") becomes an enforced
-//! property instead of a footgun.
+//! The macro does one thing, and it matters: it injects a `program_marker`
+//! call at the top of the body, naming the function and its version. The
+//! marker is journaled on the branch that calls the function and *checked*
+//! on replay, so a run recorded under one version of your agent refuses to
+//! replay under another (unless the run's code-change policy accepts it):
+//! assumption A2 ("the same term is replayed") becomes an enforced property
+//! instead of a footgun.
+//!
+//! The version is a stable hash of the function's source tokens, or the
+//! explicit `version` you give, which lets you change the source (a comment,
+//! a refactor) without changing the recorded identity:
 //!
 //! ```ignore
 //! #[pragmatic::durable]
@@ -13,6 +18,9 @@
 //!     let plan = ctx.oracle("plan the task")?;   // journaled
 //!     // ...
 //! }
+//!
+//! #[pragmatic::durable(version = "2")]
+//! fn summarize(ctx: &mut Ctx) -> Result<Value, Fault> { /* ... */ }
 //! ```
 //!
 //! Requirements: the function's **first parameter** must be the `&mut Ctx`
@@ -53,18 +61,44 @@ fn first_param_name(args: &Group) -> Option<String> {
     None
 }
 
+/// The explicit version in `version = "..."`, `None` for an empty
+/// attribute, or an error message for anything else.
+fn explicit_version(attr: TokenStream) -> Result<Option<String>, &'static str> {
+    const USAGE: &str = "#[pragmatic::durable] takes no arguments or `version = \"...\"`";
+    let tokens: Vec<TokenTree> = attr.into_iter().collect();
+    match tokens.as_slice() {
+        [] => Ok(None),
+        [TokenTree::Ident(key), TokenTree::Punct(eq), TokenTree::Literal(lit)]
+            if key.to_string() == "version" && eq.as_char() == '=' =>
+        {
+            let text = lit.to_string();
+            match text
+                .strip_prefix('"')
+                .and_then(|t| t.strip_suffix('"'))
+                .filter(|t| !t.is_empty() && !t.contains('\\'))
+            {
+                Some(v) => Ok(Some(v.to_string())),
+                None => Err("the durable version must be a non-empty plain string literal"),
+            }
+        }
+        _ => Err(USAGE),
+    }
+}
+
 /// See the crate docs. Applied to a `fn` whose first parameter is
-/// `&mut pragmatic::Ctx`.
+/// `&mut pragmatic::Ctx` (or `&mut pragmatic::AsyncCtx`).
 #[proc_macro_attribute]
 pub fn durable(attr: TokenStream, item: TokenStream) -> TokenStream {
-    if !attr.is_empty() {
-        return err(&item, "#[pragmatic::durable] takes no arguments");
-    }
+    let version = match explicit_version(attr) {
+        Ok(v) => v,
+        Err(msg) => return err(&item, msg),
+    };
 
     let tokens: Vec<TokenTree> = item.clone().into_iter().collect();
 
-    // The program hash covers the entire item: signature and body.
-    let hash = format!("{:016x}", fnv1a(&item.to_string()));
+    // The program hash covers the entire item, signature and body, unless
+    // an explicit version names the program instead.
+    let hash = version.unwrap_or_else(|| format!("{:016x}", fnv1a(&item.to_string())));
 
     // Find the function name: the ident right after the `fn` keyword.
     let mut fn_name: Option<String> = None;
@@ -111,8 +145,9 @@ pub fn durable(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // New body: `{ ctx.program_marker("name", "hash")?; <original body> }`.
-    // The marker journals the program identity on record and verifies it on
-    // replay; `?` surfaces a changed program as a JournalDesync fault.
+    // The marker journals the program identity on the calling context's
+    // branch on record and checks it on replay; `?` surfaces a refused
+    // change as a JournalDesync fault.
     let marker: TokenStream = format!("{ctx_name}.program_marker({fn_name:?}, {hash:?})?;")
         .parse()
         .expect("marker statement parses");

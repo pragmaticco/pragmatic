@@ -11,7 +11,7 @@
 //!     .max_tokens(1024)
 //!     .system("You are a terse research assistant.");
 //!
-//! let mut rt = Runtime::on_dir("./journals", oracle).unwrap();
+//! let rt = Runtime::on_dir("./journals", oracle).unwrap();
 //! let report = rt.run("research-42", |ctx| {
 //!     let plan = ctx.oracle("Plan a survey of durable execution.")?;
 //!     ctx.oracle(format!("Execute step one of: {plan}"))

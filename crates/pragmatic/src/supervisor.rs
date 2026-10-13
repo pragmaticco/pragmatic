@@ -1,14 +1,17 @@
-//! The **Supervisor** - the control plane that turns a crashed run into a
+//! The **Supervisor**: the control plane that turns a crashed run into a
 //! resumed one (paper §3.8).
 //!
 //! A supervisor maps faults to decisions: **restart** (re-enter from the
-//! journal - precisely the `replay(N, J↾id)` transition T1 certifies sound),
+//! journal: precisely the `replay(N, J↾id)` transition T1 certifies sound),
 //! **compensate** (run the saga against committed effects, in reverse),
 //! **escalate** (re-raise to the parent), or **stop**.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::ctx::{Ctx, RunOptions};
 use crate::fault::Fault;
-use crate::journal::Event;
+use crate::journal::{note, Content, Cursor, EffectOutcome, Event, META};
+use crate::json::Json;
 use crate::oracle::Oracle;
 use crate::runtime::{Recover, RunReport, Runtime};
 use crate::value::Value;
@@ -27,17 +30,34 @@ pub enum Decision {
 }
 
 /// Default decision policy: transient faults restart, logical faults stop.
+///
+/// Storage faults stop too, except [`Fault::Unavailable`]: a lock held by
+/// someone else, a conflict, a lost lease, erased content or a deleted run
+/// will not go away by trying again immediately, while an unavailable store
+/// may.
 pub fn default_policy(fault: &Fault) -> Decision {
     match fault {
-        Fault::OracleErr(_) | Fault::ToolErr(_) | Fault::Timeout | Fault::Io(_) => {
-            Decision::Restart
-        }
+        Fault::OracleErr(_)
+        | Fault::ToolErr(_)
+        | Fault::Timeout
+        | Fault::Io(_)
+        | Fault::Unavailable(_) => Decision::Restart,
         Fault::BudgetExhausted
         | Fault::ContractViol(_)
         | Fault::CapabilityDenied(_)
         | Fault::JournalDesync { .. }
         | Fault::ReplayExhausted { .. }
-        | Fault::Escalated(_) => Decision::Stop,
+        | Fault::Escalated(_)
+        | Fault::Erased { .. }
+        | Fault::Locked { .. }
+        | Fault::Conflict { .. }
+        | Fault::Unsupported(_)
+        | Fault::TooLarge { .. }
+        | Fault::DanglingIntent { .. }
+        | Fault::DanglingEffect { .. }
+        | Fault::EffectUnrecorded { .. }
+        | Fault::LeaseLost
+        | Fault::Deleted => Decision::Stop,
     }
 }
 
@@ -50,7 +70,7 @@ pub struct Supervisor {
     max_restarts: u32,
     decide: Box<dyn Fn(&Fault) -> Decision>,
     /// Called for each committed effect during compensation, in reverse
-    /// commit order - this is where your saga undoes the world.
+    /// commit order: this is where your saga undoes the world.
     compensator: Option<Compensator>,
 }
 
@@ -92,7 +112,7 @@ impl Supervisor {
     /// replays the journaled prefix first, so no work is repeated).
     pub fn supervise<O: Oracle>(
         &mut self,
-        rt: &mut Runtime<O>,
+        rt: &Runtime<O>,
         run_id: &str,
         opts: RunOptions,
         mut agent: impl FnMut(&mut Ctx) -> Result<Value, Fault>,
@@ -108,8 +128,12 @@ impl Supervisor {
             match (self.decide)(&fault) {
                 Decision::Restart if attempt < self.max_restarts => {
                     attempt += 1;
-                    // [Sup-restart]: re-enter the term against J↾id. Dangling
-                    // intents are written off (performed fresh on re-entry).
+                    // [Sup-restart]: re-enter the term against J↾id. Effects
+                    // a crash left open at the end of their branch are
+                    // written off (performed again on re-entry), and a
+                    // failure nothing observed is retried. An effect left
+                    // open with later steps after it cannot be written off:
+                    // the attempt stops with DanglingEffect for a decision.
                     outcome = rt.resume_with(
                         run_id,
                         opts.clone(),
@@ -128,33 +152,102 @@ impl Supervisor {
         }
     }
 
-    /// [Sup-comp]: compensations run in reverse order against the committed
-    /// `EffectCommit` entries in the journal, and each is journaled as
-    /// `EffectCompensated` so a later replay never double-undoes.
-    fn run_saga<O: Oracle>(&mut self, rt: &mut Runtime<O>, run_id: &str) -> Result<(), Fault> {
-        let journal = rt.journal(run_id)?;
-        // Committed effects not already compensated, in commit order.
-        let mut committed: Vec<(String, Value)> = Vec::new();
-        for e in journal.entries() {
+    /// [Sup-comp]: compensations run in reverse commit order against the
+    /// effects whose latest result is `ok`. The saga checks the run out
+    /// (taking its write lock, like any writer) and records each
+    /// compensation as `recovery` notes with decision `compensate` on the
+    /// meta branch, so program replay of the run is unchanged.
+    ///
+    /// The first note (`"saga": "begin"`) is persisted *before* the
+    /// compensator runs and the second (`"saga": "done"`) after it returns.
+    /// An effect with a `begin` note is never compensated again, so a later
+    /// saga never undoes the same effect twice, even when this one dies
+    /// between its note and its compensator; a `begin` without a `done`
+    /// shows an operator a compensation that may not have finished. If a
+    /// note cannot be persisted, the saga stops with that fault before
+    /// undoing anything more.
+    fn run_saga<O: Oracle>(&mut self, rt: &Runtime<O>, run_id: &str) -> Result<(), Fault> {
+        let mut co = rt.checkout(run_id)?;
+        let entries = co.journal.entries();
+        let mut latest: HashMap<Cursor, Cursor> = HashMap::new();
+        let mut undone: HashSet<Cursor> = HashSet::new();
+        for e in entries {
             match &e.event {
-                Event::EffectCommit { name, result } => {
-                    committed.push((name.clone(), result.clone()))
+                Event::EffectResult { intent, .. } => {
+                    latest.insert(*intent, e.cursor);
                 }
-                Event::EffectCompensated { name } => {
-                    if let Some(i) = committed.iter().rposition(|(n, _)| n == name) {
-                        committed.remove(i);
+                Event::Note { kind, data, .. } if kind == note::RECOVERY => {
+                    if let Some(intent) = saga_note_intent(data) {
+                        undone.insert(intent);
                     }
                 }
                 _ => {}
             }
         }
-        for (name, result) in committed.into_iter().rev() {
+        // (result cursor, intent cursor, branch, name, result), in commit
+        // order.
+        let mut committed = Vec::new();
+        for e in entries {
+            let Event::EffectIntent { name, .. } = &e.event else {
+                continue;
+            };
+            let Some(&r) = latest.get(&e.cursor) else {
+                continue;
+            };
+            if undone.contains(&e.cursor) {
+                continue;
+            }
+            if let Event::EffectResult {
+                outcome: EffectOutcome::Ok,
+                payload,
+                ..
+            } = &entries[r as usize].event
+            {
+                let result = match payload {
+                    Some(Content::Sealed(v)) => v.clone(),
+                    _ => Value::default(),
+                };
+                committed.push((r, e.cursor, e.branch.clone(), name.clone(), result));
+            }
+        }
+        committed.sort_by_key(|c| c.0);
+        for (result_cursor, intent, branch, name, result) in committed.into_iter().rev() {
+            let note = |phase: &str| {
+                let data = Json::Object(vec![
+                    (
+                        "branch".into(),
+                        Json::Array(branch.iter().map(|&i| Json::from(i)).collect()),
+                    ),
+                    ("decision".into(), "compensate".into()),
+                    ("intent".into(), intent.into()),
+                    ("name".into(), name.as_str().into()),
+                    ("result".into(), result_cursor.into()),
+                    ("saga".into(), phase.into()),
+                ])
+                .to_string();
+                Event::Note {
+                    kind: note::RECOVERY.into(),
+                    data,
+                    payload: Vec::new(),
+                }
+            };
+            co.journal.append(META, note("begin"))?;
+            co.persist()?;
             if let Some(f) = self.compensator.as_mut() {
                 f(&name, &result);
             }
-            journal.append(Event::EffectCompensated { name })?;
+            co.journal.append(META, note("done"))?;
+            co.persist()?;
         }
-        journal.sync()?;
         Ok(())
     }
+}
+
+/// The intent of a `recovery` note recording a compensation.
+fn saga_note_intent(data: &str) -> Option<Cursor> {
+    let doc = crate::journal::strict_json_field(data)?;
+    if doc.get("decision")?.as_str()? != "compensate" {
+        return None;
+    }
+    doc.get("intent")?.as_u64()
 }

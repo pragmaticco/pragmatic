@@ -1,10 +1,14 @@
 //! The async runtime carries the same guarantees as the sync one: replay
 //! determinism, crash recovery without re-sampling, strict replay never
-//! touching the model - driven by the built-in `block_on` (no executor
+//! touching the model, driven by the built-in `block_on` (no executor
 //! dependency).
 
+mod common;
+
+use common::{crash_before, keyed};
 use pragmatic::{
-    block_on, AsyncCtx, AsyncOracle, AsyncRuntime, CountingOracle, Fault, SeededOracle, Value,
+    block_on, AsyncCtx, AsyncOracle, AsyncRuntime, CountingOracle, Event, Fault, SeededOracle,
+    Value,
 };
 
 type TestOracle = CountingOracle<SeededOracle>;
@@ -30,7 +34,7 @@ async fn agent(ctx: &mut AsyncCtx<'_, TestOracle>) -> Result<Value, Fault> {
 #[test]
 fn async_replay_determinism_100_of_100() {
     for seed in 0..100 {
-        let mut rt = AsyncRuntime::in_memory(CountingOracle::new(SeededOracle::new(seed)));
+        let rt = AsyncRuntime::in_memory(CountingOracle::new(SeededOracle::new(seed)));
         let recorded = block_on(rt.run("r", agent)).expect("record");
         let calls = rt.oracle().calls();
 
@@ -65,21 +69,22 @@ async fn fixed_agent(ctx: &mut AsyncCtx<'_, TestOracle>) -> Result<Value, Fault>
 
 #[test]
 fn async_crash_resume_never_resamples_prefix() {
-    let mut rt = AsyncRuntime::in_memory(CountingOracle::new(SeededOracle::new(7)));
-    let full = block_on(rt.run("c", fixed_agent)).expect("record");
-    for k in 0..full.journal_len {
-        let mut rt = AsyncRuntime::in_memory(CountingOracle::new(SeededOracle::new(7)));
+    let rt = AsyncRuntime::in_memory(CountingOracle::new(SeededOracle::new(7)));
+    block_on(rt.run("c", fixed_agent)).expect("record");
+    let full = rt.snapshot("c").unwrap();
+    let program = full.program_entries();
+    for k in 0..=program.len() {
+        let rt = AsyncRuntime::in_memory(CountingOracle::new(SeededOracle::new(7)));
         block_on(rt.run("c", fixed_agent)).unwrap();
         let before = rt.oracle().calls();
-        rt.journal("c").unwrap().truncate(k).unwrap();
+        crash_before(rt.backend(), "c", k);
         let resumed = block_on(rt.resume("c", fixed_agent)).expect("resume");
         assert!(resumed.output.as_str().starts_with("done: "), "k={k}");
         // Replayed steps were served without new model calls beyond the
-        // lost tail.
-        let lost = full
-            .trace
+        // responses the crash destroyed.
+        let lost = program[k.min(program.len())..]
             .iter()
-            .filter(|l| matches!(l, pragmatic::TraceLabel::Oracle { cursor, .. } if *cursor >= k))
+            .filter(|e| matches!(e.event, Event::DrawResult { .. }))
             .count() as u64;
         assert_eq!(
             rt.oracle().calls() - before,
@@ -97,9 +102,9 @@ impl AsyncOracle for YieldingOracle {
     fn call(&self, prompt: &Value) -> impl std::future::Future<Output = Result<Value, Fault>> + '_ {
         let prompt = prompt.clone();
         async move {
-            // Yield to the executor once, then answer - proves the runtime
-            // survives suspension points mid-step.
-            yield_once().await;
+            // Yield to the executor once, then answer: the runtime survives
+            // suspension points mid-step.
+            common::yield_now().await;
             pragmatic::Oracle::call(&self.0, &prompt)
         }
     }
@@ -109,26 +114,6 @@ impl AsyncOracle for YieldingOracle {
     }
 }
 
-async fn yield_once() {
-    struct Yield(bool);
-    impl std::future::Future for Yield {
-        type Output = ();
-        fn poll(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<()> {
-            if self.0 {
-                std::task::Poll::Ready(())
-            } else {
-                self.0 = true;
-                cx.waker().wake_by_ref();
-                std::task::Poll::Pending
-            }
-        }
-    }
-    Yield(false).await
-}
-
 #[test]
 fn natively_async_oracle_with_suspension_points() {
     async fn two_steps(ctx: &mut AsyncCtx<'_, YieldingOracle>) -> Result<Value, Fault> {
@@ -136,7 +121,7 @@ fn natively_async_oracle_with_suspension_points() {
         let b = ctx.oracle(format!("second: {a}")).await?;
         Ok(b)
     }
-    let mut rt = AsyncRuntime::in_memory(YieldingOracle(SeededOracle::new(3)));
+    let rt = AsyncRuntime::in_memory(YieldingOracle(SeededOracle::new(3)));
     let recorded = block_on(rt.run("y", two_steps)).unwrap();
     let replayed = block_on(rt.replay("y", two_steps)).unwrap();
     assert_eq!(recorded.trace, replayed.trace);
@@ -149,12 +134,12 @@ fn async_durable_macro_works() {
         ctx.oracle("hello").await
     }
 
-    let mut rt = AsyncRuntime::in_memory(CountingOracle::new(SeededOracle::new(1)));
+    let rt = AsyncRuntime::in_memory(CountingOracle::new(SeededOracle::new(1)));
     let recorded = block_on(rt.run("m", marked)).unwrap();
-    // First journaled event is the program identity.
+    // The first journaled step is the program identity.
     assert!(matches!(
-        rt.journal("m").unwrap().entries()[0].event,
-        pragmatic::Event::Program { .. }
+        rt.snapshot("m").unwrap().program_entries()[0].event,
+        Event::Program { .. }
     ));
     let replayed = block_on(rt.replay("m", marked)).unwrap();
     assert_eq!(recorded.trace, replayed.trace);
@@ -162,26 +147,21 @@ fn async_durable_macro_works() {
 
 #[test]
 fn async_file_journal_survives_restart() {
-    let dir = std::env::temp_dir().join(format!("pragmatic-async-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-
+    let dir = common::TempDir::new("async-restart");
     let recorded = {
-        let mut rt =
-            AsyncRuntime::on_dir(&dir, CountingOracle::new(SeededOracle::new(42))).unwrap();
+        let rt = AsyncRuntime::on_dir(&dir.0, CountingOracle::new(SeededOracle::new(42))).unwrap();
         block_on(rt.run("d", agent)).unwrap()
     };
-    let mut rt2 = AsyncRuntime::on_dir(&dir, CountingOracle::new(SeededOracle::new(999))).unwrap();
+    let rt2 = AsyncRuntime::on_dir(&dir.0, CountingOracle::new(SeededOracle::new(999))).unwrap();
     let resumed = block_on(rt2.resume("d", agent)).unwrap();
     assert_eq!(rt2.oracle().calls(), 0);
     assert_eq!(resumed.trace, recorded.trace);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Regression: a journal holding a compensated effect pair followed by the
-/// re-performed pair (`Intent, Compensated, Intent, Commit`) must replay by
-/// consuming BOTH pairs - falling through after the compensated pair used to
-/// skip the second pair and desync every later step.
+/// A journal holding a written-off effect followed by its re-performed
+/// retry (`Intent, Compensated, Intent, Ok`) replays by skipping the first
+/// pair: falling through after the compensated pair would desync every
+/// later step.
 #[test]
 fn compensated_then_recommitted_effect_replays_exactly() {
     let flaky_then_fine = |fail: bool| {
@@ -194,19 +174,49 @@ fn compensated_then_recommitted_effect_replays_exactly() {
                     Ok(Value::from(format!("charged({arg})")))
                 }
             })?;
-            // A step AFTER the effect - the one that desyncs if the effect
+            // A step AFTER the effect: the one that desyncs if the effect
             // replay loop is wrong.
             ctx.oracle(format!("receipt for {r}"))
         }
     };
 
-    let mut rt = pragmatic::Runtime::in_memory(SeededOracle::new(5));
-    assert!(rt.run("cc", flaky_then_fine(true)).is_err()); // dangling intent
-    let resumed = rt.resume("cc", flaky_then_fine(false)).unwrap(); // compensate + fresh pair
+    let rt = pragmatic::Runtime::in_memory(SeededOracle::new(5));
+    assert!(rt.run("cc", flaky_then_fine(true)).is_err()); // failed effect
+    let resumed = rt.resume("cc", flaky_then_fine(false)).unwrap(); // retried
 
-    // Journal now holds Intent, Compensated, Intent, Commit. Strict replay
-    // must walk all of it and reproduce the resumed trace exactly.
     let replayed = rt.replay("cc", flaky_then_fine(false)).unwrap();
     assert_eq!(replayed.trace, resumed.trace);
     assert_eq!(replayed.fresh_steps, 0);
+}
+
+/// Children of an async region run concurrently and are journaled on their
+/// own branches; the region waits for all of them.
+#[test]
+fn async_parallel_children_run_concurrently() {
+    async fn agent(ctx: &mut AsyncCtx<'_, YieldingOracle>) -> Result<Value, Fault> {
+        let parts = ctx
+            .parallel(3, |i, mut c| async move {
+                let a = c.oracle(format!("a{i}")).await?;
+                let b = c.oracle(format!("b{i}: {a}")).await?;
+                Ok(b)
+            })
+            .await?;
+        let joined: Vec<String> = parts.iter().map(|v| v.as_str().into_owned()).collect();
+        ctx.oracle(joined.join(",")).await
+    }
+    let rt = AsyncRuntime::in_memory(YieldingOracle(SeededOracle::new(9)));
+    let recorded = block_on(rt.run("conc", agent)).unwrap();
+    let journal = rt.snapshot("conc").unwrap();
+    // Every model call yields once, so the three children opened their
+    // first draws before any of them finished: concurrent, not sequential.
+    let first_three: Vec<&'static str> = journal
+        .program_entries()
+        .iter()
+        .skip(1)
+        .take(3)
+        .map(|e| e.event.kind_name())
+        .collect();
+    assert_eq!(first_three, ["DrawIntent", "DrawIntent", "DrawIntent"]);
+    let replayed = block_on(rt.replay("conc", agent)).unwrap();
+    assert_eq!(keyed(&recorded.trace), keyed(&replayed.trace));
 }

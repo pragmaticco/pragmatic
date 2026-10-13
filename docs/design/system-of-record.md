@@ -1,8 +1,10 @@
 # Pragmatic 0.6: the system of record for AI agents
 
-Status: design, revision 2 (2026-10-13), after an adversarial review across
+Status: design, revision 3 (2026-10-13), after an adversarial review across
 cryptography, replay correctness, storage and failure handling, compliance,
-developer experience and completeness. This document is the contract
+developer experience and completeness, amended after the review of the core
+runtime (2.4, 2.6 to 2.8, 2.11, 2.12, 2.14, 3.1 to 3.3, 6.7). This document
+is the contract
 between the components built for 0.6. Everything marked MUST is
 normative; where code and this document disagree, one of them is a bug.
 
@@ -164,6 +166,11 @@ torn tail) unless all of the following hold:
   evidence bundle).
 - A ref (4) points to `target_cursor` < this cursor, and the target slot
   exists with state 1 or 2 (never another ref) and an equal commitment.
+- A `DrawResult`'s `intent` names an earlier `DrawIntent`, and an
+  `EffectResult`'s an earlier `EffectIntent`, on the same branch as the
+  result. Replay finds completions through this reference, so one that
+  pointed anywhere else would hand a step another step's record.
+- A `Refusal`'s step, name and fault fit together (2.6).
 - `depth` ≤ 32. The branch is the meta branch `[0xFFFF_FFFF]` if and only
   if the kind is `Note`.
 - The slot length does not exceed the bytes remaining in the record.
@@ -217,15 +224,32 @@ Slots are content and are erasable.
 | `Marker` | 9 | name (str) | none |
 | `Note` | 10 | kind (str), data (JSON) | payload, 0..=2 |
 | `Random` | 11 | source (str), args (JSON) | value (1) |
+| `Refusal` | 12 | step (str), name (str), fault (str) | none |
 
 **DrawResult meta** (written by the SDK; all keys optional except
 `outcome`): `{"outcome": "ok"|"error"|"partial", "status": n,
-"error_kind": "connect"|"timeout"|"protocol", "provider": "...",
+"error_kind": "connect"|"timeout"|"protocol", "error_type": "...",
+"provider": "...",
 "model": "...", "stop_reason": "...", "usage": {"input_tokens": n,
 "output_tokens": n, "cache_read_tokens": n, "cache_write_tokens": n,
 "reasoning_tokens": n}, "latency_ms": n}`. `partial` marks a stream that
-was closed before it ended. Meta holds no personal data, so usage, model
-and outcome survive erasure and shredding.
+was closed before it ended. `error_type` names what the caller's model
+client raised when the call failed outside HTTP (a core `Fault` kind such
+as `Unavailable` for a Rust oracle, or a Python exception's
+`module.QualName`), with the message in the body slot, so replay raises the
+same error (2.12). Meta holds no personal data, so usage, model and outcome
+survive erasure and shredding.
+
+**Refusal** records a step the runtime refused without touching the world,
+so replay raises the same fault where the agent saw it: `step` `recv`
+(`name` the channel, `fault` `Timeout`: the inbox was empty), `draw`
+(`name` empty, `fault` `BudgetExhausted`) or `effect` (`name` the effect,
+`fault` `CapabilityDenied`). It is appended only once the agent carries on
+past the fault: before the next start event on its branch or on an
+ancestor branch, or before `attempt.end` when the agent returns ok. A
+refusal the agent did not carry on past is never journaled, so a resumed
+run tries the step again (the message may have arrived, the budget may
+have been raised). Name and fault are structural, never personal data.
 
 **Random** sources: `uuid4` (args `[]`, value the canonical UUID string),
 `random` (args `[]`, value a float in [0, 1) as shortest round-trip
@@ -286,9 +310,10 @@ ended in a fault are exempt.
 **Budget** (model-call limit) is shared by all branches. A replayed draw
 never charges the budget and never faults. A fresh `DrawIntent` raises
 `BudgetExhausted` if (draws already in the journal at checkout + fresh
-draws opened this attempt) ≥ budget. A draw aborted before its intent was
+draws opened this attempt) ≥ budget, journaled as a `Refusal` once the
+agent carries on past it (2.6). A draw aborted before its intent was
 appended releases its reservation. Strict replay never consults the
-budget.
+budget: it raises `BudgetExhausted` where a `Refusal` was recorded.
 
 ### 2.8 Replay matching rules
 
@@ -304,6 +329,7 @@ budget.
 | fork | `Fork` | base and children equal |
 | patched | `Marker` | see 2.9 |
 | program marker | `Program` | see 2.10 |
+| draw, recv or effect | `Refusal` | step equal, and name equal (channel or effect name); raises the recorded fault |
 
 Replay consumes an entry only if every slot it compares or returns is
 sealed or a ref to a sealed slot. Otherwise it raises
@@ -370,7 +396,7 @@ no personal data; anything personal goes in a payload slot.
 | `attempt.start` | SDK | `{"attempt": n, "mode": "run"\|"resume", "sdk", "sdk_version", "principal", "program": {"name", "hash"}, "host", "pid", "traceparent", "torn_bytes", "torn_at_cursor"}` | none |
 | `attempt.end` | SDK | `{"attempt": n, "outcome": "ok"\|"fault"\|"error", "fault_kind": tag, "fault_cursor": n\|null, "fresh": n, "replayed": n, "usage_fresh": {...}, "passthrough_calls": n}` | 0: output (on ok); 1: fault or error message |
 | `program.change` | SDK | `{"branch", "cursor", "from", "to"}` | none |
-| `recovery` | SDK | `{"intent": cursor, "result": cursor, "branch", "name", "decision": "commit"\|"compensate"\|"retry"}` | none |
+| `recovery` | SDK | `{"intent": cursor, "result": cursor, "branch", "name", "decision": "commit"\|"compensate"\|"retry"}`, plus `"saga": "begin"\|"done"` for a Supervisor saga's compensation | none |
 | `erasure` | server or `pragmatic erase` | `{"slots": [[cursor, slot], ...], "by": token id or "local:<os-user>@<host>", "authenticated": bool, "reason_code", "access_log_cursor": n\|null}` | 0: free-text reason |
 | `custody` | server | `{"lease": lease-id hash, "token": token id, "principal", "from_entries", "to_entries", "requests": n, "first_received", "last_received", "clock_skew": bool}` | none |
 | `torn_tail` | writer that truncated | `{"offset", "bytes", "sha256", "moved_to"}` | none |
@@ -381,6 +407,10 @@ no personal data; anything personal goes in a payload slot.
   without `durable` as information. It does not change replay strictness.
 - `labels`: at most 32 pairs, keys `[a-z0-9_.-]{1,64}`, values at most 256
   bytes, documented as non-personal.
+- A Supervisor saga persists the `begin` note before it runs a
+  compensator and the `done` note after it returns. An effect with a
+  `begin` note is never compensated again; a `begin` without a `done`
+  marks a compensation that may not have finished.
 - **Server-only kinds:** `erasure`, `custody` and `torn_tail` (server
   side). The server's append path rejects them from clients, and
   `Journal::append` refuses them outside the erase and truncate code
@@ -408,7 +438,15 @@ they arrive, and the `DrawResult` with the full body is persisted when
 the stream ends or is closed. Transport errors and HTTP errors are
 results too (`outcome: error`), so the SDK's own retry loop replays
 identically. On replay, retryable error responses are served with
-`retry-after-ms: 0` so no time is spent sleeping.
+`retry-after-ms: 0` so no time is spent sleeping. A call that fails
+outside HTTP (a Rust oracle's fault, a Python callable's exception) is
+recorded with its `error_type` (2.6) and replays as the same error: Rust
+rebuilds the `Fault` for every kind that carries no more than a message
+and otherwise raises `Fault::OracleErr(message)`, on record and replay
+alike; Python raises `DrawFailed(type_name, message)`, which is also an
+instance of the recorded exception type when the program has it loaded.
+A cancelled or interrupted call is a crash, not a result: its intent
+stays dangling.
 
 **Effects.** `EffectIntent` is appended and persisted (acknowledged by the
 sink) before `perform` runs. `perform` receives
@@ -416,13 +454,21 @@ sink) before `perform` runs. `perform` receives
 recorded as `EffectResult{outcome: ok}`. If it raises, the failure is
 recorded as `EffectResult{outcome: failed, error_kind: <exception type>}`
 with the message in the slot. Replay of a failed effect raises
-`EffectFailed` (Python: carries the original type name and message;
-Rust: `Fault::ToolErr(message)`), so an agent that caught the exception
-behaves identically.
+`EffectFailed` (Python: carries the original type name and message, and
+is also an instance of the original exception type when the program has
+it loaded; Rust: the recorded `Fault` for every kind that carries no more
+than a message, otherwise `Fault::ToolErr(message)`, and record returns
+the same value as replay), so an agent that caught the exception behaves
+identically.
 
 **Frontier.** An intent is *at the frontier* of branch `b` if no start
-event on `b` follows it. A *dangling* intent has no result. An intent's
-*effective* result is its latest result.
+event on `b`, or on any ancestor branch of `b`, follows it. (A parallel
+child that handled a failure and returned, after which the parent carried
+on with the child's value, observed that failure even though nothing
+followed on the child's own branch.) A *dangling* intent has no result. An
+intent's *effective* result is its latest result. A failed result is
+*observed* when its intent is not at the frontier, or when a later
+`attempt.end` has outcome `ok`.
 
 **Recovery** runs in a recording attempt after `attempt.start` and before
 the agent is entered, over frontier intents in cursor order:
@@ -430,25 +476,35 @@ the agent is entered, over frontier intents in cursor order:
 - A dangling `DrawIntent` needs no decision. When the replayed program
   re-issues the identical request, the call is made again and a new
   `DrawResult` is appended for the same intent.
-- A frontier `DrawIntent` whose effective result is `error` is re-issued
-  the same way. That is how a failed call that crashed the attempt is
-  retried on resume.
-- A dangling `EffectIntent` is passed to the recovery policy
+- A frontier `DrawIntent` whose effective result is an unobserved
+  `error` is re-issued the same way. That is how a failed call that
+  crashed the attempt is retried on resume.
+- A dangling frontier `EffectIntent` is passed to the recovery policy
   `recover(name, arg, branch, intent_cursor) -> Commit(result) |
   Compensate`. The default is `Compensate` for local backends and an
   error (`Fault::DanglingEffect{cursor}`) for server-backed runtimes,
   which require an explicit policy. `Commit` appends
   `EffectResult{ok}`. `Compensate` appends `EffectResult{compensated}`,
   and the replayed program performs the effect afresh under a new intent.
-- A frontier `EffectIntent` whose effective result is `failed` is retried
-  by default (its result superseded by `compensated`). The policy may
-  instead return `Commit` or `Fail`, in which case the failure stands and
-  is replayed.
+- A dangling `EffectIntent` away from the frontier (concurrent calls on
+  one branch, with later starts recorded while it ran) cannot be written
+  off: its retry would be a fresh intent at the end of the branch, while
+  replay meets the starts recorded after it first. Only an explicit
+  `Commit` or `Fail` decides it. Without a policy (or on `Compensate`)
+  nothing is appended, the replayed program raises
+  `Fault::DanglingEffect{cursor}` when it reaches the intent, and a later
+  resume with a policy can still decide it (server-backed runtimes raise
+  `DanglingEffect` during recovery, as for frontier intents). The policy
+  request says whether the intent is at the frontier.
+- A frontier `EffectIntent` whose effective result is an unobserved
+  `failed` is retried by default (its result superseded by
+  `compensated`). The policy may instead return `Commit` or `Fail`, in
+  which case the failure stands and is replayed.
 - Each decision appends a `recovery` note. All recovery entries are
   persisted in one sync before the agent starts.
 
-Non-frontier failed results are never retried: the agent observed them
-and continued, so replay must reproduce them.
+Observed failed results are never retried: the agent observed them and
+continued, so replay must reproduce them.
 
 **Effect replay loop.** An `EffectIntent` whose effective result is
 `compensated` is skipped together with its result, and matching continues
@@ -504,14 +560,44 @@ conversation message.
 is incomplete, fails to decode, fails a commitment, or fails its chain
 link.
 
-If any complete, well-formed frame after the tail start chain-links from
-the failing frame's stored hash, the journal is **corrupt**, not torn: an
-error at that cursor, never truncated.
+The journal is **corrupt**, not torn (an error at the failing cursor,
+never truncated), if any of the following holds. A writer truncates
+whatever is torn, so each rule leans towards corruption whenever the
+damage could have hit acknowledged entries.
+
+- Any complete, well-formed frame after the tail start chain-links from
+  the 32 bytes before it (or, for the frame right after the failing one,
+  from the hash the failing frame's content implies) at any cursor it
+  could have: from the failing cursor + 1 up to that + (bytes between the
+  tail start and the frame) / (the smallest frame's size). Damage can
+  destroy more than one frame (a zeroed sector can take a stored hash and
+  the next frame's length), and the second frame after it still chains.
+  A reader stops searching after 2^18 chain computations and reports
+  corruption.
+- The failing frame decodes and its stored hash equals the hash its
+  skeleton implies, but a slot's content fails its commitment, and no
+  512-byte-aligned block of the file overlapping that content reads as
+  all zeros (a crash can keep the block holding the hash and lose a block
+  of content, which reads back as zeros; bit rot or tampering does not
+  look like that).
+- The failing frame decodes with valid commitments, but its stored hash
+  is not the implied hash, nor the implied hash with its last bytes zeros
+  (a write cut off inside the hash). A wrong key, a cleared keyed flag or
+  tampering produce this; a crash does not.
+- The failing frame chains correctly but its completion reference breaks
+  2.4.
+
+`Journal::audit_bytes` (and `Runtime::verify`, through the backend) reads
+past corruption and reports it as `VerifyReport.first_bad`, auditing the
+valid prefix, so a verifier learns where tampering starts; `Journal::parse`
+refuses the file.
 
 Only a write-lock holder may truncate a torn tail. Before truncating, it
 moves the tail bytes to `<name>.torn-<unix_ms>`, then `set_len(valid_len)`
 and fsync, and records `torn_bytes` and `torn_at_cursor` in the next
-`attempt.start`. The server never truncates below `anchored_entries`; it
+`attempt.start`. Erasure (2.13) removes a run's moved-aside tails before
+it commits: they hold bytes of frames that never became entries, which no
+erasure can reach inside. The server never truncates below `anchored_entries`; it
 raises `chain_broken` instead.
 
 Every read-only consumer ignores bytes past `valid_len` and never writes:
@@ -608,6 +694,12 @@ impl Drop for Attempt { /* checkin without attempt.end: releases lock or lease *
 - `evict` remains as a deprecated no-op.
 - `Mode::Replay` uses a snapshot (no lock, no lease), so auditors can
   replay live runs' durable prefixes.
+- `RunOptions` (labels) are checked before the checkout, so a run refused
+  for its options leaves no journal behind. `Mode::Resume` requires a
+  started run: a journal with no entries is refused (`run` starts it).
+- A receive takes its message off the run's inbox only once its
+  `ChannelRecv` is durable: a receive over the slot limit or one whose
+  persist fails leaves the message for the next receive or attempt.
 
 `Session` holds all per-attempt state. Every primitive takes the branch:
 
@@ -658,7 +750,11 @@ zero-dependency join.
   starts from durable state.
 - `Fault::EffectUnrecorded{name, intent, result}` is raised when perform
   succeeded but its result could not be persisted, so the caller can log
-  the result.
+  the result: a failed persist, a session another branch's persist failed
+  while the effect ran, or a result over the slot limit. A result that
+  cannot be appended (over a limit), for an effect or a draw, fails the
+  session as a persist error does: the call happened and the attempt
+  cannot go on as if it had not.
 
 ### 3.3 Backends and sinks
 
@@ -667,10 +763,12 @@ pub trait Backend: Send + Sync {
     fn checkout(&self, run_id: &str, create: bool, key: Option<&[u8]>) -> Result<Checkout, Fault>; // journal + guard
     fn snapshot(&self, run_id: &str, key: Option<&[u8]>) -> Result<Journal, Fault>;               // no lock, read-only
     fn list(&self) -> Result<Vec<String>, Fault>;
+    fn verify(&self, run_id: &str, key: Option<&[u8]>) -> Result<VerifyReport, Fault>;           // provided: snapshot().audit(); file-backed stores read past corruption (2.14)
 }
 pub trait Sink: Send {
     fn persist(&mut self, at: u64, frames: &[u8], head_after: &Digest) -> Result<(), SinkError>;
     fn rewrite(&mut self, file: &[u8]) -> Result<(), SinkError>;    // erasure and truncation only
+    fn remove_copies(&mut self) -> Result<(), SinkError>;           // provided (no-op): erasure removes moved-aside torn tails first
 }
 pub enum SinkError { Io(std::io::Error), Conflict { expected: u64, actual: u64 }, Locked { retry_after_secs: Option<u64> }, LeaseLost, TooLarge { limit: u64 }, Deleted }
 ```
@@ -706,7 +804,11 @@ Journal files are never locked. Checkout:
    `Fault::Io("run id collides with ...")`.
 
 `list` reads run ids from `run.start`. A format 1 journal is found by the
-old safe-name rule only when no hashed file exists.
+old safe-name rule only when no hashed file exists and the run id is one
+that rule leaves unchanged: the rule maps distinct ids to one file
+(`user.42` and `user_42`), so a format 1 journal belongs only to the id
+that is its file name. `list` reports format 1 runs by that name, even
+when it looks like a hashed name.
 
 The DirSink tracks `(entries, byte_len)`. Before each persist it fstats
 the file and returns `Conflict` if the size differs. It writes all frames
@@ -1553,7 +1655,11 @@ loosened.
   `Locked(retry_after)`, `Conflict(expected, actual)`, `LeaseLost`,
   `Deleted`, `Erased(cursor)`, `Unsupported`, `TooLarge`, `Unavailable`,
   `DanglingIntent`, `DanglingEffect`, `EffectFailed(type_name, message)`,
-  `EffectUnrecorded(name, intent, result)`, `NotInRun`.
+  `DrawFailed(type_name, message)`, `EffectUnrecorded(name, intent,
+  result)`, `NotInRun`. A replayed `EffectFailed` or `DrawFailed` is also
+  an instance of the recorded exception type when the program has that
+  type loaded (types are looked up among loaded modules, never imported),
+  with the recorded message as its `str()`.
 - **Observability.** With `PRAGMATIC_OTEL=1` and `opentelemetry-api`
   importable, the SDK emits one `pragmatic.attempt` span per attempt, plus
   one child span per step: GenAI semantic conventions for draws, and

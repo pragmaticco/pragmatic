@@ -1,29 +1,37 @@
-//! `pragmatic` - journal tooling for the Pragmatic runtime.
+//! `pragmatic`: journal tooling for the Pragmatic runtime.
 //!
 //! ```text
-//! pragmatic runs   [--dir DIR]                       list runs and their status
-//! pragmatic show   RUN [--dir DIR] [--key KEY]       print a run's timeline
-//! pragmatic verify RUN|--all [--dir DIR] [--key KEY] check the hash chain
-//! pragmatic export RUN [--dir DIR] [--key KEY] [-o FILE]
-//!                                                    self-contained HTML replay console
-//! pragmatic serve  [--dir DIR] [--key KEY] [--port P]
-//!                                                    live web console on localhost
+//! pragmatic runs   [--dir DIR]                         list runs and their status
+//! pragmatic show   RUN [--dir DIR] [--key-file FILE]   print a run's timeline
+//! pragmatic verify RUN|--all [--dir DIR] [--key-file FILE]
+//!                                                      check chain, commitments, erasures
+//! pragmatic export RUN [--dir DIR] [--key-file FILE] [-o FILE]
+//!                                                      self-contained HTML replay console
+//! pragmatic serve  [--dir DIR] [--key-file FILE] [--port P]
+//!                                                      live web console on localhost
 //! ```
+//!
+//! Every command is read-only: journals are read as snapshots (a torn tail
+//! is ignored, never truncated) and nothing is ever written to a journal
+//! directory. Format 2 journals and read-only format 1 journals (0.4, 0.5)
+//! are both understood.
 
 mod export;
 mod serve;
+mod view;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use pragmatic::journal::{Event, Journal, Loaded};
+use pragmatic::journal::Journal;
 use pragmatic::sha256::hex;
+use pragmatic::{Backend, DirBackend};
 
 struct Args {
     command: String,
     positional: Vec<String>,
     dir: PathBuf,
-    key: Option<String>,
+    key: Option<Vec<u8>>,
     out: Option<PathBuf>,
     all: bool,
     port: u16,
@@ -41,10 +49,13 @@ fn parse_args() -> Result<Args, String> {
         all: false,
         port: 7171,
     };
+    let mut key_flag: Option<String> = None;
+    let mut key_file: Option<PathBuf> = None;
     while let Some(a) = argv.next() {
         match a.as_str() {
             "--dir" => args.dir = argv.next().ok_or("--dir needs a value")?.into(),
-            "--key" => args.key = Some(argv.next().ok_or("--key needs a value")?),
+            "--key" => key_flag = Some(argv.next().ok_or("--key needs a value")?),
+            "--key-file" => key_file = Some(argv.next().ok_or("--key-file needs a value")?.into()),
             "-o" | "--out" => args.out = Some(argv.next().ok_or("-o needs a value")?.into()),
             "--all" => args.all = true,
             "--port" => {
@@ -61,80 +72,53 @@ fn parse_args() -> Result<Args, String> {
             other => args.positional.push(other.to_string()),
         }
     }
+    args.key = journal_key(key_flag, key_file)?;
     Ok(args)
 }
 
-fn open(path: &Path, key: Option<&str>) -> Result<Loaded, String> {
-    let loaded = match key {
-        Some(k) => Journal::open_keyed(path, k.as_bytes()),
-        None => Journal::open(path),
-    };
-    loaded.map_err(|e| format!("{}: {e}", path.display()))
+/// The HMAC key for keyed journals: `--key-file`, else
+/// `PRAGMATIC_JOURNAL_KEY`, else the deprecated `--key` (which puts the
+/// secret in the process list, so it warns).
+fn journal_key(flag: Option<String>, file: Option<PathBuf>) -> Result<Option<Vec<u8>>, String> {
+    if let Some(path) = file {
+        let mut bytes = std::fs::read(&path)
+            .map_err(|e| format!("cannot read key file {}: {e}", path.display()))?;
+        while bytes.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+            bytes.pop();
+        }
+        return Ok(Some(bytes));
+    }
+    if let Some(k) = flag {
+        eprintln!(
+            "warning: --key exposes the key to other users of this machine; \
+             use --key-file or PRAGMATIC_JOURNAL_KEY"
+        );
+        return Ok(Some(k.into_bytes()));
+    }
+    Ok(std::env::var("PRAGMATIC_JOURNAL_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .map(String::into_bytes))
 }
 
-/// All `*.journal` files under `dir`, as (run_id, path).
-fn discover(dir: &Path) -> Result<Vec<(String, PathBuf)>, String> {
-    let mut runs = Vec::new();
-    let entries =
-        std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("journal") {
-            let run = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("?")
-                .to_string();
-            runs.push((run, path));
-        }
+/// The backend over an existing directory. The CLI never creates one.
+fn backend(dir: &Path) -> Result<DirBackend, String> {
+    if !dir.is_dir() {
+        return Err(format!("{} is not a directory", dir.display()));
     }
-    runs.sort();
-    Ok(runs)
+    DirBackend::new(dir).map_err(|e| format!("{}: {e}", dir.display()))
 }
 
-fn event_kind(e: &Event) -> &'static str {
-    match e {
-        Event::Program { .. } => "program",
-        Event::OracleDraw { .. } => "oracle",
-        Event::ChannelRecv { .. } => "recv",
-        Event::EffectIntent { .. } => "intent",
-        Event::EffectCommit { .. } => "commit",
-        Event::EffectCompensated { .. } => "compensated",
-        Event::Clock { .. } => "clock",
-    }
+/// Read one run's journal as a snapshot.
+fn open(dir: &Path, run: &str, key: Option<&[u8]>) -> Result<Journal, String> {
+    backend(dir)?
+        .snapshot(run, key)
+        .map_err(|e| format!("{run}: {e}"))
 }
 
-fn event_summary(e: &Event, width: usize) -> String {
-    let clip = |s: &str| -> String {
-        let s = s.replace('\n', " ");
-        if s.chars().count() > width {
-            let cut: String = s.chars().take(width).collect();
-            format!("{cut}…")
-        } else {
-            s
-        }
-    };
-    match e {
-        Event::Program { name, hash } => format!("{name} [{hash}]"),
-        Event::OracleDraw {
-            prompt,
-            outcome,
-            provenance,
-        } => format!(
-            "{} ⟶ {}  ({provenance})",
-            clip(&prompt.as_str()),
-            clip(&outcome.as_str())
-        ),
-        Event::ChannelRecv { channel, value } => {
-            format!("{channel} ? {}", clip(&value.as_str()))
-        }
-        Event::EffectIntent { name, arg } => format!("{name}({})", clip(&arg.as_str())),
-        Event::EffectCommit { name, result } => {
-            format!("{name} ⟶ {}", clip(&result.as_str()))
-        }
-        Event::EffectCompensated { name } => name.to_string(),
-        Event::Clock { nanos } => format!("{nanos} ns"),
-    }
+/// Every run id in `dir`.
+fn discover(dir: &Path) -> Result<Vec<String>, String> {
+    backend(dir)?.list().map_err(|e| e.to_string())
 }
 
 fn cmd_runs(args: &Args) -> Result<(), String> {
@@ -143,29 +127,32 @@ fn cmd_runs(args: &Args) -> Result<(), String> {
         println!("no journals in {}", args.dir.display());
         return Ok(());
     }
-    let (c1, c2, c3, c4) = ("RUN", "ENTRIES", "CHAIN", "HEAD");
-    println!("{c1:<28} {c2:>8}  {c3:<9} {c4}");
-    for (run, path) in runs {
-        match open(&path, args.key.as_deref()) {
-            Ok(loaded) => {
-                let j = loaded.journal;
-                let chain = if j.verify().is_ok() {
+    let (c1, c2, c3, c4, c5) = ("RUN", "FMT", "ENTRIES", "STATUS", "HEAD");
+    println!("{c1:<28} {c2:>3} {c3:>8}  {c4:<9} {c5}");
+    for run in runs {
+        match open(&args.dir, &run, args.key.as_deref()) {
+            Ok(j) => {
+                let status = if j.audit().is_ok() {
                     "verified"
                 } else {
                     "BROKEN"
                 };
-                let head = j
-                    .head()
-                    .map(|h| hex(&h)[..16].to_string())
-                    .unwrap_or_else(|| "-".to_string());
-                let torn = if loaded.torn_bytes > 0 {
-                    format!("  (truncated {} torn bytes)", loaded.torn_bytes)
-                } else {
-                    String::new()
-                };
-                println!("{run:<28} {:>8}  {chain:<9} {head}{torn}", j.len());
+                let head = hex(&j.head())[..16].to_string();
+                let mut extra = String::new();
+                let open = view::open_intents(&j).len();
+                if open > 0 {
+                    extra.push_str(&format!("  ({open} open intent(s))"));
+                }
+                if j.torn_bytes() > 0 {
+                    extra.push_str(&format!("  ({} torn bytes ignored)", j.torn_bytes()));
+                }
+                println!(
+                    "{run:<28} {:>3} {:>8}  {status:<9} {head}{extra}",
+                    j.format(),
+                    j.len()
+                );
             }
-            Err(e) => println!("{run:<28} {:>8}  {:<9} {e}", "-", "ERROR"),
+            Err(e) => println!("{run:<28} {:>3} {:>8}  {:<9} {e}", "-", "-", "ERROR"),
         }
     }
     Ok(())
@@ -173,63 +160,81 @@ fn cmd_runs(args: &Args) -> Result<(), String> {
 
 fn cmd_show(args: &Args) -> Result<(), String> {
     let run = args.positional.first().ok_or("usage: pragmatic show RUN")?;
-    let path = args.dir.join(format!("{run}.journal"));
-    let loaded = open(&path, args.key.as_deref())?;
-    let j = loaded.journal;
+    let j = open(&args.dir, run, args.key.as_deref())?;
+    let report = j.audit();
 
     println!("run      : {run}");
-    println!("entries  : {}", j.len());
+    println!("format   : {}", j.format());
     println!(
-        "chain    : {}",
-        match j.verify() {
-            Ok(()) => "verified".to_string(),
-            Err(c) => format!("BROKEN at cursor {c}"),
-        }
+        "entries  : {} ({} agent steps)",
+        j.len(),
+        j.program_entries().len()
     );
-    if let Some(h) = j.head() {
-        println!("head     : {}", hex(&h));
-    }
-    let dangling = j.dangling_intents();
-    if !dangling.is_empty() {
+    println!("verify   : {}", view::verify_line(&report));
+    println!("head     : {}", hex(&j.head()));
+    if j.torn_bytes() > 0 {
         println!(
-            "dangling : {} effect intent(s) without commit - crashed mid-effect",
-            dangling.len()
+            "torn     : {} bytes after the valid prefix (ignored)",
+            j.torn_bytes()
+        );
+    }
+    let open = view::open_intents(&j);
+    if !open.is_empty() {
+        println!(
+            "open     : {} intent(s) without a result, first at cursor {}: interrupted by a crash",
+            open.len(),
+            open[0]
         );
     }
     println!();
     for e in j.entries() {
+        let erased = view::erased_slots(e);
+        let erased = if erased > 0 {
+            format!("  [{erased} slot(s) erased]")
+        } else {
+            String::new()
+        };
         println!(
-            "{:>6}  {:<12} {}",
+            "{:>6}  {:<6} {:<18} {}{erased}",
             e.cursor,
-            event_kind(&e.event),
-            event_summary(&e.event, 100)
+            view::branch_label(&e.branch),
+            view::label(&e.event),
+            view::summary(&e.event, 100)
         );
     }
     Ok(())
 }
 
 fn cmd_verify(args: &Args) -> Result<(), String> {
-    let targets: Vec<(String, PathBuf)> = if args.all {
+    let targets: Vec<String> = if args.all {
         discover(&args.dir)?
     } else {
         let run = args
             .positional
             .first()
             .ok_or("usage: pragmatic verify RUN (or --all)")?;
-        vec![(run.clone(), args.dir.join(format!("{run}.journal")))]
+        vec![run.clone()]
     };
     let mut failed = false;
-    for (run, path) in targets {
-        match open(&path, args.key.as_deref()) {
-            Ok(loaded) => match loaded.journal.verify() {
-                Ok(()) => println!("{run}: verified ({} entries)", loaded.journal.len()),
-                Err(c) => {
-                    println!("{run}: HASH CHAIN BROKEN at cursor {c}");
-                    failed = true;
-                }
-            },
+    for run in targets {
+        match open(&args.dir, &run, args.key.as_deref()) {
+            Ok(j) => {
+                let report = j.audit();
+                let torn = if report.torn_bytes > 0 {
+                    format!(", {} torn bytes ignored", report.torn_bytes)
+                } else {
+                    String::new()
+                };
+                println!(
+                    "{run}: {} ({} entries, format {}{torn})",
+                    view::verify_line(&report),
+                    j.len(),
+                    j.format()
+                );
+                failed |= !report.is_ok();
+            }
             Err(e) => {
-                println!("{run}: {e}");
+                println!("{e}");
                 failed = true;
             }
         }
@@ -246,9 +251,8 @@ fn cmd_export(args: &Args) -> Result<(), String> {
         .positional
         .first()
         .ok_or("usage: pragmatic export RUN [-o FILE]")?;
-    let path = args.dir.join(format!("{run}.journal"));
-    let loaded = open(&path, args.key.as_deref())?;
-    let html = export::render(run, &loaded.journal);
+    let journal = open(&args.dir, run, args.key.as_deref())?;
+    let html = export::render(run, &journal);
     let out = args
         .out
         .clone()
@@ -263,24 +267,25 @@ fn help() {
         "pragmatic - journal tooling for the Pragmatic durable-execution runtime
 
 USAGE:
-    pragmatic runs   [--dir DIR] [--key KEY]
-    pragmatic show   RUN [--dir DIR] [--key KEY]
-    pragmatic verify RUN|--all [--dir DIR] [--key KEY]
-    pragmatic export RUN [--dir DIR] [--key KEY] [-o FILE]
-    pragmatic serve  [--dir DIR] [--key KEY] [--port PORT]
+    pragmatic runs   [--dir DIR] [--key-file FILE]
+    pragmatic show   RUN [--dir DIR] [--key-file FILE]
+    pragmatic verify RUN|--all [--dir DIR] [--key-file FILE]
+    pragmatic export RUN [--dir DIR] [--key-file FILE] [-o FILE]
+    pragmatic serve  [--dir DIR] [--key-file FILE] [--port PORT]
 
 COMMANDS:
     runs      List every run journaled under DIR (default: .)
-    show      Print a run's full event timeline
-    verify    Walk the tamper-evident hash chain end to end
+    show      Print a run's full timeline: branches, steps, notes, erased slots
+    verify    Check every chain link, commitment and erasure; never writes
     export    Write a self-contained HTML replay console for a run
     serve     Live web console on http://127.0.0.1:PORT (default 7171)
 
 OPTIONS:
-    --dir DIR    Journal directory (default: current directory)
-    --key KEY    HMAC key for keyed (signed) journals
-    -o FILE      Output path for export (default: RUN.html)
-    --port PORT  Port for serve (loopback only; default 7171)"
+    --dir DIR        Journal directory (default: current directory)
+    --key-file FILE  HMAC key for keyed journals (or PRAGMATIC_JOURNAL_KEY)
+    --key KEY        Deprecated: puts the key on the command line
+    -o FILE          Output path for export (default: RUN.html)
+    --port PORT      Port for serve (loopback only; default 7171)"
     );
 }
 

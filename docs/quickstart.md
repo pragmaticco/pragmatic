@@ -49,7 +49,7 @@ let oracle = AnthropicOracle::from_env()?      // ANTHROPIC_API_KEY
     .model("claude-sonnet-5")
     .max_tokens(1024);
 
-let mut rt = Runtime::on_dir("./journals", oracle)?;
+let rt = Runtime::on_dir("./journals", oracle)?;
 let report = rt.run("research-42", research)?;
 println!("{}", report.output);
 ```
@@ -107,7 +107,7 @@ async fn research(ctx: &mut AsyncCtx<'_, MyOracle>) -> Result<Value, Fault> {
     }).await
 }
 
-let mut rt = AsyncRuntime::on_dir("./journals", oracle)?;
+let rt = AsyncRuntime::on_dir("./journals", oracle)?;
 let report = rt.run("research-42", research).await?;   // drive from tokio,
                                                         // smol, or pragmatic::block_on
 ```

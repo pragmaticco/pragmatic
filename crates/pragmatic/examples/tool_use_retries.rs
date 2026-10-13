@@ -3,8 +3,8 @@
 //! An agent drafts a query, calls a flaky external tool as a durable effect,
 //! and synthesizes an answer - under a Supervisor that restarts transient
 //! faults from the journal. The tool fails twice before succeeding; each
-//! restart replays the journaled prefix (no re-drafting, no duplicate model
-//! calls) and retries only the failed step.
+//! failure is recorded, and each restart replays the journaled prefix (no
+//! re-drafting, no duplicate model calls) and retries only the failed step.
 //!
 //! ```sh
 //! cargo run -p pragmatic --example tool_use_retries
@@ -39,11 +39,11 @@ fn main() {
         ctx.oracle(format!("synthesize an answer from: {results}"))
     };
 
-    let mut rt = Runtime::in_memory(SeededOracle::new(7));
+    let rt = Runtime::in_memory(SeededOracle::new(7));
     let mut sup = Supervisor::new().max_restarts(5);
 
     let report = sup
-        .supervise(&mut rt, "cs4", RunOptions::default().with_budget(50), agent)
+        .supervise(&rt, "cs4", RunOptions::default().with_budget(50), agent)
         .expect("supervised run completes");
 
     println!(
@@ -57,8 +57,16 @@ fn main() {
     );
     println!("journal entries : {}", report.journal_len);
 
-    // The journal shows the whole story: one draft draw, two dangling
-    // intents closed by compensation on restart, one committed effect, one
-    // synthesis draw.
+    // The journal shows the whole story: one draft draw, two failed tool
+    // calls (each retried on restart, with a recovery note saying so), one
+    // committed tool call and one synthesis draw.
     assert_eq!(attempts.get(), 3);
+    let journal = rt.snapshot("cs4").expect("snapshot");
+    let retries = journal
+        .entries()
+        .iter()
+        .filter(|e| e.event.note_kind() == Some("recovery"))
+        .count();
+    println!("retried calls   : {retries} (recorded as recovery notes)");
+    assert_eq!(retries, 2);
 }

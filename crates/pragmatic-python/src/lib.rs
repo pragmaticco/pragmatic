@@ -4,18 +4,22 @@
 //! smallest surface the pure-Python layer needs: the runtime itself, the
 //! per-attempt context, and split-phase record/replay primitives so Python
 //! can perform model calls and tool calls itself (sync or async SDK
-//! clients) while the journal stays authoritative. The public API lives in
-//! `python/pragmatic/`; see its `__init__.py`.
+//! clients) while the journal stays authoritative. The split-phase
+//! primitives sit on the core's session API: a fresh draw or effect intent
+//! is durable before Python makes the call or runs the tool. The public API
+//! lives in `python/pragmatic/`; see its `__init__.py`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use pyo3::create_exception;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyException, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use pragmatic_rt::{Fault, Oracle, TraceLabel, Value};
+use pragmatic_rt::journal::{Content, Cursor, Event};
+use pragmatic_rt::json::Json;
+use pragmatic_rt::{DrawStart, EffectStart, Fault, Oracle, TraceLabel, Value};
 
 create_exception!(
     pragmatic,
@@ -86,13 +90,56 @@ impl Oracle for PyCallableOracle {
     }
 }
 
-/// A split-phase step that has been opened (replay said "record fresh")
-/// but not yet committed. Any other journaled step in between would
-/// interleave the journal nondeterministically, so it is refused.
+/// A split-phase step whose intent is durable but whose result is not
+/// recorded yet. Any other journaled step in between is refused: journaled
+/// steps from Python run one at a time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Pending {
-    Draw(String),
-    Effect(String),
+    Draw(Cursor),
+    Effect(Cursor, String),
+}
+
+/// The `meta` the core records for a draw that returned normally.
+const META_OK: &str = r#"{"outcome":"ok"}"#;
+
+/// A string member of a draw's metadata (`outcome`, `error_type`).
+fn meta_field(meta: &str, key: &str) -> Option<String> {
+    Json::parse(meta)
+        .ok()?
+        .get(key)?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The `meta` of a model call that raised an exception of type `type_name`.
+fn error_meta(type_name: &str) -> String {
+    Json::Object(vec![
+        ("error_type".to_string(), Json::from(type_name)),
+        ("outcome".to_string(), Json::from("error")),
+    ])
+    .to_string()
+}
+
+/// The name a Python exception is recorded under (`module.QualName`, or a
+/// builtin's bare name), from `pragmatic._failures.type_name`.
+fn exception_type_name(py: Python<'_>, e: &PyErr) -> String {
+    py.import("pragmatic._failures")
+        .and_then(|m| m.call_method1("type_name", (e.value(py),)))
+        .and_then(|n| n.extract::<String>())
+        .unwrap_or_else(|_| "Exception".to_string())
+}
+
+/// The exception a recorded failure raises on replay: an `EffectFailed` or
+/// `DrawFailed` that is also an instance of the recorded exception type
+/// when the program has that type loaded (see `pragmatic/_failures.py`).
+fn replayed_exception(py: Python<'_>, step: &str, type_name: &str, message: &str) -> PyErr {
+    match py
+        .import("pragmatic._failures")
+        .and_then(|m| m.call_method1("replayed", (step, type_name, message)))
+    {
+        Ok(exc) => PyErr::from_value(exc),
+        Err(e) => e,
+    }
 }
 
 /// The per-attempt durable context. Valid only during the
@@ -132,6 +179,44 @@ impl Ctx {
             err
         })
     }
+
+    /// Begin an effect on this context's branch.
+    fn begin_effect(&mut self, name: &str, arg: &str) -> PyResult<EffectStart> {
+        let ctx = self.get()?;
+        let branch = ctx.branch().clone();
+        let r = ctx.session().effect_begin(&branch, name, Value::from(arg));
+        self.check(r)
+    }
+
+    /// Record the result of the effect at `intent`.
+    fn end_effect(
+        &mut self,
+        intent: Cursor,
+        outcome: Result<Value, (String, String)>,
+    ) -> PyResult<()> {
+        let r = self.get()?.session().effect_end(intent, outcome);
+        self.check(r)
+    }
+
+    /// The exception a recorded failure of `step` raises again on replay.
+    /// It is the agent's to handle like the original; if it escapes the
+    /// agent it is re-raised as is, so no earlier fault is restored for it.
+    fn replayed_failure(&self, py: Python<'_>, step: &str, kind: &str, message: &str) -> PyErr {
+        *self.last_fault.borrow_mut() = None;
+        replayed_exception(py, step, kind, message)
+    }
+
+    /// Record that `perform` raised `e`, unless `e` is not an `Exception`
+    /// (KeyboardInterrupt, SystemExit, a cancelled task): that is a crash,
+    /// not a result, and the intent stays open for resume's recovery.
+    fn fail_effect(&mut self, py: Python<'_>, intent: Cursor, e: &PyErr) -> PyResult<()> {
+        if !e.is_instance_of::<PyException>(py) {
+            return Ok(());
+        }
+        let kind = exception_type_name(py, e);
+        let message = e.value(py).to_string();
+        self.end_effect(intent, Err((kind, message)))
+    }
 }
 
 #[pymethods]
@@ -144,98 +229,198 @@ impl Ctx {
     }
 
     /// A durable effect under the write-ahead discipline. `perform` is a
-    /// Python callable `(str) -> str`.
-    fn effect(&mut self, name: &str, arg: &str, perform: Py<PyAny>) -> PyResult<String> {
+    /// Python callable `(str) -> str`. If it raises, the failure is recorded
+    /// (type name and message) and the exception propagates unchanged; a
+    /// replay raises `EffectFailed` with the recorded type and message,
+    /// which is also an instance of the recorded type when it is loaded.
+    fn effect(
+        &mut self,
+        py: Python<'_>,
+        name: &str,
+        arg: &str,
+        perform: Py<PyAny>,
+    ) -> PyResult<String> {
         self.idle()?;
-        let raised: RefCell<Option<PyErr>> = RefCell::new(None);
-        let r = self.get()?.effect(name, arg, |a| {
-            Python::attach(|py| {
-                let out = perform.call1(py, (a.as_str().into_owned(),)).map_err(|e| {
-                    let msg = format!("python effect raised: {e}");
-                    *raised.borrow_mut() = Some(e);
-                    Fault::ToolErr(msg)
-                })?;
-                let text: String = out
-                    .extract(py)
-                    .map_err(|e| Fault::ToolErr(format!("python effect must return str: {e}")))?;
-                Ok(Value::from(text))
-            })
-        });
-        if let Some(e) = raised.into_inner() {
-            // The tool's own exception propagates unchanged; the journal
-            // keeps the dangling intent for recovery.
-            return Err(e);
+        let intent = match self.begin_effect(name, arg)? {
+            EffectStart::Replayed(v) => return Ok(v.as_str().into_owned()),
+            EffectStart::Failed { kind, message } => {
+                return Err(self.replayed_failure(py, "effect", &kind, &message))
+            }
+            EffectStart::Fresh { intent, .. } => intent,
+        };
+        let out = perform
+            .call1(py, (arg,))
+            .and_then(|v| v.extract::<String>(py));
+        match out {
+            Ok(text) => {
+                self.end_effect(intent, Ok(Value::from(text.as_str())))?;
+                Ok(text)
+            }
+            Err(e) => {
+                self.fail_effect(py, intent, &e)?;
+                // The tool's own exception propagates unchanged.
+                Err(e)
+            }
         }
-        Ok(self.check(r)?.as_str().into_owned())
     }
 
     /// Split-phase draw, step 1: the recorded outcome for `prompt`, or None
-    /// when the model must be called. After None, `draw_commit` with the
-    /// same prompt must come next.
-    fn draw_replay(&mut self, prompt: &str) -> PyResult<Option<String>> {
+    /// when the model must be called. A None means the intent is already
+    /// durable; `draw_commit` with the same prompt (or `draw_fail`, or
+    /// `draw_abort`) must come next. A recorded failure is raised again as
+    /// `DrawFailed` (also an instance of the recorded exception type when it
+    /// is loaded).
+    #[pyo3(signature = (prompt, provenance="python"))]
+    fn draw_replay(
+        &mut self,
+        py: Python<'_>,
+        prompt: &str,
+        provenance: &str,
+    ) -> PyResult<Option<String>> {
         self.idle()?;
-        let r = self.get()?.oracle_replay(&Value::from(prompt));
+        let ctx = self.get()?;
+        let branch = ctx.branch().clone();
+        let r = ctx
+            .session()
+            .draw_begin(&branch, provenance, vec![Value::from(prompt)]);
         match self.check(r)? {
-            Some(v) => Ok(Some(v.as_str().into_owned())),
-            None => {
-                self.pending = Some(Pending::Draw(prompt.to_string()));
+            DrawStart::Replayed { meta, body, .. } => {
+                if meta_field(&meta, "outcome").as_deref() == Some("error") {
+                    let kind = meta_field(&meta, "error_type").unwrap_or_default();
+                    return Err(self.replayed_failure(py, "draw", &kind, &body.as_str()));
+                }
+                Ok(Some(body.as_str().into_owned()))
+            }
+            DrawStart::Fresh(intent) => {
+                self.pending = Some(Pending::Draw(intent));
                 Ok(None)
             }
         }
     }
 
-    /// Split-phase draw, step 2: journal the model's realized outcome.
+    /// Split-phase draw, step 2: journal the model's realized outcome. The
+    /// provenance was recorded with the intent; it is accepted here for
+    /// compatibility.
+    #[pyo3(signature = (prompt, outcome, provenance="python"))]
     fn draw_commit(&mut self, prompt: &str, outcome: &str, provenance: &str) -> PyResult<String> {
-        if self.pending != Some(Pending::Draw(prompt.to_string())) {
+        let _ = provenance;
+        let Some(Pending::Draw(intent)) = self.pending.clone() else {
+            return Err(PragmaticError::new_err(
+                "draw_commit without a matching draw_replay that returned None",
+            ));
+        };
+        let matches = matches!(
+            self.get()?.session().entry(intent).map(|e| &e.event),
+            Some(Event::DrawIntent { parts, .. })
+                if parts.len() == 1 && parts[0] == Content::from(prompt)
+        );
+        if !matches {
             return Err(PragmaticError::new_err(
                 "draw_commit without a matching draw_replay that returned None",
             ));
         }
         self.pending = None;
-        let r = self.get()?.oracle_commit(
-            Value::from(prompt),
+        let r = self.get()?.session().draw_end(
+            intent,
+            META_OK.to_string(),
+            Value::default(),
             Value::from(outcome),
-            provenance.to_string(),
         );
-        Ok(self.check(r)?.as_str().into_owned())
+        self.check(r)?;
+        Ok(outcome.to_string())
     }
 
-    /// Abandon an open draw whose model call failed. Nothing was journaled,
-    /// so the step simply has not happened yet.
+    /// Split-phase draw, step 2 for a model call that raised: record the
+    /// failure (the exception's type name and message) as the call's
+    /// result, so an agent that handles it replays identically (spec 2.12:
+    /// errors are results too). A failure the agent did not handle ends the
+    /// attempt at the frontier of its branch, where a resume calls the
+    /// model again.
+    fn draw_fail(&mut self, type_name: &str, message: &str) -> PyResult<()> {
+        let Some(Pending::Draw(intent)) = self.pending.clone() else {
+            return Err(PragmaticError::new_err(
+                "draw_fail without a matching draw_replay that returned None",
+            ));
+        };
+        self.pending = None;
+        let r = self.get()?.session().draw_end(
+            intent,
+            error_meta(type_name),
+            Value::default(),
+            Value::from(message),
+        );
+        self.check(r)
+    }
+
+    /// Abandon an open draw whose model call was interrupted (a
+    /// KeyboardInterrupt, a cancelled task). Its intent stays on record
+    /// without a result, as if the process had died during the call: a
+    /// resumed run makes the call again. A call that raised an ordinary
+    /// exception is recorded with `draw_fail` instead.
     fn draw_abort(&mut self) {
         if matches!(self.pending, Some(Pending::Draw(_))) {
             self.pending = None;
         }
     }
 
-    /// Split-phase effect, step 1: the committed result, or None when the
-    /// effect must be performed. After None, call `effect_begin` next.
-    fn effect_replay(&mut self, name: &str, arg: &str) -> PyResult<Option<String>> {
+    /// Split-phase effect, step 1: the recorded result, or None when the
+    /// effect must be performed. A None means the intent is already durable;
+    /// call `effect_begin` and then `effect_commit` (or `effect_fail`) next.
+    /// A recorded failure is raised again as `EffectFailed`.
+    fn effect_replay(&mut self, py: Python<'_>, name: &str, arg: &str) -> PyResult<Option<String>> {
         self.idle()?;
-        let r = self.get()?.effect_replay(name, &Value::from(arg));
-        Ok(self.check(r)?.map(|v| v.as_str().into_owned()))
+        match self.begin_effect(name, arg)? {
+            EffectStart::Replayed(v) => Ok(Some(v.as_str().into_owned())),
+            EffectStart::Failed { kind, message } => {
+                Err(self.replayed_failure(py, "effect", &kind, &message))
+            }
+            EffectStart::Fresh { intent, .. } => {
+                self.pending = Some(Pending::Effect(intent, name.to_string()));
+                Ok(None)
+            }
+        }
     }
 
-    /// Split-phase effect, step 2: journal the write-ahead intent, durable
-    /// before the world is touched.
+    /// Split-phase effect, step 2: the write-ahead intent. `effect_replay`
+    /// already made it durable, so this only checks the sequence.
     fn effect_begin(&mut self, name: &str, arg: &str) -> PyResult<()> {
-        self.idle()?;
-        let r = self.get()?.effect_begin(name, Value::from(arg));
-        self.check(r)?;
-        self.pending = Some(Pending::Effect(name.to_string()));
-        Ok(())
+        let _ = arg;
+        match &self.pending {
+            Some(Pending::Effect(_, n)) if n == name => Ok(()),
+            _ => Err(PragmaticError::new_err(
+                "effect_begin without a matching effect_replay that returned None",
+            )),
+        }
     }
 
     /// Split-phase effect, step 3: journal the realized result.
     fn effect_commit(&mut self, name: &str, result: &str) -> PyResult<String> {
-        if self.pending != Some(Pending::Effect(name.to_string())) {
-            return Err(PragmaticError::new_err(
-                "effect_commit without a matching effect_begin",
-            ));
-        }
+        let intent = match &self.pending {
+            Some(Pending::Effect(intent, n)) if n == name => *intent,
+            _ => {
+                return Err(PragmaticError::new_err(
+                    "effect_commit without a matching effect_begin",
+                ))
+            }
+        };
         self.pending = None;
-        let r = self.get()?.effect_commit(name, Value::from(result));
-        Ok(self.check(r)?.as_str().into_owned())
+        self.end_effect(intent, Ok(Value::from(result)))?;
+        Ok(result.to_string())
+    }
+
+    /// Split-phase effect, step 3 for a perform that raised: record the
+    /// failure (type name and message) as the effect's result.
+    fn effect_fail(&mut self, name: &str, type_name: &str, message: &str) -> PyResult<()> {
+        let intent = match &self.pending {
+            Some(Pending::Effect(intent, n)) if n == name => *intent,
+            _ => {
+                return Err(PragmaticError::new_err(
+                    "effect_fail without a matching effect_begin",
+                ))
+            }
+        };
+        self.pending = None;
+        self.end_effect(intent, Err((type_name.to_string(), message.to_string())))
     }
 
     /// Receive on a channel (journaled).
@@ -308,13 +493,14 @@ fn convert_report(r: pragmatic_rt::RunReport) -> RunReport {
         .trace
         .iter()
         .map(|l| match l {
-            TraceLabel::Oracle { cursor, outcome } => {
-                (*cursor, "oracle".to_string(), outcome.as_str().into_owned())
-            }
+            TraceLabel::Oracle {
+                cursor, outcome, ..
+            } => (*cursor, "oracle".to_string(), outcome.as_str().into_owned()),
             TraceLabel::Effect {
                 cursor,
                 name,
                 result,
+                ..
             } => (
                 *cursor,
                 "effect".to_string(),
@@ -324,17 +510,33 @@ fn convert_report(r: pragmatic_rt::RunReport) -> RunReport {
                 cursor,
                 channel,
                 value,
+                ..
             } => (
                 *cursor,
                 "recv".to_string(),
                 format!("{channel} ? {}", value.as_str()),
             ),
-            TraceLabel::Clock { cursor, nanos } => {
+            TraceLabel::Clock { cursor, nanos, .. } => {
                 (*cursor, "clock".to_string(), nanos.to_string())
             }
+            TraceLabel::Random {
+                cursor,
+                source,
+                value,
+                ..
+            } => (
+                *cursor,
+                "random".to_string(),
+                format!("{source} -> {}", value.as_str()),
+            ),
             TraceLabel::Done { output } => {
                 (u64::MAX, "done".to_string(), output.as_str().into_owned())
             }
+            other => (
+                other.cursor().unwrap_or(u64::MAX),
+                "other".to_string(),
+                String::new(),
+            ),
         })
         .collect();
     RunReport {
@@ -467,7 +669,11 @@ impl Runtime {
 impl Runtime {
     #[new]
     #[pyo3(signature = (dir, oracle=None, key=None))]
-    fn new(dir: &str, oracle: Option<Py<PyAny>>, key: Option<Bound<'_, PyBytes>>) -> PyResult<Self> {
+    fn new(
+        dir: &str,
+        oracle: Option<Py<PyAny>>,
+        key: Option<Bound<'_, PyBytes>>,
+    ) -> PyResult<Self> {
         let mut inner = pragmatic_rt::Runtime::on_dir(dir, PyCallableOracle { func: oracle })
             .map_err(|e| PragmaticError::new_err(e.to_string()))?;
         if let Some(k) = key {
@@ -514,7 +720,8 @@ impl Runtime {
         self.inner.send(run_id, channel, value);
     }
 
-    /// Walk the run's tamper-evident hash chain. Returns True if intact.
+    /// Verify the run's journal: every chain link and commitment, and that
+    /// every erased slot is accounted for. Returns True if intact.
     fn verify(&mut self, run_id: &str) -> PyResult<bool> {
         Ok(self
             .inner

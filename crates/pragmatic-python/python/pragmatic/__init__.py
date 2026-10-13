@@ -34,11 +34,14 @@ from ._native import (
     __version__,
 )
 from ._clients import JournaledClient
+from ._failures import DrawFailed, EffectFailed
 from ._runtime import Ctx, Runtime, durable
 from ._tools import ToolCall, tool_calls
 
 __all__ = [
     "Ctx",
+    "DrawFailed",
+    "EffectFailed",
     "JournalDesync",
     "JournaledClient",
     "PragmaticError",

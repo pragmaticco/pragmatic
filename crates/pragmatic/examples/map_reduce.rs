@@ -38,7 +38,7 @@ fn reducer(ctx: &mut Ctx) -> Result<Value, Fault> {
 }
 
 fn main() {
-    let mut rt = Runtime::in_memory(SeededOracle::new(2026));
+    let rt = Runtime::in_memory(SeededOracle::new(2026));
 
     // ── Map phase: one durable run per shard ────────────────────────────
     let mut summaries = Vec::new();

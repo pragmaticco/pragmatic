@@ -60,8 +60,10 @@ def main() -> None:
         print(f"replay : trace identical ({len(audit.trace)} labels)")
 
         # ── tamper-evident chain ──
+        # Every recording attempt adds its notes, so the head is the one the
+        # resume left; strict replay appends nothing.
         assert rt.verify("py-run")
-        assert audit.chain_head == report.chain_head
+        assert audit.chain_head == report2.chain_head
         print(f"chain  : verified, head={audit.chain_head[:16]}")
 
         # ── crash mid-run: process restart via a fresh Runtime ──
@@ -74,7 +76,9 @@ def main() -> None:
         # ── channels ──
         rt.send("chan-run", "tasks", "summarize the corpus")
         out = rt.run("chan-run", lambda ctx: ctx.oracle("solve " + ctx.recv("tasks")))
-        assert out.journal_len == 2
+        # run.start, attempt.start, the receive, the draw (intent and
+        # response) and attempt.end.
+        assert out.journal_len == 6, out.journal_len
         print("channel: journaled receive replays")
 
         # ── faults surface as exceptions ──

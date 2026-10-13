@@ -1,26 +1,17 @@
-//! The **Journal** - Pragmatic's append-only, hash-chained event history.
+//! The format 1 journal written by Pragmatic 0.4 and 0.5, kept as a writer
+//! of test fixtures only.
 //!
-//! The Journal is the source of truth for what an agent actually did. Every
-//! externally-determined outcome (oracle draws, channel receives, durable
-//! effects, clock reads - paper Definition 4.2) is appended as the run
-//! proceeds. Replay reads outcomes back instead of re-sampling the model,
-//! which is what makes crash recovery exact (Theorem T1).
+//! Pragmatic 0.6 reads format 1 files read-only through
+//! [`crate::journal::Journal::parse`]; nothing records into this format any
+//! more. The module is compiled for the crate's own tests and under the
+//! `testing` feature, so test suites can build the 0.4 and 0.5 journals the
+//! read-only path must accept.
 //!
-//! Properties this module provides:
-//!
-//! - **Cursor keys.** Each entry's key is its position in the log - a simple
-//!   monotone count, data-independent, so record and replay land on the same
-//!   entry (paper Lemma 5.1). No hashes or program counters in the key.
-//! - **O(1) append.** Appending is a `Vec` push plus (for durable journals) a
-//!   buffered write. Latency is flat in the number of entries.
-//! - **Tamper evidence.** Entries form a hash chain:
-//!   `h_i = H(h_{i-1} ‖ cursor ‖ payload)` with `H` either SHA-256 or, when a
-//!   runtime key is configured, HMAC-SHA-256. [`Journal::verify`] walks the
-//!   chain; any mutation of a committed entry breaks every later link.
-//! - **Torn-tail recovery.** The durable backend is a length-prefixed
-//!   append-only file. On open, a partial final record (a crash mid-write) is
-//!   detected and truncated - exactly the checkpoint-truncation semantics of
-//!   paper Definition 3.12.
+//! Format 1 in brief: a 12-byte header (`PRAGJRNL`, version 1), then frames
+//! of `len u32 LE ‖ payload ‖ hash`, chained as
+//! `h_i = H(h_{i-1} ‖ cursor ‖ payload)` from an all-zero genesis, where `H`
+//! is SHA-256, or HMAC-SHA-256 when a key is configured. On open, a partial
+//! final record (a crash mid-write) is truncated.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
@@ -34,10 +25,7 @@ const MAGIC: &[u8; 8] = b"PRAGJRNL";
 /// On-disk format version.
 const VERSION: u32 = 1;
 
-/// A journal key: the entry's position in the append-only log. The cursor is
-/// the key (paper §4.2): strictly increasing per journaled step, independent
-/// of any realized value.
-pub type Cursor = u64;
+pub use crate::journal::Cursor;
 
 /// The journal event alphabet (paper Definition 4.2).
 ///
@@ -163,21 +151,21 @@ impl Event {
         let mut r = R(rest);
         let ev = match tag {
             1 => Event::OracleDraw {
-                prompt: Value(r.field()?),
-                outcome: Value(r.field()?),
+                prompt: Value::new(r.field()?),
+                outcome: Value::new(r.field()?),
                 provenance: String::from_utf8(r.field()?).ok()?,
             },
             2 => Event::ChannelRecv {
                 channel: String::from_utf8(r.field()?).ok()?,
-                value: Value(r.field()?),
+                value: Value::new(r.field()?),
             },
             3 => Event::EffectIntent {
                 name: String::from_utf8(r.field()?).ok()?,
-                arg: Value(r.field()?),
+                arg: Value::new(r.field()?),
             },
             4 => Event::EffectCommit {
                 name: String::from_utf8(r.field()?).ok()?,
-                result: Value(r.field()?),
+                result: Value::new(r.field()?),
             },
             5 => Event::EffectCompensated {
                 name: String::from_utf8(r.field()?).ok()?,

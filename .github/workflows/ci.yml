@@ -45,7 +45,7 @@ jobs:
           sleep 2
           curl -sf http://127.0.0.1:7171/healthz
           curl -sf http://127.0.0.1:7171/ | grep -q research-42
-          curl -sf http://127.0.0.1:7171/run/research-42 | grep -q "oracle.draw"
+          curl -sf http://127.0.0.1:7171/run/research-42 | grep -q "draw.result"
           kill %1
 
   python:

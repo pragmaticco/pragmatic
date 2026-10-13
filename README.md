@@ -121,7 +121,7 @@ let oracle = AnthropicOracle::from_env()?
     .model("claude-sonnet-5")
     .tools(json!([{ "name": "search_corpus", /* … */ }]));
 
-let mut rt = Runtime::on_dir("./journals", oracle)?;
+let rt = Runtime::on_dir("./journals", oracle)?;
 let report  = rt.run("research-42", research)?;    // record
 // Crash mid-loop? Every prior model turn AND tool result replays from
 // the journal; the world is not touched again.
