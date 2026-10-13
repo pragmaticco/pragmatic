@@ -30,15 +30,37 @@
 //! # Strict DER
 //!
 //! Tokens are adversarial input that will later be handed to other parsers
-//! (OpenSSL, auditors' tools), so the reader accepts DER only: definite
-//! lengths in minimal form, lengths that fit the input, minimal INTEGERs,
-//! primitive strings, single-byte tags, and nesting no deeper than
-//! [`MAX_DEPTH`]. Every response and token is checked as a whole before
-//! any field is read, so even the parts this module does not interpret
-//! (certificates, signer infos) must be well-formed. Rejecting BER that a
-//! lenient parser would accept narrows the room for two parsers to
-//! disagree about what the same bytes say. Responses from every public TSA
-//! tried so far are strict DER.
+//! (OpenSSL, auditors' tools), so the reader rejects BER that a lenient
+//! parser would accept, narrowing the room for two parsers to disagree
+//! about what the same bytes say. The rules come in two tiers.
+//!
+//! Everywhere, including the parts this module does not interpret
+//! (certificates, CRLs, signer infos), every response and token is checked
+//! as a whole before any field is read: definite lengths in minimal form
+//! that fit the input, single-byte tags, no end-of-contents markers,
+//! nesting no deeper than [`MAX_DEPTH`], SEQUENCE and SET constructed and
+//! every other universal type primitive, and minimal content for the
+//! universal types whose encoding is checkable in isolation (INTEGER
+//! minimal, BOOLEAN `0x00` or `0xff`, NULL empty).
+//!
+//! In the fields this module reads, the value rules apply as well: a
+//! component equal to its DEFAULT is omitted (`ordering` FALSE), `Accuracy`
+//! has at least one field and `millis` and `micros` are in `1..=999`, a
+//! named-bit BIT STRING has its trailing zero bits removed, `statusString`
+//! is not empty, and `genTime` is UTC with a `Z`. Rules that need the
+//! schema, such as DEFAULT omission and SET OF ordering inside
+//! certificates, are not checked in parts that are not interpreted.
+//!
+//! One leniency is deliberate: a `genTime` fraction with trailing zeros
+//! (`.50Z`, `.000Z`), which X.690 section 11.7.3 forbids, is accepted.
+//! Microsoft's TSA writes three-digit milliseconds (`.811Z`), and no sample
+//! ending in zero has been checked yet. If it writes fixed-width fractions,
+//! refusing them would fail about one anchor in ten, while a trailing zero
+//! does not change the instant any parser reads. [`TstInfo::gen_time`]
+//! keeps the text as encoded; compare instants with
+//! [`TstInfo::gen_time_unix`] and [`TstInfo::gen_time_nanos`].
+//!
+//! Responses from every public TSA tried so far pass these checks.
 
 use std::fmt;
 
@@ -224,10 +246,25 @@ fn check_der(mut input: &[u8], depth: usize) -> Result<(), TspError> {
         if tlv.tag == 0 {
             return Err(TspError::NotDer("end-of-contents marker"));
         }
-        if universal && constructed && tlv.tag != TAG_SEQUENCE && tlv.tag != TAG_SET {
-            // DER encodes strings (and every other universal type except
-            // SEQUENCE and SET) in primitive form only.
-            return Err(TspError::NotDer("constructed universal type"));
+        if universal {
+            match tlv.tag {
+                TAG_SEQUENCE | TAG_SET => {}
+                // The same types with the constructed bit clear.
+                0x10 | 0x11 => return Err(TspError::NotDer("primitive SEQUENCE or SET")),
+                // DER encodes strings (and every other universal type
+                // except SEQUENCE and SET) in primitive form only.
+                _ if constructed => return Err(TspError::NotDer("constructed universal type")),
+                TAG_INTEGER => {
+                    integer_bytes(tlv)?;
+                }
+                TAG_BOOLEAN => {
+                    boolean(tlv)?;
+                }
+                TAG_NULL if !tlv.value.is_empty() => {
+                    return Err(TspError::NotDer("NULL with content"))
+                }
+                _ => {}
+            }
         }
         if constructed {
             check_der(tlv.value, depth + 1)?;
@@ -376,6 +413,10 @@ fn oid(tlv: Tlv<'_>) -> Result<String, TspError> {
 
 /// Decode a named-bit BIT STRING into a mask where bit `n` is `1 << n`.
 /// Bits numbered 32 and above are not defined by RFC 3161 and are ignored.
+///
+/// DER (X.690 section 11.2.2) removes trailing zero bits from a named-bit
+/// list, so the last octet must be nonzero and the unused-bit count must
+/// equal its trailing zeros exactly; no bits set is the one-octet `00`.
 fn named_bits(tlv: Tlv<'_>) -> Result<u32, TspError> {
     let (&unused, bits) = tlv
         .value
@@ -387,6 +428,11 @@ fn named_bits(tlv: Tlv<'_>) -> Result<u32, TspError> {
     if let Some(&last) = bits.last() {
         if last & ((1u8 << unused) - 1) != 0 {
             return Err(TspError::NotDer("nonzero padding bits in BIT STRING"));
+        }
+        if last == 0 || last.trailing_zeros() != unused as u32 {
+            return Err(TspError::NotDer(
+                "trailing zero bits in named-bit BIT STRING",
+            ));
         }
     }
     let mut mask = 0u32;
@@ -548,6 +594,10 @@ pub fn parse_response(bytes: &[u8]) -> Result<Response, TspError> {
         .ok_or(TspError::Invalid("unknown PKIStatus"))?;
     let mut status_text = Vec::new();
     if let Some(free_text) = s.optional(TAG_SEQUENCE, "statusString")? {
+        // PKIFreeText ::= SEQUENCE SIZE (1..MAX) OF UTF8String
+        if free_text.value.is_empty() {
+            return Err(TspError::Invalid("empty statusString"));
+        }
         let mut items = Reader::new(free_text.value);
         while items.peek_tag().is_some() {
             let item = items.expect(TAG_UTF8_STRING, "statusString")?;
@@ -734,7 +784,10 @@ fn parse_tst_info(der: &[u8]) -> Result<TstInfo, TspError> {
         None => None,
     };
     let ordering = match t.optional(TAG_BOOLEAN, "ordering")? {
-        Some(b) => boolean(b)?,
+        // DER never encodes a component equal to its DEFAULT (X.690
+        // section 11.5), and `ordering` defaults to FALSE.
+        Some(b) if !boolean(b)? => return Err(TspError::NotDer("ordering FALSE must be omitted")),
+        Some(_) => true,
         None => false,
     };
     let nonce = match t.optional(TAG_INTEGER, "nonce")? {
@@ -777,11 +830,17 @@ fn parse_tst_info(der: &[u8]) -> Result<TstInfo, TspError> {
 
 /// `Accuracy ::= SEQUENCE { seconds INTEGER OPTIONAL,
 /// millis [0] INTEGER (1..999) OPTIONAL, micros [1] INTEGER (1..999) OPTIONAL }`
+///
+/// An `Accuracy` with no fields would claim a perfect clock; no TSA sends
+/// one, and it is rejected rather than read as zero.
 fn accuracy(tlv: Tlv<'_>) -> Result<Accuracy, TspError> {
+    if tlv.value.is_empty() {
+        return Err(TspError::Invalid("accuracy with no fields"));
+    }
     let mut r = Reader::new(tlv.value);
     let small = |t: Tlv<'_>| -> Result<u16, TspError> {
         match integer_u64(t)? {
-            Some(v) if v <= 999 => Ok(v as u16),
+            Some(v) if (1..=999).contains(&v) => Ok(v as u16),
             _ => Err(TspError::Invalid("accuracy millis or micros out of range")),
         }
     };
@@ -809,7 +868,8 @@ fn accuracy(tlv: Tlv<'_>) -> Result<Accuracy, TspError> {
 /// optional `.` and fraction digits, then `Z`) into Unix seconds and
 /// nanoseconds. Local times and offsets are rejected: RFC 3161 section
 /// 2.4.2 mandates UTC with `Z`. A leap second (`60`) is accepted and folds
-/// into the following second, as POSIX time cannot represent it.
+/// into the following second, as POSIX time cannot represent it. Trailing
+/// zeros in the fraction are accepted; see the module documentation.
 fn generalized_time(text: &[u8]) -> Result<(i64, u32), TspError> {
     const BAD: TspError = TspError::Invalid("malformed genTime");
     if text.len() < 15 {
@@ -1374,6 +1434,188 @@ mod tests {
         assert!(bits(&[0x08, 0x00]).is_err());
         assert!(bits(&[0x01]).is_err());
         assert!(bits(&[0x07, 0x81]).is_err()); // nonzero padding bit
+                                               // Trailing zero bits must be removed from a named-bit list.
+        assert!(bits(&[0x00, 0x80, 0x00]).is_err()); // BAD_ALG plus a zero octet
+        assert!(bits(&[0x00, 0x80]).is_err()); // unused count too small
+        assert!(bits(&[0x06, 0x80]).is_err());
+        assert!(bits(&[0x07, 0x00]).is_err());
+        assert!(bits(&[0x00, 0x00]).is_err());
+    }
+
+    #[test]
+    fn response_value_rules() {
+        let status = |extra: &[u8]| {
+            let mut info = tlv(TAG_INTEGER, &[2]);
+            info.extend_from_slice(extra);
+            tlv(TAG_SEQUENCE, &tlv(TAG_SEQUENCE, &info))
+        };
+        // PKIFreeText has at least one string.
+        assert_eq!(
+            parse_response(&status(&[0x30, 0x00])),
+            Err(TspError::Invalid("empty statusString"))
+        );
+        let one = tlv(TAG_SEQUENCE, &tlv(TAG_UTF8_STRING, b"no"));
+        assert_eq!(parse_response(&status(&one)).unwrap().status_text, ["no"]);
+        // failInfo with a trailing zero octet.
+        assert!(matches!(
+            parse_response(&status(&[0x03, 0x03, 0x00, 0x80, 0x00])),
+            Err(TspError::NotDer(_))
+        ));
+        assert_eq!(
+            parse_response(&status(&[0x03, 0x02, 0x07, 0x80]))
+                .unwrap()
+                .fail_info,
+            Some(fail_info::BAD_ALG)
+        );
+    }
+
+    /// A minimal TSTInfo: version 1, policy 1.2.3, a SHA-256 imprint,
+    /// serial 5, the given `genTime`, then `rest` (accuracy, ordering, ...).
+    fn tst_info(gen_time: &str, rest: &[u8]) -> Vec<u8> {
+        let mut alg = tlv(TAG_OID, &SHA256_OID_DER);
+        write_tlv(&mut alg, TAG_NULL, &[]);
+        let mut imprint = tlv(TAG_SEQUENCE, &alg);
+        write_tlv(&mut imprint, TAG_OCTET_STRING, &[7; 32]);
+        let mut body = tlv(TAG_INTEGER, &[1]);
+        write_tlv(&mut body, TAG_OID, &[0x2a, 0x03]);
+        write_tlv(&mut body, TAG_SEQUENCE, &imprint);
+        write_tlv(&mut body, TAG_INTEGER, &[5]);
+        write_tlv(&mut body, TAG_GENERALIZED_TIME, gen_time.as_bytes());
+        body.extend_from_slice(rest);
+        tlv(TAG_SEQUENCE, &body)
+    }
+
+    #[test]
+    fn tst_info_value_rules() {
+        const TIME: &str = "20261013132322Z";
+        let parse = |rest: &[u8]| parse_tst_info(&tst_info(TIME, rest));
+        let base = parse(&[]).unwrap();
+        assert_eq!(base.policy, "1.2.3");
+        assert!(base.imprint_matches(&[7; 32]));
+        assert!(!base.ordering);
+        assert_eq!(base.accuracy, None);
+
+        // ordering: TRUE is encoded, FALSE (the DEFAULT) must be omitted.
+        assert!(parse(&[0x01, 0x01, 0xff]).unwrap().ordering);
+        assert_eq!(
+            parse(&[0x01, 0x01, 0x00]),
+            Err(TspError::NotDer("ordering FALSE must be omitted"))
+        );
+        assert!(matches!(
+            parse(&[0x01, 0x01, 0x01]),
+            Err(TspError::NotDer(_))
+        ));
+
+        // Accuracy: millis and micros are 1..=999, and at least one field
+        // is present.
+        let acc = |content: &[u8]| parse(&tlv(TAG_SEQUENCE, content));
+        let ok = |content: &[u8]| acc(content).unwrap().accuracy.unwrap();
+        assert_eq!(
+            ok(&[0x02, 0x01, 0x01, 0x80, 0x01, 0x01, 0x81, 0x02, 0x03, 0xe7]),
+            Accuracy {
+                seconds: Some(1),
+                millis: Some(1),
+                micros: Some(999)
+            }
+        );
+        assert_eq!(ok(&[0x02, 0x01, 0x00]).seconds, Some(0));
+        for bad in [
+            &[][..],
+            &[0x80, 0x01, 0x00],
+            &[0x81, 0x01, 0x00],
+            &[0x80, 0x02, 0x03, 0xe8],
+            &[0x81, 0x02, 0x03, 0xe8],
+            &[0x80, 0x01, 0xff],
+        ] {
+            assert!(acc(bad).is_err(), "{bad:02x?}");
+        }
+
+        // A fraction with trailing zeros is a deliberate leniency (see the
+        // module documentation): it parses to the same instant, and the
+        // text is kept as encoded.
+        for (text, nanos) in [
+            ("20261013132322.50Z", 500_000_000),
+            ("20261013132322.000Z", 0),
+            ("20261013132322.810Z", 810_000_000),
+        ] {
+            let tst = parse_tst_info(&tst_info(text, &[])).unwrap();
+            assert_eq!(
+                (tst.gen_time.as_str(), tst.gen_time_unix, tst.gen_time_nanos),
+                (text, 1_791_897_802, nanos)
+            );
+        }
+    }
+
+    #[test]
+    fn uninterpreted_parts_follow_der_rules() {
+        // SEQUENCE and SET must be constructed.
+        for tag in [0x10, 0x11] {
+            assert_eq!(
+                check_der(&[0x30, 0x02, tag, 0x00], 0),
+                Err(TspError::NotDer("primitive SEQUENCE or SET"))
+            );
+        }
+        // INTEGER, BOOLEAN and NULL content is checked wherever they occur,
+        // here nested inside a context-tagged element nobody interprets.
+        let wrapped = |inner: &[u8]| tlv(TAG_CTX0, &tlv(TAG_SEQUENCE, inner));
+        assert!(check_der(&wrapped(&[0x02, 0x01, 0x00]), 0).is_ok());
+        assert!(check_der(&wrapped(&[0x01, 0x01, 0xff, 0x05, 0x00]), 0).is_ok());
+        for bad in [
+            &[0x02, 0x02, 0x00, 0x01][..],
+            &[0x02, 0x02, 0xff, 0x80],
+            &[0x02, 0x00],
+            &[0x01, 0x01, 0x01],
+            &[0x01, 0x02, 0xff, 0xff],
+            &[0x05, 0x01, 0x00],
+        ] {
+            assert!(
+                matches!(check_der(&wrapped(bad), 0), Err(TspError::NotDer(_))),
+                "{bad:02x?}"
+            );
+        }
+        // In a real token, clear the top bit after the sign octet of the
+        // last positive INTEGER that needs one (a serial number in the
+        // signer info or a certificate, which nothing here interprets).
+        // The length is unchanged, so only the INTEGER rule can object.
+        /// Offsets of the content of every INTEGER reachable through
+        /// constructed elements, in document order.
+        fn integers(der: &[u8], base: usize, out: &mut Vec<usize>) {
+            let mut rest = der;
+            while !rest.is_empty() {
+                let (t, after) = read_tlv(rest).unwrap();
+                let content = base + (der.len() - rest.len()) + (t.raw.len() - t.value.len());
+                if t.tag == TAG_INTEGER {
+                    out.push(content);
+                }
+                if t.tag & 0x20 != 0 {
+                    integers(t.value, content, out);
+                }
+                rest = after;
+            }
+        }
+        let mut exercised = 0;
+        for tsr in GRANTED {
+            let mut token = token_of(tsr);
+            let mut found = Vec::new();
+            integers(&token, 0, &mut found);
+            let found = found.into_iter().rev().find(|&c| {
+                token[c - 1] >= 2
+                    && token[c - 1] < 0x80
+                    && token[c] == 0
+                    && token[c + 1] & 0x80 != 0
+            });
+            if let Some(content) = found {
+                let at = content - 2;
+                parse_token(&token).unwrap();
+                token[at + 3] &= 0x7f;
+                assert_eq!(
+                    parse_token(&token),
+                    Err(TspError::NotDer("non-minimal INTEGER"))
+                );
+                exercised += 1;
+            }
+        }
+        assert!(exercised >= 2, "{exercised}");
     }
 
     #[test]

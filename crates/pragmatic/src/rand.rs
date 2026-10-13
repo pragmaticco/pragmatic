@@ -9,13 +9,23 @@
 //! system's CSPRNG and never from a userspace PRNG seeded with the clock.
 //!
 //! The core crate is zero-dependency, so this module talks to the OS
-//! directly instead of pulling in `getrandom`:
+//! directly instead of pulling in `getrandom`, using the same sources that
+//! crate and Rust's standard library use:
 //!
-//! - **Unix**: reads `/dev/urandom`. It is present on every Unix target Rust
-//!   supports (Linux, macOS, the BSDs, illumos), never blocks once the
-//!   system has booted, and needs no `libc` bindings. The open file is
-//!   cached for the life of the process, so steady-state cost is one
-//!   `read(2)` per call.
+//! - **Linux and Android**: the `getrandom(2)` system call, which blocks
+//!   until the kernel's CRNG has been seeded and never afterwards. Reading
+//!   `/dev/urandom` instead would not wait, so an early-boot VM or container
+//!   could get predictable salts. The call goes through `syscall(2)` rather
+//!   than glibc's `getrandom` wrapper, which only exists from glibc 2.25 on
+//!   and would stop the crate linking against the glibc 2.17 that
+//!   manylinux2014 wheels target. On kernels older than 3.17 (no such
+//!   system call), under a seccomp policy that refuses it, or on an
+//!   architecture whose system call number is not listed here, it falls
+//!   back to `/dev/urandom` after first waiting for `/dev/random` to become
+//!   readable, which happens once the pool is initialized.
+//! - **macOS and OpenBSD**: `getentropy(2)`, in chunks of at most 256
+//!   bytes, the most it accepts per call.
+//! - **Other Unix systems** (the BSDs, illumos, ...): reads `/dev/urandom`.
 //! - **Windows**: calls `BCryptGenRandom` with
 //!   `BCRYPT_USE_SYSTEM_PREFERRED_RNG`, the documented way to reach the
 //!   system RNG without opening an algorithm provider.
@@ -23,6 +33,11 @@
 //!   returns an [`io::ErrorKind::Unsupported`] error rather than failing to
 //!   compile, so the rest of the crate still builds for targets that never
 //!   write v2 journals.
+//!
+//! No file descriptor is kept open between calls. A cached descriptor
+//! would silently read from an unrelated file in a daemon that closes all
+//! descriptors after startup and gets the same number back from a later
+//! `open`.
 
 use std::io;
 
@@ -60,53 +75,227 @@ pub fn salt16() -> [u8; 16] {
     salt
 }
 
-#[cfg(unix)]
-mod imp {
-    use std::fs::File;
-    use std::io::{self, Read};
-    use std::sync::OnceLock;
+/// Read `path` until `buf` is full. The file is opened for this call only.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "openbsd"))))]
+fn read_device(path: &str, buf: &mut [u8]) -> io::Result<()> {
+    use std::io::Read;
 
-    /// The cached `/dev/urandom` handle.
-    ///
-    /// `&File` implements `Read`, and reads from `/dev/urandom` ignore the
-    /// file offset, so concurrent callers can share one descriptor without
-    /// a lock. Rust opens files with `O_CLOEXEC`, so the descriptor does not
-    /// leak into child processes.
-    static URANDOM: OnceLock<File> = OnceLock::new();
-
-    fn urandom() -> io::Result<&'static File> {
-        if let Some(file) = URANDOM.get() {
-            return Ok(file);
+    let mut file = std::fs::File::open(path)?;
+    let mut filled = 0;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..]) {
+            // A character device that reports end of file is broken (or is
+            // not really the device); refuse rather than spin.
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("{path} reported end of file"),
+                ))
+            }
+            // Short reads are legal (Linux caps a single read at 32 MiB and a
+            // signal can interrupt a large one); keep going.
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         }
-        // `OnceLock::get_or_try_init` is not stable, so open first and then
-        // publish. Two threads racing here may both open the device; the
-        // loser's handle is dropped (closed) by `set`, which is harmless.
-        let file = File::open("/dev/urandom")?;
-        let _ = URANDOM.set(file);
-        Ok(URANDOM.get().expect("URANDOM was just set"))
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod imp {
+    use std::ffi::{c_int, c_long, c_short, c_void};
+    use std::io;
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+    /// `__NR_getrandom` for the architectures Rust commonly targets, from
+    /// the kernel's syscall tables. Anything else uses the fallback.
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    const SYS_GETRANDOM: Option<c_long> = Some(318);
+    #[cfg(target_arch = "x86")]
+    const SYS_GETRANDOM: Option<c_long> = Some(355);
+    #[cfg(target_arch = "arm")]
+    const SYS_GETRANDOM: Option<c_long> = Some(384);
+    #[cfg(any(
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64"
+    ))]
+    const SYS_GETRANDOM: Option<c_long> = Some(278);
+    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+    const SYS_GETRANDOM: Option<c_long> = Some(359);
+    #[cfg(target_arch = "s390x")]
+    const SYS_GETRANDOM: Option<c_long> = Some(349);
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        target_arch = "x86",
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "s390x"
+    )))]
+    const SYS_GETRANDOM: Option<c_long> = None;
+
+    /// `nfds_t`: `unsigned long` in glibc and musl, `unsigned int` in bionic.
+    #[cfg(target_os = "linux")]
+    type NfdsT = std::ffi::c_ulong;
+    #[cfg(target_os = "android")]
+    type NfdsT = std::ffi::c_uint;
+
+    #[repr(C)]
+    struct PollFd {
+        fd: c_int,
+        events: c_short,
+        revents: c_short,
+    }
+
+    const POLLIN: c_short = 0x1;
+
+    unsafe extern "C" {
+        fn syscall(number: c_long, ...) -> c_long;
+        fn poll(fds: *mut PollFd, nfds: NfdsT, timeout: c_int) -> c_int;
+    }
+
+    const UNKNOWN: u8 = 0;
+    const SYSCALL: u8 = 1;
+    const FALLBACK: u8 = 2;
+
+    /// Which source works here, decided by the first call.
+    static SOURCE: AtomicU8 = AtomicU8::new(UNKNOWN);
+    /// Set once `/dev/random` has been seen readable.
+    static SEEDED: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn fill(buf: &mut [u8]) -> io::Result<()> {
+        if SOURCE.load(Ordering::Relaxed) != FALLBACK {
+            if let Some(number) = SYS_GETRANDOM {
+                match getrandom(number, buf) {
+                    Ok(()) => {
+                        SOURCE.store(SYSCALL, Ordering::Relaxed);
+                        return Ok(());
+                    }
+                    // ENOSYS (kernel before 3.17) maps to Unsupported, and
+                    // EPERM (a seccomp filter) to PermissionDenied. Neither
+                    // can change while the process runs, so remember it.
+                    Err(e)
+                        if SOURCE.load(Ordering::Relaxed) == UNKNOWN
+                            && matches!(
+                                e.kind(),
+                                io::ErrorKind::Unsupported | io::ErrorKind::PermissionDenied
+                            ) =>
+                    {
+                        SOURCE.store(FALLBACK, Ordering::Relaxed);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        wait_until_seeded()?;
+        super::read_device("/dev/urandom", buf)
+    }
+
+    /// `getrandom(buf, len, 0)` until `buf` is full. With no flags the call
+    /// blocks only until the CRNG is first seeded.
+    fn getrandom(number: c_long, buf: &mut [u8]) -> io::Result<()> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            let rest = &mut buf[filled..];
+            let flags: c_long = 0;
+            // SAFETY: the pointer and length describe a live, writable
+            // slice; the kernel writes at most `len` bytes into it.
+            let ret = unsafe {
+                syscall(
+                    number,
+                    rest.as_mut_ptr().cast::<c_void>(),
+                    rest.len(),
+                    flags,
+                )
+            };
+            if ret < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            // Large requests may be cut short by a signal; keep going.
+            filled += ret as usize;
+        }
+        Ok(())
+    }
+
+    /// Block until `/dev/random` is readable, which the kernel reports once
+    /// the entropy pool behind `/dev/urandom` has been initialized. Polling
+    /// does not consume entropy, unlike reading `/dev/random`.
+    fn wait_until_seeded() -> io::Result<()> {
+        if SEEDED.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let random = std::fs::File::open("/dev/random")?;
+        let mut pfd = PollFd {
+            fd: random.as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        };
+        loop {
+            // SAFETY: `pfd` is one valid, writable pollfd and `random` keeps
+            // the descriptor open for the duration of the call. A negative
+            // timeout waits indefinitely.
+            let ret = unsafe { poll(&mut pfd, 1, -1) };
+            if ret >= 0 {
+                break;
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+        SEEDED.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "openbsd"))]
+mod imp {
+    use std::ffi::{c_int, c_void};
+    use std::io;
+
+    unsafe extern "C" {
+        fn getentropy(buf: *mut c_void, len: usize) -> c_int;
     }
 
     pub(super) fn fill(buf: &mut [u8]) -> io::Result<()> {
-        let mut file = urandom()?;
-        let mut filled = 0;
-        while filled < buf.len() {
-            match file.read(&mut buf[filled..]) {
-                // A character device that reports end of file is broken (or
-                // is not really /dev/urandom); refuse rather than spin.
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "/dev/urandom reported end of file",
-                    ))
-                }
-                // Short reads are legal (Linux caps a single read at 32 MiB
-                // and a signal can interrupt a large one); keep going.
-                Ok(n) => filled += n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
+        // getentropy(2) fails with EINVAL above 256 bytes, so larger
+        // buffers are filled in 256-byte pieces.
+        for chunk in buf.chunks_mut(256) {
+            // SAFETY: the pointer and length describe a live, writable
+            // slice of at most 256 bytes.
+            let ret = unsafe { getentropy(chunk.as_mut_ptr().cast::<c_void>(), chunk.len()) };
+            if ret != 0 {
+                return Err(io::Error::last_os_error());
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "openbsd"
+    ))
+))]
+mod imp {
+    use std::io;
+
+    pub(super) fn fill(buf: &mut [u8]) -> io::Result<()> {
+        super::read_device("/dev/urandom", buf)
     }
 }
 
@@ -119,7 +308,7 @@ mod imp {
     const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
 
     #[link(name = "bcrypt")]
-    extern "system" {
+    unsafe extern "system" {
         fn BCryptGenRandom(
             h_algorithm: *mut c_void,
             pb_buffer: *mut u8,
@@ -192,6 +381,37 @@ mod tests {
     #[test]
     fn empty_buffer_is_ok() {
         fill(&mut []).unwrap();
+    }
+
+    #[test]
+    fn fills_across_chunk_boundaries() {
+        // getentropy(2) takes at most 256 bytes per call; the tail of every
+        // buffer must still be written. A 32-byte tail of zeros has
+        // probability 2^-256.
+        for len in [1, 31, 32, 255, 256, 257, 511, 512, 513, 4096] {
+            let mut buf = vec![0u8; len.max(32)];
+            fill(&mut buf).unwrap();
+            let tail = &buf[buf.len() - 32..];
+            assert!(tail.iter().any(|&b| b != 0), "len {len}");
+        }
+    }
+
+    /// No descriptor for a random device stays open after a call, so a
+    /// daemon that closes every descriptor cannot later have `fill` read
+    /// from whatever file reuses the number.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn keeps_no_descriptor_open() {
+        fill(&mut [0u8; 64]).unwrap();
+        for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+            let Ok(target) = std::fs::read_link(entry.unwrap().path()) else {
+                continue;
+            };
+            assert!(
+                !target.starts_with("/dev/urandom") && !target.starts_with("/dev/random"),
+                "{target:?} left open"
+            );
+        }
     }
 
     #[test]

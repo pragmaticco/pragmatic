@@ -200,9 +200,10 @@ fn push_subproof(m: usize, leaves: &[Digest], whole: bool, out: &mut Vec<Digest>
 /// (RFC 9162 section 2.1.4.2).
 ///
 /// The degenerate cases the RFC leaves to the caller are handled the way
-/// [`consistency_proof`] produces them: `m == n` needs an empty proof and
-/// equal roots, and `m == 0` needs an empty proof and `root_m` equal to
-/// [`empty_root`]. `m > n` is always rejected.
+/// [`consistency_proof`] produces them: `m == 0` needs an empty proof and
+/// `root_m` equal to [`empty_root`] (and `root_n` too when `n == 0`), and
+/// `m == n` needs an empty proof and equal roots. `m > n` is always
+/// rejected.
 pub fn verify_consistency(
     m: u64,
     n: u64,
@@ -213,11 +214,14 @@ pub fn verify_consistency(
     if m > n {
         return false;
     }
+    // The empty-tree case comes first, so that `m == n == 0` cannot vouch
+    // for an arbitrary root as the root of the empty tree.
+    if m == 0 {
+        let empty = empty_root();
+        return proof.is_empty() && *root_m == empty && (n > 0 || *root_n == empty);
+    }
     if m == n {
         return proof.is_empty() && root_m == root_n;
-    }
-    if m == 0 {
-        return proof.is_empty() && *root_m == empty_root();
     }
     // 1. Between distinct non-empty sizes the proof is never empty.
     if proof.is_empty() {
@@ -611,6 +615,13 @@ mod tests {
         assert!(!verify_consistency(0, 5, &empty_root(), &r5, &[r5]));
         // Shrinking is never consistent.
         assert!(!verify_consistency(5, 4, &r5, &root(&leaves[..4]), &[]));
+        // Two empty trees are consistent only under the empty root.
+        let empty = empty_root();
+        assert!(verify_consistency(0, 0, &empty, &empty, &[]));
+        assert!(!verify_consistency(0, 0, &r5, &r5, &[]));
+        assert!(!verify_consistency(0, 0, &empty, &r5, &[]));
+        assert!(!verify_consistency(0, 0, &r5, &empty, &[]));
+        assert!(!verify_consistency(0, 0, &empty, &empty, &[empty]));
     }
 
     #[test]

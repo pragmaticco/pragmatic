@@ -8,21 +8,29 @@
 //!
 //! - **Strict input.** The parser accepts RFC 8259 JSON and nothing else:
 //!   no trailing commas, comments, single quotes, `NaN`, leading zeros,
-//!   byte-order mark or unpaired surrogate escapes, and nesting is capped at
-//!   [`MAX_DEPTH`]. Evidence is adversarial input, and every leniency is a
-//!   place where two parsers can disagree about what a document says.
+//!   byte-order mark, unpaired surrogate escapes or repeated object keys,
+//!   and nesting is capped at [`MAX_DEPTH`]. Evidence is adversarial input,
+//!   and every leniency is a place where two parsers can disagree about
+//!   what a document says.
 //! - **Exact numbers.** A [`Number`] keeps its original text, so integers
 //!   such as cursors, sizes and Unix times round-trip exactly even beyond
 //!   2^53, where an `f64` would silently round them.
 //!
 //! Objects are an ordered list of pairs, so serialization preserves key
-//! order and output is stable byte for byte. Duplicate keys are valid JSON
-//! (RFC 8259 only says names "SHOULD be unique"), so they are kept rather
-//! than rejected: [`Json::get`] returns the first, and
-//! [`Json::duplicate_key`] reports the first duplicate anywhere in a
-//! document, so a verifier can refuse a bundle that different JSON parsers
-//! would read differently.
+//! order and output is stable byte for byte.
+//!
+//! RFC 8259 only says object names "SHOULD be unique", and parsers that
+//! accept repeats disagree about them: JavaScript's `JSON.parse`, Python's
+//! `json` and Go's `encoding/json` keep the last value, others keep the
+//! first. `{"verified":false,"verified":true}` would then mean different
+//! things to the server and to an auditor's script, so the parser rejects
+//! any object that repeats a key (after unescaping), as I-JSON (RFC 7493
+//! section 2.3) requires. Objects with more than a few members are checked
+//! with a hash set, so the check stays linear in the number of keys.
+//! Values built in code can still repeat a key; [`Json::duplicate_key`]
+//! finds one before serialization.
 
+use std::collections::HashSet;
 use std::fmt::{self, Write as _};
 
 /// The deepest nesting of arrays and objects the parser accepts. A top-level
@@ -38,7 +46,8 @@ pub enum Json {
     Number(Number),
     String(String),
     Array(Vec<Json>),
-    /// Members in document order, duplicates included.
+    /// Members in document order. Parsed objects never repeat a key; see
+    /// [`Json::duplicate_key`] for objects built in code.
     Object(Vec<(String, Json)>),
 }
 
@@ -100,13 +109,14 @@ impl Number {
     }
 
     /// The value as a `u64`, if it is written as an integer (no fraction or
-    /// exponent) and fits.
+    /// exponent) and fits. Negative zero (`-0`) is zero.
     pub fn as_u64(&self) -> Option<u64> {
-        if self.is_integer() {
-            self.0.parse().ok()
-        } else {
-            None
+        if !self.is_integer() {
+            return None;
         }
+        // `u64::from_str` rejects any leading '-', even on zero.
+        let text = if self.0 == "-0" { "0" } else { &self.0 };
+        text.parse().ok()
     }
 
     /// The value as an `i64`, if it is written as an integer (no fraction or
@@ -179,7 +189,8 @@ impl Json {
         parse(text)
     }
 
-    /// The first member named `key`, if this is an object.
+    /// The member named `key`, if this is an object. A parsed object never
+    /// repeats a key; for one built in code that does, this is the first.
     pub fn get(&self, key: &str) -> Option<&Json> {
         match self {
             Json::Object(members) => members.iter().find(|(k, _)| k == key).map(|(_, v)| v),
@@ -250,14 +261,16 @@ impl Json {
     /// The first key that appears twice in the same object, searching the
     /// whole document depth first. `None` means every object has unique
     /// keys, so all conforming parsers agree on what the document says.
+    ///
+    /// [`parse`] already rejects repeated keys, so this matters only for
+    /// values built in code. It runs in time linear in the number of keys.
     pub fn duplicate_key(&self) -> Option<&str> {
         match self {
             Json::Array(items) => items.iter().find_map(Json::duplicate_key),
             Json::Object(members) => {
-                for (i, (key, _)) in members.iter().enumerate() {
-                    if members[..i].iter().any(|(k, _)| k == key) {
-                        return Some(key);
-                    }
+                let mut seen = HashSet::with_capacity(members.len());
+                if let Some((key, _)) = members.iter().find(|(k, _)| !seen.insert(k.as_str())) {
+                    return Some(key);
                 }
                 members.iter().find_map(|(_, v)| v.duplicate_key())
             }
@@ -367,6 +380,28 @@ pub fn parse(text: &str) -> Result<Json, JsonError> {
         return Err(p.err("unexpected data after the value"));
     }
     Ok(value)
+}
+
+/// Objects with at most this many members are checked for repeated keys by
+/// scanning the members already parsed, which needs no allocation and is
+/// faster than hashing for the small objects that journal notes use.
+const LINEAR_KEY_SCAN: usize = 16;
+
+/// True if `key` is already a member. Small objects are scanned; once an
+/// object reaches [`LINEAR_KEY_SCAN`] members its keys move into `index`,
+/// so a document with many keys is still checked in linear time.
+fn is_repeat(index: &mut Option<HashSet<String>>, members: &[(String, Json)], key: &str) -> bool {
+    if let Some(set) = index {
+        return !set.insert(key.to_string());
+    }
+    if members.iter().any(|(k, _)| k == key) {
+        return true;
+    }
+    if members.len() + 1 >= LINEAR_KEY_SCAN {
+        let keys = members.iter().map(|(k, _)| k.clone());
+        *index = Some(keys.chain([key.to_string()]).collect());
+    }
+    false
 }
 
 /// Scan an RFC 8259 number starting at `start`; return the end offset, or
@@ -493,7 +528,9 @@ impl Parser<'_> {
             return Err(self.err("nesting too deep"));
         }
         self.pos += 1; // '{'
-        let mut members = Vec::new();
+        let mut members: Vec<(String, Json)> = Vec::new();
+        // Keys seen so far, once the object outgrows a linear scan.
+        let mut index: Option<HashSet<String>> = None;
         self.skip_ws();
         if self.peek() == Some(b'}') {
             self.pos += 1;
@@ -504,7 +541,14 @@ impl Parser<'_> {
             if self.peek() != Some(b'"') {
                 return Err(self.err("expected a string key"));
             }
+            let key_at = self.pos;
             let key = self.string()?;
+            if is_repeat(&mut index, &members, &key) {
+                return Err(JsonError {
+                    offset: key_at,
+                    reason: "duplicate object key",
+                });
+            }
             self.skip_ws();
             if self.peek() != Some(b':') {
                 return Err(self.err("expected ':'"));
@@ -656,7 +700,7 @@ mod tests {
         "[\"\u{7f}\"]",
         "{\"a\":1}",
         "{\"\":0}",
-        "{\"a\":1,\"a\":2}",
+        "{\"a\":1,\"A\":2,\"a \":3}",
         "{\"a\":[{\"b\":null}]}",
         "[1,2,3]",
         "[[[[]]]]",
@@ -740,6 +784,10 @@ mod tests {
         "\u{c}[]",
         "[\u{a0}1]",
         "[1]\u{0}",
+        "{\"a\":1,\"a\":2}",
+        "{\"a\":1,\"a\":1}",
+        "{\"a\":1,\"\\u0061\":2}",
+        "[{\"x\":{\"y\":1,\"y\":2}}]",
     ];
 
     #[test]
@@ -833,6 +881,8 @@ mod tests {
         assert_eq!(ok("-1").as_u64(), None);
         assert_eq!(ok("-1").as_i64(), Some(-1));
         assert_eq!(ok("-0").as_i64(), Some(0));
+        assert_eq!(ok("-0").as_u64(), Some(0));
+        assert_eq!(ok("0").as_u64(), Some(0));
         assert_eq!(ok("1e400").as_f64(), Some(f64::INFINITY));
         assert_eq!(ok("\"1\"").as_u64(), None);
         assert!(Number::parse("01").is_none());
@@ -882,16 +932,70 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_keys_are_kept_and_reported() {
-        let doc = ok(r#"{"a":1,"b":{"c":1,"c":2},"a":3}"#);
+    fn duplicate_keys_are_rejected() {
+        // The offset points at the repeated key.
+        let e = parse(r#"{"verified":false,"verified":true}"#).unwrap_err();
+        assert_eq!((e.offset, e.reason), (18, "duplicate object key"));
+        // Keys are compared after unescaping.
+        assert!(parse(r#"{"a":1,"\u0061":2}"#).is_err());
+        assert!(parse(r#"[{"x":0},{"y":{"z":1,"z":1}}]"#).is_err());
+        // The same key in different objects is fine.
+        let doc = ok(r#"{"a":{"a":1},"b":[{"a":2},{"a":3}]}"#);
+        assert_eq!(doc.duplicate_key(), None);
+        // A repeat past the linear-scan threshold is still caught.
+        for n in [
+            LINEAR_KEY_SCAN - 1,
+            LINEAR_KEY_SCAN,
+            LINEAR_KEY_SCAN + 1,
+            100,
+        ] {
+            let keys: Vec<String> = (0..n).map(|i| format!("\"k{i}\":{i}")).collect();
+            let unique = format!("{{{}}}", keys.join(","));
+            assert_eq!(ok(&unique).as_object().unwrap().len(), n);
+            for repeat in [0, n / 2, n - 1] {
+                let text = format!("{{{},\"k{repeat}\":0}}", keys.join(","));
+                assert!(parse(&text).is_err(), "n={n} repeat={repeat}");
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_key_reports_built_documents() {
+        let doc = Json::Object(vec![
+            ("a".into(), 1u64.into()),
+            (
+                "b".into(),
+                Json::Object(vec![("c".into(), 1u64.into()), ("c".into(), 2u64.into())]),
+            ),
+            ("a".into(), 3u64.into()),
+        ]);
         assert_eq!(doc.get("a").and_then(Json::as_u64), Some(1));
-        assert_eq!(doc.as_object().unwrap().len(), 3);
         assert_eq!(doc.duplicate_key(), Some("a"));
-        let nested = ok(r#"[{"x":0},{"y":{"z":1,"z":1}}]"#);
+        let nested = Json::from(vec![Json::Object(vec![
+            ("z".into(), Json::Null),
+            ("z".into(), Json::Null),
+        ])]);
         assert_eq!(nested.duplicate_key(), Some("z"));
-        assert_eq!(ok(r#"{"a":{"a":1}}"#).duplicate_key(), None);
-        // Serialization keeps every member, in order.
+        // Serialization keeps every member, in order, and the result does
+        // not parse.
         assert_eq!(doc.to_string(), r#"{"a":1,"b":{"c":1,"c":2},"a":3}"#);
+        assert!(parse(&doc.to_string()).is_err());
+    }
+
+    #[test]
+    fn many_keys_stay_linear() {
+        // 200,000 keys (about 2.5 MB). Comparing every key with every
+        // earlier one would take minutes; hashing takes milliseconds.
+        let n = 200_000;
+        let body: Vec<String> = (0..n).map(|i| format!("\"key{i}\":{i}")).collect();
+        let text = format!("{{{}}}", body.join(","));
+        let doc = ok(&text);
+        assert_eq!(doc.duplicate_key(), None);
+        let repeated = format!("{{{},\"key0\":0}}", body.join(","));
+        assert_eq!(parse(&repeated).unwrap_err().reason, "duplicate object key");
+        let mut members = doc.as_object().unwrap().to_vec();
+        members.push(("key7".into(), Json::Null));
+        assert_eq!(Json::Object(members).duplicate_key(), Some("key7"));
     }
 
     #[test]
