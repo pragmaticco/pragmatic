@@ -66,6 +66,15 @@ fn full_trust() -> TrustPolicy {
     }
 }
 
+/// Full trust without the log key, for unsigned bundles (local ones, and
+/// tampered copies): a pinned log key requires the bundle's signature.
+fn open_log() -> TrustPolicy {
+    TrustPolicy {
+        log_keys: Vec::new(),
+        ..full_trust()
+    }
+}
+
 /// Stands in for `openssl ts -verify`: a token verifies against a root
 /// exactly when the TSA certificate that came with it was issued under
 /// that root, which the fixture's TSA URLs say.
@@ -320,7 +329,7 @@ fn aliased_operators_count_once() {
 fn an_unwitnessed_suffix_is_partial() {
     let mut b = unsigned(bundle());
     b.anchors[2].witnesses.clear();
-    let r = check(&b, &full_trust());
+    let r = check(&b, &open_log());
     assert_eq!(
         r.verdict,
         Verdict::Partial { unanchored: 12 },
@@ -334,12 +343,14 @@ fn an_unwitnessed_suffix_is_partial() {
 #[test]
 fn local_bundles_verify_unanchored() {
     let b = bundle_named("local.json");
-    let r = check(&b, &full_trust());
+    let r = check(&b, &open_log());
     assert_eq!(r.verdict, Verdict::Unanchored, "{:#?}", r.findings);
     assert_eq!(r.failures().count(), 0);
     assert_eq!(r.bundle_signature, SignatureStatus::Unsigned);
     assert!(r.has(Code::NoAnchors));
     assert_eq!(b.redacted_slots.len(), 1);
+    // A pinned log key says the bundle must come from that log, signed.
+    assert_fails(&check(&b, &full_trust()), Code::BundleSignature);
 }
 
 // ---------------------------------------------------------------------------
@@ -396,7 +407,7 @@ fn local_bundles_withhold_by_mode() {
         assert_eq!(b.redacted_slots, want, "{redact:?}");
         assert!(b.anchors.is_empty() && b.signature.is_none());
         assert!(b.requested_by.starts_with("local:"));
-        let r = check(&b, &full_trust());
+        let r = check(&b, &open_log());
         assert_eq!(r.verdict, Verdict::Unanchored, "{:#?}", r.findings);
         assert_eq!(r.failures().count(), 0, "{:#?}", r.findings);
         let again = Bundle::from_json(b.to_json().as_bytes()).unwrap();
@@ -409,6 +420,21 @@ fn local_bundles_withhold_by_mode() {
 }
 
 #[test]
+fn redaction_never_assumes_an_unread_slot_is_clean() {
+    let image = r#"{"type":"base64","media_type":"image/png","data":"QUJD"}"#;
+    let deep = format!("{}{image}{}", "[".repeat(70), "]".repeat(70));
+    for r in [
+        Redact::Binary,
+        Redact::Detectors(vec![crate::redact::Kind::Email]),
+    ] {
+        assert!(r.withholds(deep.as_bytes()), "{r:?}: nested past 64 levels");
+        assert!(r.withholds(b"[1, 2"), "{r:?}: not read to its end");
+        assert!(!r.withholds(b"[1, 2]"), "{r:?}");
+        assert!(!r.withholds(b"plain words"), "{r:?}");
+    }
+}
+
+#[test]
 fn withholding_more_keeps_anchors_valid() {
     let mut b = bundle();
     let changed = b.withhold(&[(4, 1)]).unwrap();
@@ -418,7 +444,9 @@ fn withholding_more_keeps_anchors_valid() {
         "the old signature no longer covers it"
     );
     assert!(b.redacted_slots.contains(&(4, 1)));
-    let r = check(&b, &full_trust());
+    // Unsigned now, so verified without the log key: the anchors, and the
+    // witnesses that vouch for them, are untouched.
+    let r = check(&b, &open_log());
     assert_eq!(r.verdict, Verdict::Verified, "{:#?}", r.findings);
     // The ref in entry 12 now reads as withheld too.
     let rec = &b.records[12];
@@ -436,7 +464,7 @@ fn directory_form_needs_its_journal() {
     assert_fails(&check(&read, &full_trust()), Code::JournalMissing);
     assert!(read.attach_journal(b"not it".to_vec()).is_err());
     read.attach_journal(journal).unwrap();
-    assert_eq!(check(&read, &full_trust()).verdict, Verdict::Unanchored);
+    assert_eq!(check(&read, &open_log()).verdict, Verdict::Unanchored);
     let bad = json.replace(DIRECTORY_JOURNAL_FILE, "../journal");
     assert!(Bundle::from_json(bad.as_bytes()).is_err());
 }
@@ -467,7 +495,7 @@ fn self_signed_tsa_is_not_trusted() {
             })
             .collect();
     }
-    let r = check(&b, &full_trust());
+    let r = check(&b, &open_log());
     assert_eq!(r.verdict, Verdict::Unanchored, "{:#?}", r.findings);
     assert!(r.has(Code::TsaUntrusted));
     assert!(r.anchors.iter().all(|a| a.trusted_operators.is_empty()));
@@ -508,7 +536,7 @@ fn omitted_anchor_is_caught_by_the_full_log() {
     // Hiding the last anchor: on its own the bundle still looks fine...
     let mut b = unsigned(bundle());
     b.anchors.pop();
-    let r = check(&b, &full_trust());
+    let r = check(&b, &open_log());
     assert_eq!(r.verdict, Verdict::Partial { unanchored: 12 });
     // ...and the full log shows the leaf it hid.
     assert_fails(
@@ -553,7 +581,7 @@ fn erased_slot_without_a_note_fails() {
         .unwrap();
     // With its note it is accounted for.
     let b = Bundle::local(&erased.file, "r1", &Redact::None).unwrap();
-    assert_eq!(check(&b, &full_trust()).failures().count(), 0);
+    assert_eq!(check(&b, &open_log()).failures().count(), 0);
     // Without it, it is not.
     let mut without_note = erased.journal;
     without_note.truncate(without_note.len() - 1);
@@ -702,19 +730,29 @@ fn witness_logs_detect_forks() {
         .checks
         .iter()
         .any(|c| c.step == "11" && c.status == CheckStatus::Pass));
+    // With the full log too, every cosigned root is checked against it.
+    let both = Audit {
+        log: Some(AnchorLog::from_json(&fixture("log.json")).unwrap()),
+        witness_logs: vec![wl.clone()],
+    };
+    assert_eq!(
+        check_audit(&bundle(), &full_trust(), &both).verdict,
+        Verdict::Verified
+    );
 
-    // The witness saw another root for the first anchor's tree size.
-    let mut forked = wl.clone();
-    let mut lines: Vec<String> = forked.checkpoints[0]
+    // A root the witness never signed: the history is not the witness's.
+    // (Forks the witness did cosign are built in the attacks module.)
+    let mut forged = wl.clone();
+    let mut lines: Vec<String> = forged.checkpoints[0]
         .body
         .lines()
         .map(str::to_string)
         .collect();
     lines[2] = base64_encode(&[7u8; 32]);
-    forked.checkpoints[0].body = format!("{}\n", lines.join("\n"));
+    forged.checkpoints[0].body = format!("{}\n", lines.join("\n"));
     assert_fails(
-        &check_audit(&bundle(), &full_trust(), &with_witness_log(forked)),
-        Code::WitnessLogFork,
+        &check_audit(&bundle(), &full_trust(), &with_witness_log(forged)),
+        Code::WitnessLogUntrusted,
     );
 
     // A cosigned checkpoint the witness never recorded.
@@ -725,12 +763,21 @@ fn witness_logs_detect_forks() {
         Code::WitnessLogMismatch,
     );
 
-    // A history for another log is skipped with a warning.
+    // A history for another log does not apply: the audit asked for fails.
     let mut other = wl;
     other.origin = "pragmatic/elsewhere".into();
-    let r = check_audit(&bundle(), &full_trust(), &with_witness_log(other));
-    assert_eq!(r.verdict, Verdict::Verified);
-    assert!(r.has(Code::WitnessLogOrigin));
+    assert_fails(
+        &check_audit(&bundle(), &full_trust(), &with_witness_log(other)),
+        Code::WitnessLogOrigin,
+    );
+}
+
+#[test]
+fn unreadable_bundles_fail_with_their_code() {
+    let r = EvidenceReport::unreadable(Code::BundleFile, "journal.pragmatic is a FIFO", 2);
+    assert_fails(&r, Code::BundleFile);
+    assert_eq!(r.exit_code(), 1);
+    assert_eq!(r.checks[0].step, "2");
 }
 
 #[test]
@@ -749,7 +796,7 @@ fn witness_key_validity_windows() {
 #[test]
 fn every_failure_code_is_exercised_somewhere() {
     // A guard against adding a code without a test: the failure codes the
-    // tests in this module assert.
+    // tests in this module and the attacks module assert.
     let tested = [
         Code::BundleJson,
         Code::BundleSchema,
@@ -778,6 +825,10 @@ fn every_failure_code_is_exercised_somewhere() {
         Code::LogMismatch,
         Code::WitnessLogFork,
         Code::WitnessLogMismatch,
+        Code::WitnessLogOrigin,
+        Code::WitnessLogUntrusted,
+        Code::LogUnauditable,
+        Code::BundleFile,
     ];
     // Reached only through journals the parser already refuses (a broken
     // chain, a format 1 journal, erasure notes that list missing or still

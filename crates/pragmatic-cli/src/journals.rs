@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use pragmatic::encoding::hex_encode;
 use pragmatic::journal::{EraseSelector, ErasureNote, Journal};
 use pragmatic::{Backend, DirBackend, VerifyReport};
-use pragmatic_console::{render_run, text, RunView};
+use pragmatic_console::{render_run_page, text, RunView};
 
 use crate::args::{journal_key, Args, Usage};
 use crate::Failure;
@@ -78,9 +78,15 @@ pub fn runs(args: &Args) -> Result<(), Failure> {
                     &hex_encode(&j.head())[..16],
                 );
             }
+            // The error can quote journal content (a format 1 file name, a
+            // run.start run id), so it is printed sanitized.
             Err(e) => println!(
-                "{name:<28} {:>3} {:>8} {:>8}  {:<9} {e}",
-                "-", "-", "-", "ERROR"
+                "{name:<28} {:>3} {:>8} {:>8}  {:<9} {}",
+                "-",
+                "-",
+                "-",
+                "ERROR",
+                text::sanitize(&e)
             ),
         }
     }
@@ -237,8 +243,9 @@ pub fn verify(args: &Args) -> Result<(), Failure> {
             }
             Err(e) => {
                 println!(
-                    "{}\n  result                FAILED: {e}",
-                    text::sanitize(run)
+                    "{}\n  result                FAILED: {}",
+                    text::sanitize(run),
+                    text::sanitize(&e.to_string())
                 );
                 failed += 1;
             }
@@ -254,24 +261,49 @@ pub fn verify(args: &Args) -> Result<(), Failure> {
     }
 }
 
+/// `export RUN [--from CURSOR] [-o FILE]`: one page of the run (a long
+/// timeline is split into pages that a browser opens quickly; `--from`
+/// picks the page that starts at a cursor).
 pub fn export(args: &Args) -> Result<(), Failure> {
     let mut allowed = READ_FLAGS.to_vec();
-    allowed.push("--out");
+    allowed.extend(["--out", "--from"]);
     args.only(&allowed)?;
     let run = args.one("RUN")?;
+    let from: u64 = args.number("--from")?.unwrap_or(0);
     let key = journal_key(args)?;
     let dir = args.dir();
     let journal = open(&dir, run, key.as_deref())?;
+    if from > 0 && from >= journal.len() {
+        return Err(Usage(format!(
+            "--from {from} is past the run's last entry ({} entries)",
+            journal.len()
+        ))
+        .into());
+    }
     let report = journal.audit();
     let source = dir.display().to_string();
     let mut view = RunView::new(run, &journal, &report);
     view.source = Some(&source);
-    let html = render_run(&view);
-    let out = args
-        .path("--out")
-        .unwrap_or_else(|| PathBuf::from(format!("{run}.html")));
-    std::fs::write(&out, html).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
-    println!("wrote {}", out.display());
+    view.from = from;
+    let page = render_run_page(&view);
+    let out = args.path("--out").unwrap_or_else(|| {
+        PathBuf::from(if from == 0 {
+            format!("{run}.html")
+        } else {
+            format!("{run}.from-{from}.html")
+        })
+    });
+    crate::output::write(&out, page.html.as_bytes())?;
+    match page.next {
+        None => println!("wrote {}", out.display()),
+        Some(next) => println!(
+            "wrote {}: entries #{from} to #{} of {}; the next page: pragmatic export {} --from {next}",
+            out.display(),
+            next - 1,
+            journal.len(),
+            text::sanitize(run)
+        ),
+    }
     Ok(())
 }
 

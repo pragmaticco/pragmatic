@@ -3,9 +3,11 @@
 Status: design, revision 3 (2026-10-13), after an adversarial review across
 cryptography, replay correctness, storage and failure handling, compliance,
 developer experience and completeness, amended after the review of the core
-runtime (2.4, 2.6 to 2.8, 2.11, 2.12, 2.14, 3.1 to 3.3, 6.7), and where
+runtime (2.4, 2.6 to 2.8, 2.11, 2.12, 2.14, 3.1 to 3.3, 6.7), where
 building evidence bundles, the console and the CLI settled open details
-(3.5, 4.7, 4.10, 4.14, 5.1 to 5.3, 7). This document
+(3.5, 4.7, 4.10, 4.14, 5.1 to 5.3, 7), and after the adversarial review of
+evidence verification, the console and the CLI (1.3, 4.7, 4.10, 4.14, 5.3,
+7, 10). This document
 is the contract
 between the components built for 0.6. Everything marked MUST is
 normative; where code and this document disagree, one of them is a bug.
@@ -56,7 +58,7 @@ anchor.
 |---|---|---|
 | Agent code (including prompt-injected tools) | act outside journaled interfaces (unrecorded); hold an agent token scoped to its prefixes | write erased or withheld slots, server-only notes, or touch runs outside its scopes |
 | Host operator without the HMAC key (local mode) | read and edit local files | edit a keyed journal undetected |
-| Server administrator with root | rewrite unanchored suffixes (at most `interval_secs` old); delete data | rewrite an anchored prefix, or hide an anchored run from an auditor who audits the anchor log against a pinned independent witness |
+| Server administrator with root | rewrite unanchored suffixes (at most `interval_secs` old); delete data; with `anchor_run_ids = "hmac"`, re-anchor a rewritten run under a new per-run key, which no audit detects (4.7) | rewrite an anchored prefix, or hide an anchored run from an auditor who audits the anchor log against a pinned independent witness, for runs anchored with plain ids |
 | Auditor | read what their token's scopes and `view_raw` allow | recover redacted content (salts are never served with redacted content) |
 | Pragmatic Witness (hosted) | refuse service; see `(origin, seq, root)` | learn any content or run id |
 
@@ -1147,6 +1149,16 @@ leaf_data = "pragmatic/v2/leaf" ‖ u8 type (0 run, 1 access log) ‖ u32 len(id
   carry k_run as `anchor_id`. (A literal HMAC-SHA-256(anchor_salt, run_id)
   could not be recomputed from anything a bundle may disclose; k_run lets
   the bundle holder recompute the leaf without revealing other runs' ids.)
+  - Nothing binds k_run to the run: an administrator can rewrite an
+    anchored journal and anchor it again as a fresh leaf chain under a new
+    key, and the run's earlier leaves read as another run's. Hidden or
+    re-keyed anchors of such runs cannot be detected by any audit, so
+    verifiers report `anchor_id_unbound` for every bundle with an
+    `anchor_id`, and the `--log` audit fails with `log_unauditable`
+    rather than pass (5.3). Deployments that need the omission audit
+    anchor with `"plain"`, the default. A run id bound to the log key by a
+    verifiable random function (RFC 9381) would keep both properties; it
+    is deferred (section 10).
 - Every `interval_secs`, one task snapshots, under each run's lock, the
   fsynced `(entries, head)` of every run and of the access log that
   changed since its last leaf. Runs created by PUT are included even with
@@ -1283,7 +1295,10 @@ ships its public keys, an empty list until it launches.
 ### 4.10 Redaction and views
 
 Views for tokens without `view_raw` never include salts or raw journal
-bytes. Each slot is parsed as JSON when possible:
+bytes. Each slot that starts like JSON is read as JSON, in one pass with no
+size or nesting limit and leniently (a repeated key is read in every copy,
+`NaN` is a value), since an attachment must never escape detection because
+a slot is large, deep or not quite strict JSON:
 
 - Binary fields are replaced by
   `[binary media_type=… bytes=n sha256=…]` and never served. These are
@@ -1294,6 +1309,11 @@ bytes. Each slot is parsed as JSON when possible:
   evidence redaction.
 - Text is redacted with the built-in detectors plus configured patterns.
 - Non-JSON slots are redacted as text.
+- A slot that starts like JSON but cannot be read to its end is reported
+  as `incomplete` by the scan, with whatever was found before it stopped.
+  Evidence redaction (`binary`, `detectors`) withholds such slots: what
+  was not read is never assumed free of attachments. The console says the
+  slot was not fully scanned.
 
 The console never inlines base64 larger than 64 KiB. The docs state that
 redaction does not inspect images, PDFs or audio, and that regex
@@ -1368,11 +1388,28 @@ Server-rendered with the shared `pragmatic-console` crate:
 
 The `pragmatic-console` crate (Apache-2.0, no dependencies beyond the
 core) renders these pages for the server and the CLI alike:
-`render_run(&RunView)`, `render_index(&[RunRow])`,
-`render_evidence(&Bundle, &EvidenceReport)` and `render_csv(&Bundle)`.
-Pages carry a Content-Security-Policy that loads nothing and run no script;
-all journal and bundle text is escaped, binary values are summarized, and
-slot text is cut at 64 KiB.
+`render_run(&RunView)` (and `render_run_page`, which also returns where
+the next page starts), `render_index(&[RunRow])`,
+`render_evidence(&Bundle, &EvidenceReport)` and
+`render_csv(&Bundle, &EvidenceReport)`. Pages carry a
+Content-Security-Policy that loads nothing and run no script; all journal
+and bundle text is escaped, binary values are summarized, and slot text is
+cut at 64 KiB.
+
+- **Pages are bounded.** A run's timeline is shown a page at a time: a
+  page ends after 5,000 entries, or before the entry whose row would take
+  the page past 16 MiB of HTML, whichever comes first, and links to the
+  next (`RunView.from` and `RunView.page_link`), so every entry is on some
+  page and no page grows with the journal (a 1 GiB journal would
+  otherwise be a multi-gigabyte page). A ref slot links to the slot it
+  repeats rather than showing its content again.
+- **CSV carries its verdict.** `render_csv` takes the report: every row
+  carries the verdict and whether the entry is independently anchored, and
+  rows are decoded from the bundle's journal, never taken from its
+  `records` as stated (only a journal that cannot be read falls back to
+  them, with every row `FAILED`).
+- **Format 1 runs** are counted (commits as ok effects) and shown in full:
+  each recorded value in its own block, as a format 2 slot.
 
 ### 4.15 Deployment
 
@@ -1481,7 +1518,12 @@ and never counts as independent.
 ### 5.3 Checks (`pragmatic verify-evidence FILE`)
 
 1. Strict JSON; unknown keys rejected. Bundle signature is verified when
-   the key is pinned, otherwise reported as operator-asserted.
+   the key is pinned, otherwise reported as operator-asserted. With a log
+   key pinned, a bundle that is unsigned, or signed by another key, fails
+   (`bundle_signature`): only the signature covers `generator`,
+   `requested_by`, `redaction` and `verification_spec`, which are shown as
+   unverified claims unless it verified. (A bundle someone withheld more
+   slots from is unsigned, and is verified without `--log-key`.)
 2. The journal parses canonically with no trailing bytes. `entries` and
    `head` are recomputed and must match.
 3. The chain verifies.
@@ -1500,7 +1542,8 @@ and never counts as independent.
    - the consistency proof links to `latest_checkpoint`;
    - the leaf chain is continuous through `prev_leaf_index`.
    - The checkpoint's server signature is checked against `--log-key` if
-     given; otherwise it is reported as operator-asserted.
+     given, and the key that signed it must be named for the checkpoint's
+     origin; otherwise it is reported as operator-asserted.
 9. For each witness, classify it as `trusted`, `self-asserted` or
    `operator-controlled`:
    - `rfc3161`: run `openssl ts -verify -token_in -in <i>.der -digest
@@ -1509,19 +1552,36 @@ and never counts as independent.
      index, and never go through a shell. The reported time is genTime
      plus accuracy.
    - `cosignature`: verify against pinned `--witness-key` values only.
+   - An anchor's reported time ("no later than") is the time at least
+     `--min-operators` distinct trusted operators vouch for: each trusted
+     operator's earliest witness time, and of those the k-th earliest. One
+     operator alone cannot backdate an anchor.
 10. **Independence:** count trusted witnesses by distinct *operator*,
     mapping Entrust to Sectigo and QuoVadis EU to DigiCert.
     - `VERIFIED` (exit 0) requires at least `--min-operators` (default 2)
       distinct trusted operators on an anchor whose `entries` equals the
       journal length.
-    - `VERIFIED (PARTIAL)` (exit 2) when that is true only for a prefix.
-      The report states the unanchored suffix length.
-    - `UNANCHORED` (exit 3) when no anchor has enough trusted operators.
-    - `FAILED` (exit 1) for any integrity failure.
+    - `VERIFIED (PARTIAL)` (exit 2) when that is true only for a prefix
+      of at least one entry. The report states the unanchored suffix
+      length.
+    - `UNANCHORED` (exit 3) when no anchor has enough trusted operators,
+      or only anchors of 0 entries do (they commit to the genesis head
+      every unkeyed journal shares, so they vouch for no content).
+    - `FAILED` (exit 1) for any integrity failure, or an audit of step 11
+      that was asked for and could not be completed.
 11. **Full-log audit (optional):** `--log FILE` (from
     `GET /v1/anchors/log`) verifies every leaf of the run against
-    `latest_checkpoint`, which detects hidden anchors. `--witness-log FILE`
-    checks each checkpoint against a witness's cosigned history.
+    `latest_checkpoint`, which detects hidden anchors (for plain run ids;
+    with `anchor_id` it fails with `log_unauditable`, 4.7).
+    `--witness-log FILE` checks the bundle's tree against a witness's
+    cosigned history, which detects a forked log: every history checkpoint
+    must verify with a pinned key for that witness and be for the bundle's
+    origin, every tree size the history and the bundle (its checkpoints,
+    and with `--log` the root of every prefix of the log) both name must
+    have one root, and the bundle's tree must link to the history (the
+    witness cosigned the latest checkpoint, or the history's largest tree
+    is one the bundle vouches for). `docs/evidence-format.md` step 11 is
+    normative.
 12. The bundle's text is never printed as instructions. `--explain`
     prints the verification procedure that ships with the CLI.
 
@@ -1534,13 +1594,16 @@ all are reported, not only the first. Integrity failures make the verdict
 self-asserted and simply does not count (`tsa_untrusted`,
 `cosignature_untrusted`), but a malformed witness, a token over another
 digest, or a cosignature line from a pinned key that does not verify is a
-failure. `--log FILE` takes `{"leaves": [hex...]}`, every leaf from index
+failure. A token is `tsa_untrusted` only when OpenSSL ran the check and
+reported failure; when it could not run it, the token is `tsa_unchecked`. `--log FILE` takes `{"leaves": [hex...]}`, every leaf from index
 0; `--witness-log FILE` takes `{"witness", "origin", "checkpoints":
 [signed note...]}`.
 
 `docs/evidence-format.md` and a standard-library-only Python reference
 verifier (`tools/verify_evidence.py`, which needs `openssl` on PATH)
-implement the same checks.
+implement the same checks, the reference verifier with its own pure-Python
+Ed25519 (RFC 8032, with the core's acceptance rules), strict DER and
+signed-note parsers, so it checks every signature and takes the same flags.
 
 ---
 
@@ -1747,11 +1810,29 @@ loosened.
   100 MiB. Keyed journals are refused.
 - `verify-evidence FILE [--tsa-roots [OP=]F]... [--witness-key OP=VKEY]...
   [--log-key VKEY]... [--min-operators N] [--log F] [--witness-log F]...
-  [--openssl | --no-openssl] [--explain]`. OpenSSL is used when it is on
-  PATH; `--openssl` requires it. FILE may be a directory bundle.
+  [--openssl | --no-openssl] [--explain]`. The first `openssl` on PATH
+  that can check tokens (OpenSSL whose `ts` takes `-attime`, not LibreSSL)
+  is used; `--openssl` requires one, and names the unusable binary when
+  there is none. A check counts as a rejected token only when OpenSSL ran
+  it and reported failure. FILE may be a directory bundle, whose files are
+  read only if they are regular files of a sane size (`bundle_file`).
 - `render-evidence FILE --format html|csv [-o FILE]`, with the same trust
-  flags (the page shows the verification report).
-- Usage errors exit 64, distinct from every verification outcome.
+  flags (the page shows the verification report). It exits with the
+  verdict's code, and never writes CSV for a bundle that fails.
+- Every file the CLI writes (`-o`, and `render-evidence`'s default next to
+  the bundle) is written to a fresh temporary file and renamed into place,
+  and a destination that is a symbolic link or not a regular file is
+  refused, so a link shipped with a bundle is never written through.
+- `export RUN [--from CURSOR]` writes one page of the run (4.14) and says
+  where the next starts. `serve` answers only requests whose `Host` is
+  its own loopback name (`127.0.0.1`, `localhost` or `[::1]`, with its
+  port or none), and refuses requests a browser marks as cross-site, so a
+  web page cannot read the console by DNS rebinding.
+- Error messages quote journal content (run ids, file names) and are
+  printed with control characters escaped, like everything else.
+- Usage errors exit 64, distinct from every verification outcome. Trust
+  inputs that are malformed or cannot be read (a root, key, log or witness
+  history) and a bundle path that cannot be read are usage errors.
 - No secrets in argv: `--key-file` and `PRAGMATIC_JOURNAL_KEY` replace
   `--key`. `--key` remains, deprecated, with a warning.
 
@@ -1862,4 +1943,6 @@ with an unpinned root.
 OIDC sign-in; in-process TLS; server-side OTLP export; local anchoring
 from the CLI; Claude Agent SDK capture (hooks and session store);
 LiteLLM's own Anthropic handler; a Pydantic AI durable-execution backend;
-the TypeScript SDK; multi-replica servers.
+the TypeScript SDK; multi-replica servers; anchor ids bound to the log key
+by a verifiable random function (RFC 9381 ECVRF), so that HMAC-named runs
+can be audited for hidden anchors (4.7).

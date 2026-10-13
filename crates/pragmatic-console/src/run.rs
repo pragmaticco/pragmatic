@@ -9,17 +9,35 @@
 //! lane. Intents carry the status of their latest result and link to it;
 //! results link back. Expanding a row shows its fields, metadata and every
 //! slot.
+//!
+//! A run can hold millions of entries and gigabytes of content, so the
+//! timeline is shown a page at a time: a page ends after [`PAGE_ENTRIES`]
+//! entries, or before the entry that would take its rows past
+//! [`PAGE_BYTES`] of HTML, whichever comes first, and links to the next.
+//! Every entry is on some page, and every page is bounded whatever the
+//! journal holds (only one entry larger than the budget makes a page
+//! larger, and an entry is bounded too: at most 255 slots of at most
+//! 64 KiB shown each).
 
 use std::collections::HashMap;
 
 use pragmatic::encoding::hex_encode;
-use pragmatic::journal::{Content, Cursor, EffectOutcome, Entry, Event, Journal, META};
+use pragmatic::journal::{
+    Content, Cursor, EffectOutcome, Entry, Event, Journal, LegacyEvent, META,
+};
 use pragmatic::json::Json;
 use pragmatic::VerifyReport;
 
 use crate::html::{block, esc, masthead, page, pill, pre, pretty_json};
-use crate::slots::slot_html;
+use crate::slots::{slot_html, value_html};
 use crate::text;
+
+/// The most timeline entries one page shows.
+pub const PAGE_ENTRIES: usize = 5_000;
+
+/// The most bytes of timeline HTML one page holds. The page ends before the
+/// entry whose row would pass it, unless that entry is the page's first.
+pub const PAGE_BYTES: usize = 16 << 20;
 
 /// What a page needs to show one run.
 #[derive(Clone, Copy, Debug)]
@@ -36,6 +54,12 @@ pub struct RunView<'a> {
     pub source: Option<&'a str>,
     /// The run index to link back to, for a live console.
     pub home: Option<&'a str>,
+    /// The cursor the timeline page starts at (0 for the first page).
+    pub from: Cursor,
+    /// How to link to another page of the timeline: a URL to which a
+    /// page's first cursor is appended, such as `/run/r1?from=`. Without
+    /// one (an exported file), the page says where the next one starts.
+    pub page_link: Option<&'a str>,
 }
 
 impl<'a> RunView<'a> {
@@ -47,8 +71,18 @@ impl<'a> RunView<'a> {
             anchor: None,
             source: None,
             home: None,
+            from: 0,
+            page_link: None,
         }
     }
+}
+
+/// One page of a run, and where the next one starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunPage {
+    pub html: String,
+    /// The first cursor of the next page, `None` on the last page.
+    pub next: Option<Cursor>,
 }
 
 /// A run's anchoring as the server knows it.
@@ -65,8 +99,14 @@ pub struct AnchorStatus {
     pub time: Option<String>,
 }
 
-/// The full page for one run.
+/// The page for one run: its facts, attempts and verification, and the
+/// page of the timeline that starts at `view.from`.
 pub fn render_run(view: &RunView<'_>) -> String {
+    render_run_page(view).html
+}
+
+/// [`render_run`], also saying where the next page of the timeline starts.
+pub fn render_run_page(view: &RunView<'_>) -> RunPage {
     let j = view.journal;
     let mut body = String::new();
     let right = view.source.map(esc).unwrap_or_default();
@@ -89,9 +129,13 @@ pub fn render_run(view: &RunView<'_>) -> String {
         );
     }
     body.push_str("<h2>timeline</h2>");
-    body.push_str(&timeline(j));
+    let (rows, next) = timeline(j, view.from, view.page_link);
+    body.push_str(&rows);
     body.push_str(&verification(view.report, j));
-    page(&format!("{} \u{b7} pragmatic", esc(view.run_id)), &body)
+    RunPage {
+        html: page(&format!("{} \u{b7} pragmatic", esc(view.run_id)), &body),
+        next,
+    }
 }
 
 /// Totals over a journal, for the facts line.
@@ -137,6 +181,9 @@ fn totals(j: &Journal) -> Totals {
                 EffectOutcome::Failed => t.effects_failed += 1,
                 EffectOutcome::Compensated => t.effects_compensated += 1,
             },
+            // Format 1 records commits and write-offs, not failures.
+            Event::Legacy(LegacyEvent::EffectCommit { .. }) => t.effects_ok += 1,
+            Event::Legacy(LegacyEvent::EffectCompensated { .. }) => t.effects_compensated += 1,
             _ => {}
         }
     }
@@ -160,14 +207,23 @@ fn facts(view: &RunView<'_>) -> String {
     if j.format() == 2 {
         f.push(format!("<b>{}</b> attempt(s)", text::attempts(j)));
     }
-    f.push(format!(
-        "<b>{}</b> model calls ({} in / {} out tokens)",
-        t.draws, t.input_tokens, t.output_tokens
-    ));
-    f.push(format!(
-        "effects <b>{}</b> ok, <b>{}</b> failed, <b>{}</b> written off",
-        t.effects_ok, t.effects_failed, t.effects_compensated
-    ));
+    if j.format() == 2 {
+        f.push(format!(
+            "<b>{}</b> model calls ({} in / {} out tokens)",
+            t.draws, t.input_tokens, t.output_tokens
+        ));
+        f.push(format!(
+            "effects <b>{}</b> ok, <b>{}</b> failed, <b>{}</b> written off",
+            t.effects_ok, t.effects_failed, t.effects_compensated
+        ));
+    } else {
+        // Format 1 records no token usage and no failed effects.
+        f.push(format!("<b>{}</b> model calls", t.draws));
+        f.push(format!(
+            "effects <b>{}</b> ok, <b>{}</b> written off (format 1 records no failures)",
+            t.effects_ok, t.effects_compensated
+        ));
+    }
     if t.erased + t.withheld > 0 {
         f.push(format!(
             "<b>{}</b> erased, <b>{}</b> withheld slot(s)",
@@ -261,29 +317,31 @@ struct AttemptRow {
 
 fn attempts_table(j: &Journal) -> String {
     let mut rows: Vec<AttemptRow> = Vec::new();
+    // Attempt number to its latest row, so each end is matched in O(1):
+    // a journal of many ends that name no started attempt (hostile or
+    // broken) must not cost starts times ends.
+    let mut latest: HashMap<u64, usize> = HashMap::new();
     for e in j.entries() {
         let Event::Note { kind, data, .. } = &e.event else {
             continue;
         };
+        if kind != "attempt.start" && kind != "attempt.end" {
+            continue;
+        }
         let Ok(doc) = Json::parse(data) else { continue };
-        match kind.as_str() {
-            "attempt.start" => rows.push(AttemptRow {
+        let n = doc.get("attempt").and_then(Json::as_u64);
+        if kind == "attempt.start" {
+            if let Some(n) = n {
+                latest.insert(n, rows.len());
+            }
+            rows.push(AttemptRow {
                 cursor: e.cursor,
                 at: e.at,
                 start: doc,
                 end: None,
-            }),
-            "attempt.end" => {
-                let n = doc.get("attempt").and_then(Json::as_u64);
-                if let Some(r) = rows
-                    .iter_mut()
-                    .rev()
-                    .find(|r| r.start.get("attempt").and_then(Json::as_u64) == n)
-                {
-                    r.end = Some((e.cursor, doc));
-                }
-            }
-            _ => {}
+            });
+        } else if let Some(&i) = n.and_then(|n| latest.get(&n)) {
+            rows[i].end = Some((e.cursor, doc));
         }
     }
     if rows.is_empty() {
@@ -341,20 +399,59 @@ fn attempts_table(j: &Journal) -> String {
     out
 }
 
-/// The timeline of every entry, as nested lanes.
-pub(crate) fn timeline(j: &Journal) -> String {
+/// One page of the timeline, as nested lanes, from cursor `from`, and the
+/// cursor the next page starts at (see the module documentation).
+pub(crate) fn timeline(j: &Journal, from: Cursor, link: Option<&str>) -> (String, Option<Cursor>) {
     let results = text::results_by_intent(j);
-    let mut out = String::from(
+    let mut out = String::new();
+    let total = j.len();
+    let from = from.min(total);
+    if from > 0 {
+        out.push_str(&format!(
+            "<p class=\"lede\">Entries from #{from} of {total}. {}</p>",
+            page_link(link, 0, "The timeline starts on the first page")
+        ));
+    }
+    out.push_str(
         "<div class=\"cols\"><span>time (utc)</span><span>cur</span><span>lane</span>\
          <span>event</span><span>summary: click to expand</span><span style=\"text-align:right\">hash</span></div>",
     );
-    for e in j.entries() {
-        out.push_str(&row(e, j, &results));
+    let mut size = 0usize;
+    let mut next = None;
+    for (n, e) in j.entries()[from as usize..].iter().enumerate() {
+        if n == PAGE_ENTRIES {
+            next = Some(e.cursor);
+            break;
+        }
+        let html = row(e, j, &results);
+        if n > 0 && size + html.len() > PAGE_BYTES {
+            next = Some(e.cursor);
+            break;
+        }
+        size += html.len();
+        out.push_str(&html);
     }
     if j.is_empty() {
         out.push_str("<div class=\"empty\">no entries</div>");
     }
-    out
+    if let Some(c) = next {
+        out.push_str(&format!(
+            "<p class=\"lede\">This page ends before #{c}, to keep it a size a browser opens \
+             quickly; {} entries remain. {}</p>",
+            total - c,
+            page_link(link, c, &format!("The next page starts at cursor {c}"))
+        ));
+    }
+    (out, next)
+}
+
+/// A link to the page starting at `from`, or the plain `text` when there is
+/// no way to link (an exported file).
+fn page_link(link: Option<&str>, from: Cursor, text: &str) -> String {
+    match link {
+        Some(prefix) => format!("<a href=\"{}{from}\">{}</a>", esc(prefix), esc(text)),
+        None => format!("{}.", esc(text)),
+    }
 }
 
 fn lane(branch: &[u32]) -> String {
@@ -392,6 +489,7 @@ fn intent_status(j: &Journal, latest: Option<Cursor>) -> (String, &'static str) 
     }
 }
 
+/// One timeline row.
 fn row(e: &Entry, j: &Journal, results: &HashMap<Cursor, Vec<Cursor>>) -> String {
     let hash = hex_encode(&e.hash);
     let is_meta = e.branch == META;
@@ -578,9 +676,7 @@ fn detail(e: &Entry, explain: String, at: &str, hash: &str) -> String {
             out.push_str(&kv("source", source));
             out.push_str(&kv("args", args));
         }
-        Event::Legacy(_) => {
-            out.push_str(&block("entry", &pre(&text::summary(&e.event, 4096))));
-        }
+        Event::Legacy(l) => out.push_str(&legacy_detail(l)),
         _ => {}
     }
     let labels = slot_labels(&e.event);
@@ -600,6 +696,37 @@ fn detail(e: &Entry, explain: String, at: &str, hash: &str) -> String {
     }
     out.push_str(&kv("entry hash", hash));
     out
+}
+
+/// A format 1 entry in full: its structural fields as key and value, and
+/// each recorded value (prompt, outcome, argument, result, received value)
+/// in its own block, shown the way a format 2 slot is.
+fn legacy_detail(l: &LegacyEvent) -> String {
+    let value = |label: &str, v: &pragmatic::Value| value_html(label, v.as_bytes());
+    match l {
+        LegacyEvent::OracleDraw {
+            prompt,
+            outcome,
+            provenance,
+        } => format!(
+            "{}{}{}",
+            kv("provenance", provenance),
+            value("prompt", prompt),
+            value("outcome", outcome)
+        ),
+        LegacyEvent::ChannelRecv { channel, value: v } => {
+            format!("{}{}", kv("channel", channel), value("value", v))
+        }
+        LegacyEvent::EffectIntent { name, arg } => {
+            format!("{}{}", kv("effect", name), value("argument", arg))
+        }
+        LegacyEvent::EffectCommit { name, result } => {
+            format!("{}{}", kv("effect", name), value("result", result))
+        }
+        LegacyEvent::EffectCompensated { name } => kv("effect", name),
+        LegacyEvent::Clock { nanos } => kv("nanos", &nanos.to_string()),
+        LegacyEvent::Program { name, hash } => format!("{}{}", kv("name", name), kv("hash", hash)),
+    }
 }
 
 fn verification(report: &VerifyReport, j: &Journal) -> String {

@@ -102,7 +102,7 @@ pub fn time(at: u64) -> String {
 pub fn label(event: &Event) -> String {
     match event {
         Event::DrawIntent { .. } => "draw.intent".into(),
-        Event::DrawResult { meta, .. } => format!("draw.{}", draw_meta(meta).outcome),
+        Event::DrawResult { meta, .. } => format!("draw.{}", clip(&draw_meta(meta).outcome, 16)),
         Event::ChannelRecv { .. } => "chan.recv".into(),
         Event::EffectIntent { .. } => "effect.intent".into(),
         Event::EffectResult { outcome, .. } => format!("effect.{}", outcome.as_str()),
@@ -128,6 +128,11 @@ pub fn label(event: &Event) -> String {
 
 /// What a draw result's `meta` says (design 2.6). Missing values are
 /// empty or `None`; malformed meta reads as outcome `?`.
+///
+/// Meta is journal content, so every string is cut to one line of at most
+/// [`META_WIDTH`] characters with control characters escaped when it is
+/// read: whoever prints a `DrawMeta` field (a label on a terminal, a pill
+/// on a page) gets text that cannot drive a terminal.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DrawMeta {
     pub outcome: String,
@@ -145,6 +150,9 @@ pub struct DrawMeta {
     pub latency_ms: Option<u64>,
 }
 
+/// The longest a [`DrawMeta`] string field is kept, in characters.
+pub const META_WIDTH: usize = 128;
+
 /// Parse draw result meta.
 pub fn draw_meta(meta: &str) -> DrawMeta {
     let Ok(doc) = Json::parse(meta) else {
@@ -153,7 +161,7 @@ pub fn draw_meta(meta: &str) -> DrawMeta {
             ..DrawMeta::default()
         };
     };
-    let s = |k: &str| doc.get(k).and_then(Json::as_str).unwrap_or("").to_string();
+    let s = |k: &str| clip(doc.get(k).and_then(Json::as_str).unwrap_or(""), META_WIDTH);
     let usage = |k: &str| {
         doc.get("usage")
             .and_then(|u| u.get(k))
@@ -639,6 +647,23 @@ mod tests {
         let e = draw_meta(r#"{"outcome":"error","error_kind":"timeout","status":503}"#);
         assert_eq!(e.describe(), "timeout, HTTP 503");
         assert_eq!(draw_meta("not json").outcome, "?");
+    }
+
+    #[test]
+    fn draw_meta_cannot_reach_a_terminal() {
+        let meta = r#"{"outcome":"ok\u001b]0;pwned\u0007\u001b[2J","model":"m\nx"}"#;
+        let m = draw_meta(meta);
+        assert!(!m.outcome.contains('\u{1b}'));
+        assert_eq!(m.model, "m x");
+        let e = Event::DrawResult {
+            intent: 0,
+            meta: meta.into(),
+            head: Content::Erased,
+            body: Content::Erased,
+        };
+        let label = label(&e);
+        assert!(label.starts_with("draw.ok\\u{1b}"), "{label}");
+        assert!(!label.contains('\u{1b}') && !label.contains('\u{7}'));
     }
 
     #[test]

@@ -214,15 +214,46 @@ fn evidence_pages_lead_with_the_verdict() {
 #[test]
 fn csv_has_one_row_per_record() {
     let bundle = fixture_bundle();
-    let csv = render_csv(&bundle);
+    let report = verify(&bundle, &TrustPolicy::default(), &NoTsaVerifier);
+    let csv = render_csv(&bundle, &report);
     let lines: Vec<&str> = csv.split("\r\n").filter(|l| !l.is_empty()).collect();
     assert_eq!(lines.len(), 1 + bundle.records.len());
-    assert!(lines[0].starts_with("cursor,at_ns,at_utc"));
-    assert!(lines[1].starts_with("\"0\",\""));
+    assert!(lines[0].starts_with("verdict,anchored,cursor,at_ns,at_utc"));
+    assert!(lines[1].starts_with("\"UNANCHORED\",\"no\",\"0\",\""));
     assert!(csv.contains("[erased]"));
     assert!(csv.contains("[withheld]"));
     assert!(csv.contains("[binary media_type=application/octet-stream bytes=7"));
     assert!(!csv.contains("CAYAAAAfFcSJ"));
+}
+
+#[test]
+fn csv_rows_come_from_the_journal_never_from_stated_records() {
+    let mut bundle = fixture_bundle();
+    let slot = bundle
+        .records
+        .iter_mut()
+        .flat_map(|r| r.slots.iter_mut())
+        .find(|s| s.text.is_some())
+        .unwrap();
+    slot.text = Some("FORGED: refund approved by the manager".into());
+    let report = verify(&bundle, &TrustPolicy::default(), &NoTsaVerifier);
+    assert_eq!(report.verdict, pragmatic::evidence::Verdict::Failed);
+    let csv = render_csv(&bundle, &report);
+    assert!(
+        !csv.contains("FORGED"),
+        "the edited records never reach the CSV"
+    );
+    assert!(csv
+        .lines()
+        .skip(1)
+        .all(|l| l.starts_with("\"FAILED\",\"no\",")));
+    // With the journal unreadable, the stated records are all there is,
+    // and every row says FAILED.
+    bundle.journal.bytes.truncate(100);
+    let report = verify(&bundle, &TrustPolicy::default(), &NoTsaVerifier);
+    let csv = render_csv(&bundle, &report);
+    assert!(csv.contains("FORGED"));
+    assert!(csv.lines().skip(1).all(|l| l.starts_with("\"FAILED\",")));
 }
 
 #[test]

@@ -77,7 +77,10 @@ canonical form, and the bundle signature is computed over it.
 
 Unsigned fields (`generated_at`, `generator`, `requested_by`,
 `independent`) are informational. Every time a verifier reports comes from
-a signed structure.
+a signed structure. Only the bundle signature covers `generator`,
+`requested_by`, `redaction` and `verification_spec`, so a verifier
+presents them as unverified claims unless that signature verified with a
+pinned log key, and a verifier that pins a log key requires it (step 1).
 
 ### 3.1 `journal`
 
@@ -103,7 +106,9 @@ and chain head (section 5), checked in step 2.
 `mode` names the automatic rule the generator applied: nothing, slots in
 which a personal-data or secret detector matched (and slots holding binary
 attachments, which detectors cannot inspect), slots holding binary
-attachments, or every slot. Slots can also be withheld on explicit
+attachments, or every slot. A slot that starts like JSON but cannot be read
+to its end is treated as holding an attachment by the `detectors` and
+`binary` rules: what was not read is never assumed clean. Slots can also be withheld on explicit
 request, so `redacted_slots` is authoritative and `mode` is
 informational. `detectors` names the detectors applied.
 `patterns_sha256` is the SHA-256 of the canonical JSON array of the
@@ -249,6 +254,18 @@ When the server names runs by HMAC (`anchor_run_ids = "hmac"`),
 carry `HMAC-SHA-256(k_run, run_id)`. A log reader or witness then never
 learns run ids, while the bundle holder can recompute the leaf.
 
+That privacy has a cost a verifier MUST report. The bundle supplies
+`k_run`, and nothing binds it to the run: a log operator can anchor a
+rewritten journal for the same run as a fresh leaf chain under a new key,
+and the run's earlier leaves, under the old key, look like any other run's.
+So for a bundle with `anchor_id` set, hidden or re-keyed anchors cannot be
+detected, not even with the full log: a verifier reports
+`anchor_id_unbound` (warning, step 7), and the full-log audit of step 11
+fails with `log_unauditable` instead of passing. Runs whose anchors must be
+auditable for omission are anchored with plain ids. (A run id bound to the
+log key by a verifiable random function would keep both properties; it is
+planned, not part of this format.)
+
 ### 6.3 Checkpoints and signatures
 
 A checkpoint is a C2SP `tlog-checkpoint`: the body is three lines, each
@@ -257,7 +274,11 @@ root in base64 (further lines are extensions). It is wrapped in a C2SP
 `signed-note`: the body, a blank line, and signature lines, each the
 character U+2014 EM DASH, a space, the key name, a space, and
 `base64(key id ‖ signature)`. The log signs with Ed25519 (signed-note type
-`0x01`) under its origin as key name.
+`0x01`) under its origin as key name. Its key would sign any origin line,
+so a verifier that pins a log key MUST also require that the key which
+verifies a checkpoint is named for that checkpoint's origin (step 8):
+otherwise the log could fork under a renamed origin, signed by the same
+key, where no witness history for its real origin applies.
 
 A cosignature is a C2SP `cosignature/v1` line (type `0x04`):
 `base64(key id ‖ u64 big-endian timestamp ‖ signature)`, where the
@@ -309,17 +330,24 @@ A verifier performs every step and reports every finding, each with its
 code. Codes marked *failure* make the verdict `FAILED`; the others do not.
 
 1. **Strict JSON, known keys** (section 2): `bundle_json`,
-   `bundle_schema` (failures). **Bundle signature:** if `signature` is
-   null, report it unsigned (`unsigned`, info). If its `public_key` is the
-   key of a pinned log key (with the same key id), the signature MUST
-   verify with it (`bundle_signature`, failure). Otherwise it MUST verify
-   with the key it names (`bundle_signature`, failure) and is reported as
-   operator-asserted (`operator_asserted`, info).
-2. **Journal.** Decode the journal (section 5); undecodable is
-   `journal_parse`, a format 1 journal `journal_format`, and any bytes
-   after the last complete frame `journal_trailing_bytes` (failures).
-   Recompute `entries` and `head`: `entries_mismatch`, `head_mismatch`
-   (failures).
+   `bundle_schema` (failures). **Bundle signature:** if its `public_key`
+   is the key of a pinned log key (with the same key id), the signature
+   MUST verify with it (`bundle_signature`, failure). Otherwise a signature
+   MUST verify with the key it names (`bundle_signature`, failure). When
+   log keys are pinned, the bundle MUST be signed by one of them: a
+   pinned log key says which log the bundle comes from, and that log signs
+   its bundles, so an unsigned bundle or one signed by any other key fails
+   (`bundle_signature`). With no log key pinned, an unsigned bundle is
+   reported as such (`unsigned`, info) and a valid signature by an unpinned
+   key as operator-asserted (`operator_asserted`, info).
+2. **Journal.** For a directory bundle, the verifier reads `evidence.json`
+   and the journal file only if each is a regular file (not a symbolic
+   link, FIFO or device; the directory comes from the party being
+   audited) of a size a bundle can have (`bundle_file`, failure). Decode
+   the journal (section 5); undecodable is `journal_parse`, a format 1
+   journal `journal_format`, and any bytes after the last complete frame
+   `journal_trailing_bytes` (failures). Recompute `entries` and `head`:
+   `entries_mismatch`, `head_mismatch` (failures).
 3. **Chain.** Every chain link, commitment and ref verifies (`chain`,
    failure).
 4. **Withheld slots.** `redacted_slots` equals exactly the set of state 3
@@ -333,7 +361,9 @@ code. Codes marked *failure* make the verdict `FAILED`; the others do not.
    (section 4), compared in canonical form (`records_mismatch`, failure).
 7. **Run id.** The journal's first entry is a `run.start` note whose
    `run_id` equals `run_id`, and every anchor's leaf carries the run's id
-   (section 6.2) (`run_id_mismatch`, failure).
+   (section 6.2) (`run_id_mismatch`, failure). A bundle with `anchor_id`
+   set is reported as one whose hidden anchors cannot be detected
+   (`anchor_id_unbound`, warning; section 6.2).
 8. **Anchors.** If there are none, report it (`no_anchors`, info) and go
    to step 10. Otherwise `latest_checkpoint` MUST be a checkpoint
    (`anchor_consistency`, failure), and for each anchor:
@@ -355,8 +385,9 @@ code. Codes marked *failure* make the verdict `FAILED`; the others do not.
      anchor's `leaf_index`, `seq` and `leaf_index` increase, and `entries`
      never decreases (`anchor_chain`);
    - if log keys are pinned, the checkpoint (and `latest_checkpoint`) is
-     signed by one of them under the signed-note rules (`log_signature`);
-     otherwise its signature is operator-asserted.
+     signed by one of them under the signed-note rules, and a key that
+     signed it is named for the checkpoint's origin (`log_signature`;
+     section 6.3); otherwise its signature is operator-asserted.
 
    All of these are failures.
 9. **Witnesses.** Classify each witness as *trusted*, *self-asserted* or
@@ -375,14 +406,19 @@ code. Codes marked *failure* make the verdict `FAILED`; the others do not.
      run with the token and certificates written to a fresh directory only
      the verifier can read (mode 0700), files named by a counter, the
      arguments passed directly (never through a shell), every path
-     absolute, and the digest checked to be 64 lowercase hex digits. Each
-     pinned root is tried in turn; the operator is that root's. A token
-     that verifies against none is self-asserted (`tsa_untrusted`,
-     warning); one that could not be checked (no OpenSSL) is self-asserted
-     too (`tsa_unchecked`, warning). The reported time is `genTime` plus
-     the token's accuracy. A trusted token whose bundle `operator`
-     disagrees with the root's operator is reported (`operator_mismatch`,
-     warning).
+     absolute, and the digest checked to be 64 lowercase hex digits. Only
+     an OpenSSL whose `ts` command takes `-attime` is used (LibreSSL's does
+     not, so it cannot check a token at its signing time). Each pinned root
+     is tried in turn; the operator is that root's. A token is rejected by
+     a root only when OpenSSL ran the verification and reported it failed
+     (`Verification: FAILED`); a token that verifies against no root is
+     self-asserted (`tsa_untrusted`, warning). One that could not be
+     checked (no usable OpenSSL, or OpenSSL did not run the check, as when
+     it answers with a usage message) is self-asserted too
+     (`tsa_unchecked`, warning), and is never reported as rejected by the
+     roots. The token's time is `genTime` plus its accuracy. A trusted
+     token whose bundle `operator` disagrees with the root's operator is
+     reported (`operator_mismatch`, warning).
    - `cosignature`: the line MUST parse as a signature line naming the
      witness's `name` (`witness_malformed`, failure). It is trusted if a
      pinned witness key with that name and key id verifies it over the
@@ -393,31 +429,75 @@ code. Codes marked *failure* make the verdict `FAILED`; the others do not.
      outside its key's window is self-asserted (`witness_key_expired`,
      warning). The reported time is the cosignature's timestamp.
    - The checkpoint's server signature is operator-controlled.
+   - **The anchor's time.** An anchor's prefix existed no later than the
+     time at least the minimum number of distinct trusted operators vouch
+     for: take each trusted operator's earliest witness time, and of
+     those the k-th earliest, where k is the minimum. The plain earliest
+     would let one operator (a compromised witness, a TSA with a wrong
+     clock) backdate the anchor alone. With fewer than k trusted operators
+     giving a time, the anchor reports none.
 10. **Independence.** An anchor is independent when it passed every check
     of step 8 and its trusted witnesses come from at least the minimum
     number of distinct operators, after aliasing (section 7). Then:
     - `VERIFIED` (exit 0) when an independent anchor's `entries` equals the
       journal's length;
     - `VERIFIED (PARTIAL)` (exit 2) when independent anchors cover only a
-      prefix, reporting the unanchored suffix's length;
-    - `UNANCHORED` (exit 3) when no anchor is independent;
-    - `FAILED` (exit 1) when any failure was found, whatever else holds.
-11. **Full-log audit** (optional). With the full anchor log (`--log`, the
-    file form `{"leaves": [<hex leaf data>...]}` with every leaf from index
-    0): its first `tree_size` leaves (the latest checkpoint's size) MUST
-    hash to the latest checkpoint's root, and each bundle anchor's leaf
-    MUST equal the log's leaf at its index (`log_mismatch`, failure).
-    Every leaf among them that carries this run's id MUST be one of the
-    bundle's anchors (`anchor_omitted`, failure): this detects a bundle
-    that hides an anchor. A run leaf past the latest checkpoint is
-    reported (`log_newer`, warning). With a witness's cosigned history
-    (`--witness-log`, the file form `{"witness": <cosigner name>,
-    "origin": <log origin>, "checkpoints": [<signed note>...]}`): a history
-    for another origin is skipped (`witness_log_origin`, warning); the
-    history and every bundle checkpoint MUST agree on the root of every
-    tree size both name (`witness_log_fork`, failure: the log showed two
-    histories); and every bundle checkpoint that carries this witness's
-    cosignature MUST be in its history (`witness_log_mismatch`, failure).
+      prefix of at least one entry, reporting the unanchored suffix's
+      length;
+    - `UNANCHORED` (exit 3) when no anchor is independent, or the only
+      independent anchors cover 0 entries: such an anchor commits only to
+      the genesis head, which every unkeyed journal shares, so it vouches
+      for no content;
+    - `FAILED` (exit 1) when any failure was found, whatever else holds,
+      including an audit of step 11 that was asked for and could not be
+      completed.
+11. **Full-log audits** (optional). Each audit asked for MUST be
+    completed; one that cannot be is a failure, never a skipped step.
+    - **The full log** (`--log`, the file form `{"leaves": [<hex leaf
+      data>...]}` with every leaf from index 0): its first `tree_size`
+      leaves (the latest checkpoint's size) MUST hash to the latest
+      checkpoint's root, and each bundle anchor's leaf MUST equal the
+      log's leaf at its index (`log_mismatch`, failure). Every leaf among
+      them that carries this run's id MUST be one of the bundle's anchors
+      (`anchor_omitted`, failure): this detects a bundle that hides an
+      anchor. A run leaf past the latest checkpoint is reported
+      (`log_newer`, warning). For a bundle with `anchor_id` set, that
+      cannot be shown (section 6.2), and the audit fails with
+      `log_unauditable`. The log is checked against the latest
+      checkpoint, a tree head the operator chose: on its own it cannot
+      show that the operator did not fork the log; the witness history
+      below does.
+    - **A witness's cosigned history** (`--witness-log`, the file form
+      `{"witness": <cosigner name>, "origin": <log origin>,
+      "checkpoints": [<signed note>...]}`). A witness cosigns a checkpoint
+      only after checking that it extends the last one it cosigned, so its
+      history is one chain of consistent tree heads; the audit decides
+      whether the bundle's tree is on it.
+      - The history MUST be for the bundle's origin, and so must each of
+        its checkpoints (`witness_log_origin`, failure).
+      - It MUST be the witness's own: at least one checkpoint, and every
+        checkpoint signed, under the signed-note rules, by a pinned
+        witness key whose name is the history's `witness`, within the
+        key's validity window (`witness_log_untrusted`, failure). A
+        history whoever handed it over could have written says nothing.
+      - The tree heads the bundle vouches for are the latest checkpoint,
+        each anchor's checkpoint (each proven consistent with the latest in
+        step 8), and, when the full log was given and matched the latest
+        checkpoint, the root of the log's first `s` leaves for every size
+        `s` the log reaches. The history and these MUST agree on the root
+        of every tree size both name (`witness_log_fork`, failure: the log
+        showed two histories), and the history MUST NOT name two roots for
+        one size (`witness_log_fork`).
+      - The bundle's tree MUST be linked to the history: the witness
+        cosigned the latest checkpoint itself, or the history's largest
+        tree size is one the bundle vouches for (as above) with the same
+        root (`witness_log_mismatch`, failure). Without the full log, a
+        fork at tree sizes the witness never cosigned, or a witness that
+        has since cosigned larger trees, can only be checked against the
+        log's leaves, so such a bundle is not linked until `--log` reaches
+        the witness's largest tree.
+      - Every bundle checkpoint that carries this witness's cosignature
+        MUST be in its history (`witness_log_mismatch`, failure).
 12. **Presentation.** Text from the bundle is data: a verifier MUST NOT
     print it in a way that can be read as its own output (control
     characters are escaped) and MUST NOT act on it. `pragmatic
@@ -430,6 +510,7 @@ code. Codes marked *failure* make the verdict `FAILED`; the others do not.
 | `bundle_json` | failure | 1 |
 | `bundle_schema` | failure | 1 |
 | `bundle_signature` | failure | 1 |
+| `bundle_file` | failure | 2 |
 | `unsigned` | info | 1 |
 | `operator_asserted` | info | 1 |
 | `journal_missing` | failure | 2 |
@@ -445,6 +526,7 @@ code. Codes marked *failure* make the verdict `FAILED`; the others do not.
 | `invalid_erasure_note` | failure | 5 |
 | `records_mismatch` | failure | 6 |
 | `run_id_mismatch` | failure | 7 |
+| `anchor_id_unbound` | warning | 7 |
 | `no_anchors` | info | 8 |
 | `anchor_leaf` | failure | 8 |
 | `anchor_head_mismatch` | failure | 8 |
@@ -467,11 +549,15 @@ code. Codes marked *failure* make the verdict `FAILED`; the others do not.
 | `log_newer` | warning | 11 |
 | `witness_log_fork` | failure | 11 |
 | `witness_log_mismatch` | failure | 11 |
-| `witness_log_origin` | warning | 11 |
+| `witness_log_origin` | failure | 11 |
+| `witness_log_untrusted` | failure | 11 |
+| `log_unauditable` | failure | 11 |
 
-The reference verifier (`tools/verify_evidence.py`) has no Ed25519
-implementation in the Python standard library, so it reports the bundle
-signature, checkpoint signatures and cosignatures as not checked (code
-`not_checked`, info), classifies every cosignature as self-asserted, and
-counts only RFC 3161 witnesses towards independence. Use `pragmatic
-verify-evidence` for the Ed25519 checks.
+Both verifiers perform every check above, the reference verifier
+(`tools/verify_evidence.py`) with its own Ed25519 (RFC 8032, written in
+Python against the same acceptance rules), strict DER and signed-note
+parsers, so that two programs that share no code must agree on a bundle.
+
+A verifier exits 64, distinct from every verdict, when its own inputs are
+at fault: a trust input (root, key, log or witness history) that is
+malformed or cannot be read, or a bundle path that cannot be read.

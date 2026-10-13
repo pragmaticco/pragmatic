@@ -22,10 +22,13 @@ pub enum Redact {
     /// Withhold nothing.
     None,
     /// Withhold every slot in which one of these detectors finds a match,
-    /// and every slot holding binary content (attachments are never
-    /// scanned, so they are never assumed clean).
+    /// and every slot that holds or may hold binary content (attachments
+    /// are never scanned, so they are never assumed clean).
     Detectors(Vec<Kind>),
-    /// Withhold every slot holding binary content (design 4.10).
+    /// Withhold every slot that holds binary content (design 4.10), or may:
+    /// a slot that starts like JSON but could not be read to its end is
+    /// withheld too, since what the scan did not reach is never assumed to
+    /// be free of attachments.
     Binary,
     /// Withhold every slot: the bundle shows structure, timing and
     /// integrity, and no content at all.
@@ -48,10 +51,10 @@ impl Redact {
         match self {
             Redact::None => false,
             Redact::All => true,
-            Redact::Binary => binary::contains_binary(bytes),
+            Redact::Binary => binary::scan(bytes).may_hold_binary(),
             Redact::Detectors(kinds) => {
                 let scanned = binary::scan(bytes);
-                scanned.has_binary()
+                scanned.may_hold_binary()
                     || scanned
                         .text
                         .is_some_and(|t| !redact::find(&t, kinds).is_empty())

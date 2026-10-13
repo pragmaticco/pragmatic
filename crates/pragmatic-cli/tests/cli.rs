@@ -317,7 +317,9 @@ fn local_evidence_round_trip() {
         "-o",
         html.to_str().unwrap(),
     ]);
-    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    // render-evidence exits with the verdict's code, as verify-evidence.
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stdout(&o).contains("UNANCHORED"));
     let page = std::fs::read_to_string(&html).unwrap();
     assert!(page.contains("UNANCHORED \u{b7} exit 3"));
     let csv = dir.join("r.csv");
@@ -329,10 +331,10 @@ fn local_evidence_round_trip() {
         "-o",
         csv.to_str().unwrap(),
     ]);
-    assert_eq!(code(&o), 0, "{}", stderr(&o));
-    assert!(std::fs::read_to_string(&csv)
-        .unwrap()
-        .starts_with("cursor,at_ns"));
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    let rows = std::fs::read_to_string(&csv).unwrap();
+    assert!(rows.starts_with("verdict,anchored,cursor,at_ns"));
+    assert!(rows.contains("\r\n\"UNANCHORED\",\"no\",\"0\","));
 
     // Withholding on request.
     let o = pragmatic(&[
@@ -599,7 +601,10 @@ fn adversarial_omitted_anchor_caught_with_log() {
     let file = variant(&dir, "omitted.json", |b| {
         b.anchors.pop();
     });
+    // The variant is unsigned, so the log key stays unpinned (a pinned log
+    // key requires the bundle's signature).
     let mut flags = full_trust();
+    flags.truncate(6);
     flags.push("--no-openssl".into());
     flags.extend(["--min-operators".into(), "1".into()]);
     // Without the log the bundle looks like a partial anchor.

@@ -4,7 +4,10 @@
 //! bundle against trust the auditor supplies on the command line (pinned
 //! TSA roots, witness keys and log keys) and exits with the verdict's code:
 //! 0 verified, 2 verified for a prefix only, 3 unanchored, 1 failed.
-//! `render-evidence` turns a bundle into a page or a spreadsheet.
+//! `render-evidence` turns a bundle into a page or a spreadsheet, and exits
+//! with the same code. A trust input that is malformed or cannot be read is
+//! a usage error (exit 64), never a verdict, so a typo in a CI gate's flags
+//! cannot read as "the bundle is forged".
 //!
 //! Every string in a report that came from the bundle is printed through
 //! `text::sanitize`, so a bundle cannot put escape sequences on the
@@ -14,9 +17,9 @@ use std::path::{Path, PathBuf};
 
 use pragmatic::encoding::hex_decode_exact;
 use pragmatic::evidence::{
-    self, AnchorLog, Audit, Bundle, CheckStatus, EvidenceReport, NoTsaVerifier, Redact, Severity,
-    SignatureStatus, TrustPolicy, TsaRoot, TsaVerifier, Verdict, VerificationSpec, WitnessClass,
-    WitnessKey, WitnessLog, DIRECTORY_BUNDLE_FILE, DIRECTORY_THRESHOLD,
+    self, AnchorLog, Audit, Bundle, CheckStatus, Code, EvidenceReport, NoTsaVerifier, Redact,
+    Severity, SignatureStatus, TrustPolicy, TsaRoot, TsaVerifier, Verdict, VerificationSpec,
+    WitnessClass, WitnessKey, WitnessLog, DIRECTORY_BUNDLE_FILE, DIRECTORY_THRESHOLD,
 };
 use pragmatic::note::{SignatureType, VerifierKey};
 use pragmatic::redact::Kind;
@@ -27,7 +30,7 @@ use pragmatic_console::{render_csv, render_evidence};
 
 use crate::args::{journal_key, Args, Usage};
 use crate::journals::backend;
-use crate::openssl::OpenSslTsa;
+use crate::openssl::{Found, OpenSslTsa};
 use crate::Failure;
 
 /// The normative format and verification procedure, as shipped with this
@@ -149,7 +152,7 @@ pub fn build(args: &Args) -> Result<(), Failure> {
     let written = if json.len() as u64 > DIRECTORY_THRESHOLD {
         write_directory(&out, &mut bundle)?
     } else {
-        std::fs::write(&out, json).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+        crate::output::write(&out, json.as_bytes())?;
         out.display().to_string()
     };
     println!(
@@ -196,34 +199,41 @@ const TRUST_FLAGS: &[&str] = &[
 ];
 
 /// A vkey given inline, or the path of a file holding one.
-fn read_vkey(value: &str) -> Result<VerifierKey, String> {
+fn read_vkey(value: &str) -> Result<VerifierKey, Usage> {
     let text = if value.contains('+') {
         value.to_string()
     } else {
-        std::fs::read_to_string(value).map_err(|e| format!("cannot read key file {value}: {e}"))?
+        std::fs::read_to_string(value)
+            .map_err(|e| Usage(format!("cannot read key file {}: {e}", sanitize(value))))?
     };
-    VerifierKey::parse(text.trim()).map_err(|e| format!("{value}: {e}"))
+    VerifierKey::parse(text.trim()).map_err(|e| Usage(format!("{}: {e}", sanitize(value))))
 }
 
 /// `--witness-key NAME=VKEY` (or `NAME=HEX`, a 32-byte cosignature key
 /// whose cosigner name is `NAME`). `NAME` is the operator the witness
 /// counts for.
-fn witness_key(value: &str) -> Result<WitnessKey, String> {
-    let (operator, key) = value
-        .split_once('=')
-        .ok_or_else(|| format!("--witness-key takes NAME=VKEY, not {value:?}"))?;
+fn witness_key(value: &str) -> Result<WitnessKey, Usage> {
+    let (operator, key) = value.split_once('=').ok_or_else(|| {
+        Usage(format!(
+            "--witness-key takes NAME=VKEY, not {:?}",
+            sanitize(value)
+        ))
+    })?;
     if operator.trim().is_empty() {
-        return Err("--witness-key needs an operator name before '='".into());
+        return Err(Usage(
+            "--witness-key needs an operator name before '='".into(),
+        ));
     }
     let key = match hex_decode_exact::<32>(key) {
         Ok(raw) => VerifierKey::new(operator, SignatureType::CosignatureV1, raw)
-            .map_err(|e| format!("--witness-key {operator}: {e}"))?,
+            .map_err(|e| Usage(format!("--witness-key {}: {e}", sanitize(operator))))?,
         Err(_) => read_vkey(key)?,
     };
     if key.signature_type() != SignatureType::CosignatureV1 {
-        return Err(format!(
-            "--witness-key {operator}: a witness key must be a cosignature/v1 key (type 0x04)"
-        ));
+        return Err(Usage(format!(
+            "--witness-key {}: a witness key must be a cosignature/v1 key (type 0x04)",
+            sanitize(operator)
+        )));
     }
     Ok(WitnessKey {
         operator: operator.to_string(),
@@ -235,7 +245,7 @@ fn witness_key(value: &str) -> Result<WitnessKey, String> {
 
 /// `--tsa-roots [OPERATOR=]FILE`: the operator defaults to the file's
 /// name without its extension.
-fn tsa_root(value: &str) -> Result<TsaRoot, String> {
+fn tsa_root(value: &str) -> Result<TsaRoot, Usage> {
     let (operator, path) = match value.split_once('=') {
         Some((op, p)) if !Path::new(value).exists() => (op.to_string(), PathBuf::from(p)),
         _ => {
@@ -248,7 +258,10 @@ fn tsa_root(value: &str) -> Result<TsaRoot, String> {
         }
     };
     if !path.is_file() {
-        return Err(format!("--tsa-roots: {} is not a file", path.display()));
+        return Err(Usage(format!(
+            "--tsa-roots: {} is not a file",
+            path.display()
+        )));
     }
     Ok(TsaRoot { operator, path })
 }
@@ -272,10 +285,11 @@ fn policy(args: &Args) -> Result<TrustPolicy, Failure> {
     for v in args.values("--log-key") {
         let key = read_vkey(v)?;
         if key.signature_type() != SignatureType::Ed25519 {
-            return Err(Failure::Error(format!(
+            return Err(Usage(format!(
                 "--log-key {}: a log key must be an Ed25519 note key (type 0x01)",
                 sanitize(v)
-            )));
+            ))
+            .into());
         }
         p.log_keys.push(key);
     }
@@ -288,22 +302,30 @@ fn policy(args: &Args) -> Result<TrustPolicy, Failure> {
     Ok(p)
 }
 
-fn audit(args: &Args) -> Result<Audit, Failure> {
-    let read = |p: &str| std::fs::read(p).map_err(|e| format!("cannot read {p}: {e}"));
+fn audit(args: &Args) -> Result<Audit, Usage> {
+    let read = |flag: &str, p: &str| {
+        std::fs::read(p).map_err(|e| Usage(format!("{flag}: cannot read {}: {e}", sanitize(p))))
+    };
     let log = match args.value("--log") {
-        Some(p) => Some(AnchorLog::from_json(&read(p)?).map_err(|e| format!("--log {p}: {e}"))?),
+        Some(p) => Some(
+            AnchorLog::from_json(&read("--log", p)?)
+                .map_err(|e| Usage(format!("--log {}: {e}", sanitize(p))))?,
+        ),
         None => None,
     };
     let mut witness_logs = Vec::new();
     for p in args.values("--witness-log") {
-        witness_logs
-            .push(WitnessLog::from_json(&read(p)?).map_err(|e| format!("--witness-log {p}: {e}"))?);
+        witness_logs.push(
+            WitnessLog::from_json(&read("--witness-log", p)?)
+                .map_err(|e| Usage(format!("--witness-log {}: {e}", sanitize(p))))?,
+        );
     }
     Ok(Audit { log, witness_logs })
 }
 
-/// The TSA verifier: OpenSSL when it is on `PATH` (required with
-/// `--openssl`), nothing with `--no-openssl`.
+/// The TSA verifier: the first OpenSSL on `PATH` that can check tokens
+/// (required with `--openssl`), nothing with `--no-openssl`. Returns it
+/// and a line for the report.
 fn tsa(args: &Args) -> Result<(Box<dyn TsaVerifier>, String), Failure> {
     if args.has("--openssl") && args.has("--no-openssl") {
         return Err(Usage("--openssl and --no-openssl contradict each other".into()).into());
@@ -314,56 +336,164 @@ fn tsa(args: &Args) -> Result<(Box<dyn TsaVerifier>, String), Failure> {
             "not used (--no-openssl): RFC 3161 tokens are not checked".into(),
         ));
     }
-    match OpenSslTsa::from_path() {
-        Some(o) => {
-            let about = format!(
-                "{} ({})",
-                o.bin().display(),
-                o.version().unwrap_or_else(|| "version unknown".into())
-            );
+    match OpenSslTsa::find() {
+        Found::Usable(o, version) => {
+            let about = format!("{} ({version})", o.bin().display());
             Ok((Box::new(o), about))
         }
-        None if args.has("--openssl") => {
-            Err(Failure::Error("--openssl: no openssl on PATH".into()))
+        Found::Unusable(bin, why) if args.has("--openssl") => Err(Usage(format!(
+            "--openssl: {} cannot check time-stamp tokens: {why}; put OpenSSL 3 on PATH",
+            bin.display()
+        ))
+        .into()),
+        Found::Missing if args.has("--openssl") => {
+            Err(Usage("--openssl: no openssl on PATH".into()).into())
         }
-        None => Ok((
+        Found::Unusable(bin, why) => Ok((
+            Box::new(NoTsaVerifier),
+            format!(
+                "{} cannot check time-stamp tokens ({why}): RFC 3161 tokens are not checked; put OpenSSL 3 on PATH",
+                bin.display()
+            ),
+        )),
+        Found::Missing => Ok((
             Box::new(NoTsaVerifier),
             "not found on PATH: RFC 3161 tokens are not checked".into(),
         )),
     }
 }
 
-/// Read a bundle file, or a directory bundle.
-fn load(path: &Path) -> Result<Vec<u8>, String> {
-    let file = if path.is_dir() {
-        path.join(DIRECTORY_BUNDLE_FILE)
-    } else {
-        path.to_path_buf()
-    };
-    std::fs::read(&file).map_err(|e| format!("cannot read {}: {e}", file.display()))
+/// The most bytes read from a file of a directory bundle. A directory
+/// bundle comes from the party being audited, and its journal can be as
+/// large as a run (gigabytes); this only refuses what no run produces.
+const MAX_BUNDLE_FILE: u64 = 16 << 30;
+
+/// Why a file of a directory bundle was not read.
+enum Unread {
+    /// It is not there.
+    Missing,
+    /// It is a link, a FIFO, a device or larger than any run: a finding
+    /// (`bundle_file`) about the bundle.
+    Refused(String),
+    /// Reading it failed: the auditor's problem, not the bundle's.
+    Io(String),
 }
 
-/// Parse and verify, attaching a directory bundle's journal file.
+/// Read a file inside a directory bundle. The directory came from the
+/// party being audited, and archives keep symbolic links and FIFOs: a link
+/// to `/dev/zero` would exhaust memory and a FIFO would block forever, so
+/// only a regular file (by `lstat`, and again on the open handle) of at
+/// most [`MAX_BUNDLE_FILE`] bytes is read.
+fn read_bundle_file(path: &Path) -> Result<Vec<u8>, Unread> {
+    use std::io::Read;
+    let shown = path.display();
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Unread::Missing),
+        Err(e) => return Err(Unread::Io(format!("cannot read {shown}: {e}"))),
+    };
+    if !meta.file_type().is_file() {
+        return Err(Unread::Refused(format!(
+            "{shown} is not a regular file (a symbolic link, FIFO or device in a bundle directory is never read)"
+        )));
+    }
+    if meta.len() > MAX_BUNDLE_FILE {
+        return Err(Unread::Refused(format!(
+            "{shown} is {} bytes, more than any bundle holds",
+            meta.len()
+        )));
+    }
+    let file =
+        std::fs::File::open(path).map_err(|e| Unread::Io(format!("cannot read {shown}: {e}")))?;
+    let opened = file
+        .metadata()
+        .map_err(|e| Unread::Io(format!("cannot read {shown}: {e}")))?;
+    if !opened.is_file() || !same_file(&meta, &opened) {
+        return Err(Unread::Refused(format!(
+            "{shown} changed while it was being opened"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    file.take(MAX_BUNDLE_FILE + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| Unread::Io(format!("cannot read {shown}: {e}")))?;
+    if bytes.len() as u64 > MAX_BUNDLE_FILE {
+        return Err(Unread::Refused(format!("{shown} grew past the size limit")));
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(_: &std::fs::Metadata, _: &std::fs::Metadata) -> bool {
+    true
+}
+
+/// Parse and verify, attaching a directory bundle's journal file. The
+/// bundle path is the auditor's own choice and is read as given (a pipe
+/// from process substitution works); files inside a directory bundle are
+/// read as [`read_bundle_file`] says.
 fn check(path: &Path, args: &Args) -> Result<(Option<Bundle>, EvidenceReport, String), Failure> {
     let policy = policy(args)?;
     let audit = audit(args)?;
     let (tsa, about) = tsa(args)?;
-    let bytes = load(path)?;
-    let (bundle, report) = match Bundle::from_json(&bytes) {
-        Ok(mut b) => {
-            if path.is_dir() {
-                if let evidence::JournalEncoding::File { path: name, .. } = &b.journal.encoding {
-                    let journal = std::fs::read(path.join(name))
-                        .map_err(|e| format!("cannot read the bundle's journal file: {e}"))?;
-                    b.attach_journal(journal)?;
-                }
+    let min = policy.min_operators;
+    let bytes = if path.is_dir() {
+        let file = path.join(DIRECTORY_BUNDLE_FILE);
+        match read_bundle_file(&file) {
+            Ok(b) => b,
+            Err(Unread::Refused(why)) => {
+                return Ok((
+                    None,
+                    EvidenceReport::unreadable(Code::BundleFile, why, min),
+                    about,
+                ))
             }
-            let r = evidence::verify_with(&b, &policy, tsa.as_ref(), &audit);
-            (Some(b), r)
+            Err(Unread::Missing) => {
+                return Err(Usage(format!(
+                    "{} is a directory without {DIRECTORY_BUNDLE_FILE}: not a directory bundle",
+                    path.display()
+                ))
+                .into())
+            }
+            Err(Unread::Io(e)) => return Err(Usage(e).into()),
         }
-        Err(_) => evidence::verify_bytes(&bytes, &policy, tsa.as_ref(), &audit),
+    } else {
+        std::fs::read(path).map_err(|e| Usage(format!("cannot read {}: {e}", path.display())))?
     };
-    Ok((bundle, report, about))
+    let mut bundle = match Bundle::from_json(&bytes) {
+        Ok(b) => b,
+        Err(_) => {
+            let (_, report) = evidence::verify_bytes(&bytes, &policy, tsa.as_ref(), &audit);
+            return Ok((None, report, about));
+        }
+    };
+    if path.is_dir() {
+        if let evidence::JournalEncoding::File { path: name, .. } = &bundle.journal.encoding {
+            let failed = |code, why: String| EvidenceReport::unreadable(code, why, min);
+            match read_bundle_file(&path.join(name)) {
+                Ok(journal) => {
+                    if let Err(why) = bundle.attach_journal(journal) {
+                        let report = failed(Code::JournalMissing, why);
+                        return Ok((Some(bundle), report, about));
+                    }
+                }
+                // Absent: verification reports journal_missing.
+                Err(Unread::Missing) => {}
+                Err(Unread::Refused(why)) => {
+                    return Ok((Some(bundle), failed(Code::BundleFile, why), about))
+                }
+                Err(Unread::Io(e)) => return Err(Usage(e).into()),
+            }
+        }
+    }
+    let report = evidence::verify_with(&bundle, &policy, tsa.as_ref(), &audit);
+    Ok((Some(bundle), report, about))
 }
 
 // ---------------------------------------------------------------------------
@@ -396,36 +526,54 @@ fn print_report(
 ) {
     println!("pragmatic verify-evidence {}", file.display());
     println!();
+    // Only the bundle signature covers the generator's own fields; unless a
+    // pinned key verified it, they are claims anyone could have edited.
+    let signed = matches!(r.bundle_signature, SignatureStatus::Verified { .. });
+    let claim = if signed {
+        "signed by the log"
+    } else {
+        "unsigned claims"
+    };
     if let Some(b) = bundle {
         println!("run        {}", sanitize(&b.run_id));
         println!(
-            "journal    {} entries, {} withheld slot(s), redaction {}",
+            "journal    {} entries, {} withheld slot(s), redaction {} ({claim})",
             r.entries,
             b.redacted_slots.len(),
             sanitize(&b.redaction.mode)
         );
         println!(
-            "generator  {} for {} (unsigned claims)",
+            "generator  {} for {} ({claim})",
             sanitize(&b.generator),
             sanitize(&b.requested_by)
         );
         if let Some(s) = &b.verification_spec {
             let ours = spec().sha256;
             let note = if s.sha256 == ours {
-                "the procedure this verifier ships"
+                "its sha256 is that of the procedure this verifier ships"
             } else {
-                "differs from the procedure this verifier ships (see --explain)"
+                "its sha256 differs from the procedure this verifier ships (see --explain)"
             };
-            println!("spec       {} ({note})", sanitize(&s.url));
+            let url = if signed {
+                "url"
+            } else {
+                "url, an unverified claim:"
+            };
+            println!("spec       {note}; {url} {}", sanitize(&s.url));
         }
     }
+    let pinned = !args.values("--log-key").is_empty();
     let sig = match &r.bundle_signature {
         SignatureStatus::Verified { key } => {
             format!("verified with pinned log key {}", sanitize(key))
         }
+        SignatureStatus::OperatorAsserted if pinned => {
+            "signed by a key that is not the pinned log key".into()
+        }
         SignatureStatus::OperatorAsserted => {
             "valid for a key that is not pinned: operator-asserted (pass --log-key)".into()
         }
+        SignatureStatus::Unsigned if pinned => "unsigned, though a log key is pinned".into(),
         SignatureStatus::Unsigned => "unsigned".into(),
         SignatureStatus::Invalid => "INVALID".into(),
     };
@@ -521,7 +669,10 @@ fn print_report(
             "the journal's integrity checks pass, but no anchor has enough trusted operators"
                 .to_string()
         }
-        Verdict::Failed => format!("{} integrity failure(s)", r.failures().count()),
+        Verdict::Failed => format!(
+            "{} failure(s) of integrity or of an audit asked for",
+            r.failures().count()
+        ),
     };
     println!("{}: {summary} (exit {})", r.verdict.label(), r.exit_code());
 }
@@ -530,6 +681,14 @@ fn print_report(
 // render-evidence FILE --format html|csv
 // ---------------------------------------------------------------------------
 
+/// `render-evidence`: the page (verdict, checks, anchors, timeline) or the
+/// CSV of the records, written safely (see `output`), and the verdict's
+/// exit code, as `verify-evidence` gives it.
+///
+/// A bundle that fails verification is never written as CSV: a
+/// spreadsheet is what gets passed on, and it has no room for the report
+/// that says its rows are not what the journal holds. The page, which
+/// leads with the failure, is written.
 pub fn render(args: &Args) -> Result<(), Failure> {
     let mut allowed = TRUST_FLAGS.to_vec();
     allowed.extend(["--format", "--out"]);
@@ -554,6 +713,18 @@ pub fn render(args: &Args) -> Result<(), Failure> {
             sanitize(&why)
         )));
     };
+    if format == "csv" && report.verdict == Verdict::Failed {
+        return Err(Failure::Exit(
+            report.exit_code(),
+            format!(
+                "{} fails verification ({} failure(s)), so its records are not written as a \
+                 spreadsheet; `pragmatic verify-evidence` lists the failures, and --format html \
+                 writes the report",
+                file.display(),
+                report.failures().count()
+            ),
+        ));
+    }
     let out = args.path("--out").unwrap_or_else(|| {
         let stem = file
             .file_stem()
@@ -564,23 +735,22 @@ pub fn render(args: &Args) -> Result<(), Failure> {
     let content = if format == "html" {
         render_evidence(&bundle, &report)
     } else {
-        if report.verdict == Verdict::Failed {
-            eprintln!(
-                "warning: the bundle fails verification; the CSV shows its records as stated"
-            );
-        }
-        render_csv(&bundle)
+        render_csv(&bundle, &report)
     };
-    std::fs::write(&out, content).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+    crate::output::write(&out, content.as_bytes())?;
     println!(
-        "wrote {} ({}: {})",
+        "wrote {} ({}: {}) (exit {})",
         out.display(),
         report.verdict.label(),
         if format == "html" {
             "verification report and timeline"
         } else {
-            "one row per record"
-        }
+            "one row per entry, each with the verdict"
+        },
+        report.exit_code()
     );
-    Ok(())
+    match report.exit_code() {
+        0 => Ok(()),
+        code => Err(Failure::Silent(code)),
+    }
 }

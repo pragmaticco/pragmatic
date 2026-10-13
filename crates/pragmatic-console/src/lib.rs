@@ -9,7 +9,8 @@
 //!   branches and parallel regions as nested lanes, intents with their
 //!   results, erased, withheld and ref slots, notes, times, the
 //!   verification report and, when known, anchoring; format 1 runs
-//!   read-only).
+//!   read-only). Long timelines are shown a page at a time
+//!   ([`render_run_page`]).
 //! - [`render_index`]: the list of runs.
 //! - [`render_evidence`]: a bundle's verification report and timeline.
 //! - [`render_csv`]: a bundle's records for spreadsheets.
@@ -22,8 +23,11 @@
 //! reads it. Every page escapes all such text, contains no script, and
 //! carries a Content-Security-Policy that forbids loading anything, so
 //! opening a page makes no network request. Binary content is summarized
-//! by media type, size and SHA-256 and never inlined, and text is cut at
-//! 64 KiB per slot. The plain-text helpers escape control characters, so
+//! by media type, size and SHA-256 and never inlined, text is cut at
+//! 64 KiB per slot, and a page of a timeline holds at most
+//! [`PAGE_ENTRIES`] entries and about [`PAGE_BYTES`] of HTML, so a
+//! page stays a size a browser (or a server rendering it) can handle
+//! whatever the journal holds. The plain-text helpers escape control characters, so
 //! journal content printed to a terminal cannot drive it.
 //!
 //! The crate has no dependencies beyond the core.
@@ -37,7 +41,9 @@ pub mod text;
 
 pub use evidence::{render_csv, render_evidence};
 pub use index::{render_index, render_index_of, RunRow};
-pub use run::{render_run, AnchorStatus, RunView};
+pub use run::{
+    render_run, render_run_page, AnchorStatus, RunPage, RunView, PAGE_BYTES, PAGE_ENTRIES,
+};
 
 #[cfg(test)]
 mod tests;

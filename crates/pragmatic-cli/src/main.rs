@@ -23,6 +23,7 @@ mod args;
 mod evidence;
 mod journals;
 mod openssl;
+mod output;
 mod serve;
 
 use std::process::ExitCode;
@@ -67,7 +68,7 @@ USAGE:
     pragmatic runs    [--dir DIR]
     pragmatic show    RUN [--dir DIR]
     pragmatic verify  RUN|--all [--dir DIR]
-    pragmatic export  RUN [--dir DIR] [-o FILE]
+    pragmatic export  RUN [--dir DIR] [--from CURSOR] [-o FILE]
     pragmatic serve   [--dir DIR] [--port PORT]
     pragmatic erase   RUN (--cursor N [--slot K] | --match TEXT) --reason-code CODE
                       [--reason TEXT] [--dir DIR]
@@ -84,7 +85,8 @@ COMMANDS:
     runs             List every run journaled under DIR
     show             Print a run's timeline: attempts, branches, steps, notes
     verify           Print the full verification report; never writes
-    export           Write a self-contained HTML page of a run
+    export           Write a self-contained HTML page of a run (a long timeline
+                     is split into pages; --from picks the page that starts there)
     serve            Live console on http://127.0.0.1:PORT (default 7171)
     erase            Erase slot content under the run's write lock; records an
                      erasure note by local:<user>@<host>, unauthenticated
@@ -92,7 +94,8 @@ COMMANDS:
     verify-evidence  Verify a bundle offline against the roots and keys you pin.
                      Exit 0 VERIFIED, 2 VERIFIED (PARTIAL), 3 UNANCHORED, 1 FAILED
     render-evidence  Write a bundle's verification report and timeline (html)
-                     or its records (csv)
+                     or its records with the verdict on every row (csv; never for
+                     a bundle that fails). Exits with the verdict's code
 
 OPTIONS:
     --dir DIR        Journal directory (default: the current directory)
@@ -108,11 +111,13 @@ OPTIONS:
     --min-operators  Distinct trusted operators an anchor needs (default 2)
     --log FILE       The full anchor log, to find anchors a bundle leaves out
     --witness-log    A witness's cosigned history, to find split views
-    --openssl        Require openssl for RFC 3161 tokens (default: use it if on PATH)
+    --openssl        Require OpenSSL for RFC 3161 tokens (default: the first
+                     openssl on PATH that can check them; LibreSSL cannot)
     --explain        Print the verification procedure this verifier implements
 
-Usage errors exit 64. Nothing in a bundle is ever trusted: trust comes only from
-the roots and keys given on the command line.";
+Usage errors, including trust flags that are malformed or cannot be read, exit
+64. Nothing in a bundle is ever trusted: trust comes only from the roots and
+keys given on the command line.";
 
 fn dispatch(args: &Args) -> Result<(), Failure> {
     if args.has("--help") {
@@ -140,6 +145,14 @@ fn dispatch(args: &Args) -> Result<(), Failure> {
     }
 }
 
+/// Print an error. Messages quote journal content (a run id from a
+/// `run.start` note, a file name in the journal directory), so they pass
+/// through `sanitize` here, at the one place errors reach the terminal,
+/// rather than relying on every place that builds one.
+fn report(message: &str) {
+    eprintln!("error: {}", pragmatic_console::text::sanitize(message));
+}
+
 fn main() -> ExitCode {
     let result = Args::parse(std::env::args().skip(1))
         .map_err(Failure::from)
@@ -147,15 +160,15 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(Failure::Usage(m)) => {
-            eprintln!("error: {m}");
+            report(&m);
             ExitCode::from(64)
         }
         Err(Failure::Error(m)) => {
-            eprintln!("error: {m}");
+            report(&m);
             ExitCode::FAILURE
         }
         Err(Failure::Exit(code, m)) => {
-            eprintln!("error: {m}");
+            report(&m);
             ExitCode::from(code)
         }
         Err(Failure::Silent(code)) => ExitCode::from(code),

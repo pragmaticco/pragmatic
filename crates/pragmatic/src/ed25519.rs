@@ -599,6 +599,90 @@ fn words_sub(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
     out
 }
 
+/// Signing for tests only: honest RFC 8032 signatures from a seed, so
+/// tests elsewhere in the crate (evidence bundles, signed notes) can build
+/// logs, checkpoints and cosignatures, including hostile ones, without a
+/// signing dependency. Variable time and never compiled into the library.
+#[cfg(test)]
+pub(crate) mod test_signing {
+    use super::*;
+
+    /// The secret scalar of an RFC 8032 key: the first half of
+    /// SHA-512(seed), clamped (section 5.1.5).
+    pub(crate) fn secret_scalar(seed: &[u8; 32]) -> [u8; 32] {
+        let h = crate::sha512::sha512(seed);
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&h[..32]);
+        a[0] &= 248;
+        a[31] &= 127;
+        a[31] |= 64;
+        a
+    }
+
+    /// `(a b + c) mod L` for little-endian integers with `a b + c` below
+    /// 2^512, by schoolbook multiplication and [`reduce_scalar_wide`].
+    pub(crate) fn scalar_mul_add(a: &[u8; 32], b: &[u8; 32], c: &[u8; 32]) -> [u8; 32] {
+        let words = |x: &[u8; 32]| -> [u64; 4] {
+            std::array::from_fn(|i| u64::from_le_bytes(x[i * 8..i * 8 + 8].try_into().unwrap()))
+        };
+        let (a, b, c) = (words(a), words(b), words(c));
+        let mut wide = [0u64; 8];
+        wide[..4].copy_from_slice(&c);
+        for i in 0..4 {
+            let mut carry = 0u128;
+            for j in 0..4 {
+                let t = u128::from(a[i]) * u128::from(b[j]) + u128::from(wide[i + j]) + carry;
+                wide[i + j] = t as u64;
+                carry = t >> 64;
+            }
+            wide[i + 4] = carry as u64;
+        }
+        let mut bytes = [0u8; 64];
+        for (i, w) in wide.iter().enumerate() {
+            bytes[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+        }
+        reduce_scalar_wide(&bytes)
+    }
+
+    /// `[n]B`.
+    pub(super) fn base_mul(n: &[u8; 32]) -> Point {
+        double_scalar_mul(n, &base_point(), &[0; 32], &Point::IDENTITY)
+    }
+
+    /// `k = SHA-512(R ‖ A ‖ M) mod L`.
+    pub(crate) fn challenge(r: &[u8; 32], a: &[u8; 32], msg: &[u8]) -> [u8; 32] {
+        let mut h = Sha512::new();
+        h.update(r);
+        h.update(a);
+        h.update(msg);
+        reduce_scalar_wide(&h.finalize())
+    }
+
+    pub(crate) fn signature(r: &[u8; 32], s: &[u8; 32]) -> [u8; 64] {
+        let mut sig = [0u8; 64];
+        sig[..32].copy_from_slice(r);
+        sig[32..].copy_from_slice(s);
+        sig
+    }
+
+    /// The public key of the RFC 8032 key with this seed.
+    pub(crate) fn public_key(seed: &[u8; 32]) -> [u8; 32] {
+        base_mul(&secret_scalar(seed)).encode()
+    }
+
+    /// The RFC 8032 signature on `message` by the key with this seed.
+    pub(crate) fn sign(seed: &[u8; 32], message: &[u8]) -> [u8; 64] {
+        let a = secret_scalar(seed);
+        let pk = base_mul(&a).encode();
+        let mut nonce_input = crate::sha512::sha512(seed)[32..].to_vec();
+        nonce_input.extend_from_slice(message);
+        let r = reduce_scalar_wide(&crate::sha512::sha512(&nonce_input));
+        let r_bytes = base_mul(&r).encode();
+        let k = challenge(&r_bytes, &pk, message);
+        signature(&r_bytes, &scalar_mul_add(&k, &a, &r))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,62 +1001,16 @@ mod tests {
     const RFC8032_TEST1_SEED: &str =
         "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
 
-    /// The secret scalar of an RFC 8032 key: the first half of
-    /// SHA-512(seed), clamped (section 5.1.5).
-    fn secret_scalar(seed: &[u8; 32]) -> [u8; 32] {
-        let h = crate::sha512::sha512(seed);
-        let mut a = [0u8; 32];
-        a.copy_from_slice(&h[..32]);
-        a[0] &= 248;
-        a[31] &= 127;
-        a[31] |= 64;
-        a
-    }
+    use super::test_signing::{base_mul, challenge, scalar_mul_add, secret_scalar, signature};
 
-    /// `(a b + c) mod L` for little-endian integers with `a b + c` below
-    /// 2^512, by schoolbook multiplication and [`reduce_scalar_wide`].
-    fn scalar_mul_add(a: &[u8; 32], b: &[u8; 32], c: &[u8; 32]) -> [u8; 32] {
-        let words = |x: &[u8; 32]| -> [u64; 4] {
-            std::array::from_fn(|i| u64::from_le_bytes(x[i * 8..i * 8 + 8].try_into().unwrap()))
-        };
-        let (a, b, c) = (words(a), words(b), words(c));
-        let mut wide = [0u64; 8];
-        wide[..4].copy_from_slice(&c);
-        for i in 0..4 {
-            let mut carry = 0u128;
-            for j in 0..4 {
-                let t = u128::from(a[i]) * u128::from(b[j]) + u128::from(wide[i + j]) + carry;
-                wide[i + j] = t as u64;
-                carry = t >> 64;
-            }
-            wide[i + 4] = carry as u64;
-        }
-        let mut bytes = [0u8; 64];
-        for (i, w) in wide.iter().enumerate() {
-            bytes[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
-        }
-        reduce_scalar_wide(&bytes)
-    }
-
-    /// `[n]B`.
-    fn base_mul(n: &[u8; 32]) -> Point {
-        double_scalar_mul(n, &base_point(), &[0; 32], &Point::IDENTITY)
-    }
-
-    /// `k = SHA-512(R ‖ A ‖ M) mod L`.
-    fn challenge(r: &[u8; 32], a: &[u8; 32], msg: &[u8]) -> [u8; 32] {
-        let mut h = Sha512::new();
-        h.update(r);
-        h.update(a);
-        h.update(msg);
-        reduce_scalar_wide(&h.finalize())
-    }
-
-    fn signature(r: &[u8; 32], s: &[u8; 32]) -> [u8; 64] {
-        let mut sig = [0u8; 64];
-        sig[..32].copy_from_slice(r);
-        sig[32..].copy_from_slice(s);
-        sig
+    #[test]
+    fn test_signing_reproduces_rfc8032_test1() {
+        let seed: [u8; 32] = hex_decode_exact(RFC8032_TEST1_SEED).unwrap();
+        let (pk, msg, sig) = decode_vector(&RFC8032[0]);
+        assert_eq!(super::test_signing::public_key(&seed), pk);
+        assert_eq!(super::test_signing::sign(&seed, &msg), sig);
+        let other = super::test_signing::sign(&seed, b"another message");
+        assert!(verify(&pk, b"another message", &other));
     }
 
     #[test]

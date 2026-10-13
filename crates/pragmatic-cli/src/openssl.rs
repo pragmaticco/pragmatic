@@ -15,6 +15,15 @@
 //! of the time the token was made (so a TSA certificate that has since
 //! expired still verifies, and one that was not yet valid does not).
 //!
+//! Not every `openssl` can do this. macOS ships LibreSSL as
+//! `/usr/bin/openssl`, whose `ts -verify` has no `-attime`: it prints its
+//! usage and fails, which says nothing about the token. So a binary is
+//! used only after [`capability`] has seen that it is OpenSSL and that its
+//! `ts` command takes `-attime`, and a check counts as a rejected token
+//! only when OpenSSL ran the verification and reported it failed
+//! (`Verification: FAILED`); anything else (a usage message, a crash) means
+//! the token was not checked.
+//!
 //! The bundle is adversarial input, so the invocation is defensive: the
 //! token and certificates are written to a fresh directory only this user
 //! can read (mode 0700), under names made from a counter, never from the
@@ -36,26 +45,41 @@ pub struct OpenSslTsa {
     bin: PathBuf,
 }
 
+/// What looking for a usable `openssl` found.
+#[derive(Debug)]
+pub enum Found {
+    /// A binary that can check tokens, and its version.
+    Usable(OpenSslTsa, String),
+    /// `openssl` binaries on `PATH`, none of them usable: the first, and
+    /// why not.
+    Unusable(PathBuf, String),
+    /// No `openssl` on `PATH`.
+    Missing,
+}
+
 impl OpenSslTsa {
-    /// `openssl` from `PATH`, if it is there.
-    pub fn from_path() -> Option<OpenSslTsa> {
-        find_on_path("openssl").map(|bin| OpenSslTsa { bin })
+    /// The first `openssl` on `PATH` that can check tokens, so a LibreSSL
+    /// earlier on `PATH` (macOS's `/usr/bin`) does not hide an OpenSSL
+    /// later on it.
+    pub fn find() -> Found {
+        let mut first_unusable = None;
+        for bin in all_on_path("openssl") {
+            match capability(&bin) {
+                Ok(version) => return Found::Usable(OpenSslTsa { bin }, version),
+                Err(why) => {
+                    first_unusable.get_or_insert((bin, why));
+                }
+            }
+        }
+        match first_unusable {
+            Some((bin, why)) => Found::Unusable(bin, why),
+            None => Found::Missing,
+        }
     }
 
     /// The binary in use.
     pub fn bin(&self) -> &Path {
         &self.bin
-    }
-
-    /// `openssl version`, for the report.
-    pub fn version(&self) -> Option<String> {
-        let out = Command::new(&self.bin)
-            .arg("version")
-            .stdin(Stdio::null())
-            .output()
-            .ok()?;
-        let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        (!v.is_empty()).then_some(v)
     }
 
     fn run(&self, check: &TsaCheck<'_>, dir: &Path) -> Result<TsaResult, String> {
@@ -92,11 +116,7 @@ impl OpenSslTsa {
             .stdin(Stdio::null())
             .output()
             .map_err(|e| format!("cannot run {}: {e}", self.bin.display()))?;
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        if out.status.success() && stdout.contains("Verification: OK") {
-            return Ok(TsaResult::Verified);
-        }
-        Ok(TsaResult::Rejected(openssl_reason(&out.stderr)))
+        Ok(classify(out.status.success(), &out.stdout, &out.stderr))
     }
 }
 
@@ -115,6 +135,60 @@ impl TsaVerifier for OpenSslTsa {
     }
 }
 
+/// What one run of `openssl ts -verify` says about a token. OpenSSL prints
+/// `Verification: OK` or `Verification: FAILED` once it has tried to
+/// verify; output without either (a usage message from a binary that does
+/// not know an option, a crash) is not a verdict on the token, so the
+/// token is unchecked rather than rejected.
+fn classify(success: bool, stdout: &[u8], stderr: &[u8]) -> TsaResult {
+    let out = String::from_utf8_lossy(stdout);
+    if success && out.contains("Verification: OK") {
+        TsaResult::Verified
+    } else if out.contains("Verification: FAILED") {
+        TsaResult::Rejected(openssl_reason(stderr))
+    } else {
+        TsaResult::Unavailable(format!(
+            "openssl did not run the check ({})",
+            openssl_reason(stderr)
+        ))
+    }
+}
+
+/// Whether `bin` can check tokens as step 9 needs: it is OpenSSL (not
+/// LibreSSL) and its `ts` command takes `-attime`. Returns its version, or
+/// why not.
+pub fn capability(bin: &Path) -> Result<String, String> {
+    let run = |args: &[&str]| -> Result<String, String> {
+        let out = Command::new(bin)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("cannot run {}: {e}", bin.display()))?;
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        Ok(text)
+    };
+    let version = run(&["version"])?
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let version = pragmatic_console::text::clip(&version, 80);
+    if version.contains("LibreSSL") {
+        return Err(format!(
+            "{version}, whose ts -verify cannot check a token at its signing time (no -attime)"
+        ));
+    }
+    if !run(&["ts", "-help"])?.contains("-attime") {
+        return Err(format!(
+            "{} ({version}) has no ts -verify -attime",
+            bin.display()
+        ));
+    }
+    Ok(version)
+}
+
 /// The most telling line of OpenSSL's error output, such as `unable to get
 /// local issuer certificate`, cleaned of control characters.
 fn openssl_reason(stderr: &[u8]) -> String {
@@ -130,18 +204,27 @@ fn openssl_reason(stderr: &[u8]) -> String {
     pragmatic_console::text::clip(reason, 160)
 }
 
-/// The first `name` (`name.exe` on Windows) on `PATH` that is a file.
-pub fn find_on_path(name: &str) -> Option<PathBuf> {
+/// Every `name` (`name.exe` on Windows) on `PATH` that is an executable
+/// file, in `PATH` order, each once.
+pub fn all_on_path(name: &str) -> Vec<PathBuf> {
     let file = if cfg!(windows) {
         format!("{name}.exe")
     } else {
         name.to_string()
     };
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
+    let Some(path) = std::env::var_os("PATH") else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in std::env::split_paths(&path)
         .filter(|d| d.is_absolute())
         .map(|d| d.join(&file))
-        .find(|p| is_executable(p))
+    {
+        if is_executable(&p) && !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
 }
 
 #[cfg(unix)]
@@ -205,6 +288,43 @@ mod tests {
         }
         drop(d);
         assert!(!p.exists());
+    }
+
+    #[test]
+    fn only_a_failed_verification_rejects_a_token() {
+        assert_eq!(
+            classify(true, b"Verification: OK\n", b""),
+            TsaResult::Verified
+        );
+        let failed = classify(
+            false,
+            b"Verification: FAILED\n",
+            b"x:error:...:Verify error:unable to get local issuer certificate\n",
+        );
+        assert_eq!(
+            failed,
+            TsaResult::Rejected("unable to get local issuer certificate".into())
+        );
+        // LibreSSL's answer to -attime: a usage message, no verdict.
+        let usage = classify(false, b"", b"usage:\nts -query [-config configfile] ...\n");
+        assert!(matches!(usage, TsaResult::Unavailable(_)), "{usage:?}");
+        let unknown = classify(false, b"", b"ts: Unknown option: -attime\n");
+        assert!(matches!(unknown, TsaResult::Unavailable(_)));
+    }
+
+    #[test]
+    fn libressl_is_not_used() {
+        let libre = Path::new("/usr/bin/openssl");
+        let is_libre = Command::new(libre)
+            .arg("version")
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("LibreSSL"));
+        if !is_libre {
+            eprintln!("skipped: /usr/bin/openssl is not LibreSSL");
+            return;
+        }
+        let why = capability(libre).unwrap_err();
+        assert!(why.contains("LibreSSL") && why.contains("-attime"), "{why}");
     }
 
     #[test]

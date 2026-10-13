@@ -6,7 +6,9 @@
 //! media type, size and SHA-256 using [`pragmatic::redact::binary`], and a
 //! slot that is not UTF-8 is summarized as a whole, so a page never inlines
 //! base64. Text is cut at [`MAX_INLINE`] bytes. Erased, withheld and ref
-//! slots say what they are.
+//! slots say what they are; a ref links to the slot it repeats instead of
+//! showing the same content again, so a conversation whose every request
+//! repeats the earlier messages does not grow its page quadratically.
 
 use pragmatic::encoding::hex_encode;
 use pragmatic::journal::{Content, SlotMeta, SlotState};
@@ -34,12 +36,17 @@ pub fn slot_html(label: &str, meta: &SlotMeta, content: &Content) -> String {
         "<div class=\"lbl\">{} \u{b7} {state}{size}</div>",
         esc(label)
     );
-    if let (SlotState::Ref, Some((c, s))) = (meta.state, meta.ref_target) {
-        out.push_str(&format!(
-            "<div class=\"kv\">deduplicated: the same content as <a href=\"#c{c}\">#{c}</a> slot {s}</div>"
-        ));
-    }
+    let deduplicated = match (meta.state, meta.ref_target) {
+        (SlotState::Ref, Some((c, s))) => {
+            out.push_str(&format!(
+                "<div class=\"kv\">deduplicated: the same content as <a href=\"#c{c}\">#{c}</a> slot {s}</div>"
+            ));
+            true
+        }
+        _ => false,
+    };
     out.push_str(&match content {
+        Content::Sealed(_) if deduplicated => String::new(),
         Content::Sealed(v) => sealed_html(v.as_bytes()),
         Content::Erased => gone(
             "erased: the content and its salt were dropped; the commitment below still \
@@ -61,6 +68,18 @@ fn gone(why: &str) -> String {
     format!("<pre class=\"gone\">{}</pre>", esc(why))
 }
 
+/// A value that is not a slot (a format 1 entry's prompt, outcome,
+/// argument or result) shown as a slot's content is: binary summarized,
+/// JSON pretty-printed, newlines kept, cut at [`MAX_INLINE`].
+pub(crate) fn value_html(label: &str, bytes: &[u8]) -> String {
+    format!(
+        "<div class=\"lbl\">{} \u{b7} {} bytes</div>{}",
+        esc(label),
+        bytes.len(),
+        sealed_html(bytes)
+    )
+}
+
 /// The display of content that is present.
 fn sealed_html(bytes: &[u8]) -> String {
     let scanned = binary::scan(bytes);
@@ -80,6 +99,12 @@ fn sealed_html(bytes: &[u8]) -> String {
         text.clone()
     };
     let (cut, truncated) = truncate(&shown, MAX_INLINE);
+    if scanned.incomplete {
+        out.push_str(
+            "<div class=\"kv\">this content starts like JSON but could not be read to its end, \
+             so it was not fully scanned for attachments: base64 in it may be shown as text</div>",
+        );
+    }
     out.push_str(&format!("<pre>{}</pre>", esc(cut)));
     if truncated {
         out.push_str(&format!(
@@ -170,7 +195,27 @@ mod tests {
             slot_html("x", &meta(SlotState::Withheld), &Content::Withheld)
                 .contains("withheld from")
         );
-        let r = slot_html("x", &meta(SlotState::Ref), &Content::Sealed("same".into()));
-        assert!(r.contains("href=\"#c3\"") && r.contains("same"));
+        let r = slot_html(
+            "x",
+            &meta(SlotState::Ref),
+            &Content::Sealed("repeated message".into()),
+        );
+        assert!(r.contains("href=\"#c3\"") && r.contains("the same content"));
+        assert!(
+            !r.contains("repeated message"),
+            "a ref links, never repeats"
+        );
+    }
+
+    #[test]
+    fn unread_json_is_flagged() {
+        let h = slot_html(
+            "x",
+            &meta(SlotState::Sealed),
+            &Content::Sealed("[1, 2".into()),
+        );
+        assert!(h.contains("could not be read to its end"));
+        let v = value_html("outcome", b"line one\nline two");
+        assert!(v.contains("outcome \u{b7} 17 bytes") && v.contains("line one\nline two"));
     }
 }

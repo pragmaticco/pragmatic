@@ -62,7 +62,8 @@ changes every file. Commit them together.
 | `trust/witness-wrong.vkey` | Another key under the witness's name. |
 | `trust/tsa-a-root.pem`, `trust/tsa-b-root.pem` | The two TSA roots (`--tsa-roots`). |
 
-Full trust, from this directory:
+Full trust, from this directory (the reference verifier,
+`python3 -I ../../../../../tools/verify_evidence.py`, takes the same flags):
 
 ```sh
 pragmatic verify-evidence bundle.json \
@@ -72,5 +73,11 @@ pragmatic verify-evidence bundle.json \
   --log-key $(cat trust/log.vkey) \
   --log log.json --witness-log witness-log.json
 ```
+
+`bundle-hmac.json` names the run by HMAC, so it verifies the same way
+without `--log` and reports `anchor_id_unbound`; with `--log` its omission
+audit fails (`log_unauditable`), by design (evidence format 6.2). Attacks
+on anchoring are built from scratch, rather than kept as fixtures, in
+`src/evidence/attacks.rs` and `tools/test_evidence_attacks.py`.
 
 The seeds, keys and certificates sign nothing but these fixtures.

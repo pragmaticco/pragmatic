@@ -716,4 +716,6 @@ impl BundleSignature {
 }
 
 #[cfg(test)]
+mod attacks;
+#[cfg(test)]
 mod tests;

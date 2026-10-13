@@ -2,11 +2,12 @@
 """Tests for the reference evidence verifier, against the fixtures in
 crates/pragmatic/tests/fixtures/evidence (see its README).
 
-    python3 -m unittest tools/test_verify_evidence.py
+    python3 -I tools/test_verify_evidence.py
 
-Tests that need openssl skip, saying so, when it is not on PATH. Every
-adversarial case of design section 9 that does not need Ed25519 fails here
-with the same code as in `pragmatic verify-evidence`.
+Tests that need OpenSSL skip, saying so, when no usable openssl is on
+PATH. Every adversarial case of design section 9 fails here with the same
+code as in `pragmatic verify-evidence`. tools/test_evidence_attacks.py
+runs both verifiers against attacks built from scratch.
 """
 
 import base64
@@ -26,8 +27,8 @@ import verify_evidence as ve  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURES = os.path.join(HERE, "..", "crates", "pragmatic", "tests", "fixtures", "evidence")
-HAVE_OPENSSL = shutil.which(ve.OPENSSL) is not None
-needs_openssl = unittest.skipUnless(HAVE_OPENSSL, "openssl is not on PATH")
+HAVE_OPENSSL = ve.openssl_binary()[0] is not None
+needs_openssl = unittest.skipUnless(HAVE_OPENSSL, "no usable openssl on PATH")
 
 
 def fixture(name):
@@ -39,13 +40,36 @@ def load(name):
         return json.loads(f.read())
 
 
+def unsigned(name):
+    """A fixture bundle without its signature, for tampering without
+    tripping the bundle signature (which covers everything)."""
+    b = load(name)
+    b["signature"] = None
+    return b
+
+
 def roots(*which):
     return [(f"fixture-tsa-{x}", fixture(f"trust/tsa-{x}-root.pem")) for x in which]
 
 
-def verify(bundle, tsa=("a", "b"), min_operators=2, log=None, witness_logs=()):
+def vkey(name):
+    with open(fixture(f"trust/{name}")) as f:
+        return ve.parse_vkey(f.read().strip())
+
+
+def witness_keys():
+    return [("fixture-witness", vkey("witness.vkey"))]
+
+
+def verify(bundle, tsa=("a", "b"), min_operators=2, log=None, witness_logs=(), witnesses=(),
+           log_keys=()):
     data = bundle if isinstance(bundle, bytes) else json.dumps(bundle, ensure_ascii=False).encode()
-    return ve.Verifier(roots(*tsa), min_operators, log, witness_logs).run(data)
+    return ve.Verifier(roots(*tsa), min_operators, log, witness_logs, witnesses, log_keys).run(data)
+
+
+def full(bundle, **kw):
+    """Verify with every fixture trust input pinned."""
+    return verify(bundle, witnesses=witness_keys(), log_keys=[vkey("log.vkey")], **kw)
 
 
 def codes(report):
@@ -72,20 +96,32 @@ class Fixtures(unittest.TestCase):
     def test_full_bundle_verifies(self):
         log = ve.load_log(fixture("log.json"))
         wl = ve.load_witness_log(fixture("witness-log.json"))
-        r = verify(load("bundle.json"), log=log, witness_logs=[wl])
+        r = full(load("bundle.json"), log=log, witness_logs=[wl])
         self.assertEqual(r["verdict"], "VERIFIED", r["findings"])
         self.assertEqual(r["exit"], 0)
+        self.assertEqual(r["signature"], "verified")
         self.assertEqual([a["entries"] for a in r["anchors"]], [6, 20, 32])
         for a in r["anchors"]:
-            self.assertEqual(a["trusted_operators"], ["fixture-tsa-a", "fixture-tsa-b"])
+            self.assertEqual(a["trusted_operators"], ["fixture-tsa-a", "fixture-tsa-b", "fixture-witness"])
             classes = [w["class"] for w in a["witnesses"]]
-            self.assertEqual(classes, ["operator-controlled", "trusted", "trusted", "self-asserted"])
-        self.assertIn("not_checked", codes(r))
+            self.assertEqual(classes, ["operator-controlled", "trusted", "trusted", "trusted"])
+        steps = [(c["step"], c["status"]) for c in r["checks"]]
+        self.assertEqual(steps.count((11, "pass")), 2)
+
+    def test_cosignatures_count_with_a_pinned_key(self):
+        r = verify(load("bundle.json"), tsa=(), min_operators=1, witnesses=witness_keys())
+        self.assertEqual(r["verdict"], "VERIFIED", r["findings"])
+        # The key of another witness under the same name does not.
+        wrong = [("fixture-witness", vkey("witness-wrong.vkey"))]
+        r = verify(load("bundle.json"), tsa=(), min_operators=1, witnesses=wrong)
+        self.assertEqual(r["verdict"], "UNANCHORED")
+        self.assertIn("cosignature_untrusted", codes(r))
 
     @needs_openssl
     def test_hmac_bundle_verifies(self):
         r = verify(load("bundle-hmac.json"))
         self.assertEqual(r["verdict"], "VERIFIED", r["findings"])
+        self.assertIn("anchor_id_unbound", codes(r))
         b = load("bundle-hmac.json")
         b["anchor_id"] = None
         self.assertFails(verify(b), "run_id_mismatch")
@@ -109,9 +145,10 @@ class Fixtures(unittest.TestCase):
         self.assertEqual(r["verdict"], "UNANCHORED")
         self.assertIn("tsa_untrusted", codes(r))
 
-    def test_cosignatures_never_count_here(self):
+    def test_cosignatures_need_a_pinned_key(self):
         r = verify(load("bundle.json"), tsa=(), min_operators=1)
         self.assertEqual(r["verdict"], "UNANCHORED")
+        self.assertIn("cosignature_untrusted", codes(r))
 
     def test_without_openssl_tokens_are_unchecked(self):
         saved = ve.OPENSSL
@@ -123,6 +160,40 @@ class Fixtures(unittest.TestCase):
         self.assertEqual(r["verdict"], "UNANCHORED")
         self.assertIn("tsa_unchecked", codes(r))
 
+    def test_a_pinned_log_key_checks_every_signature(self):
+        b = load("bundle.json")
+        r = full(b, tsa=())
+        self.assertEqual(r["signature"], "verified")
+        self.assertNotIn("log_signature", codes(r))
+        # The bundle signature covers the generator's fields.
+        b["requested_by"] = "tok_someone_else"
+        self.assertFails(full(b, tsa=()), "bundle_signature")
+        # Stripped, with the log key pinned: a failure, not "unsigned".
+        b["signature"] = None
+        self.assertFails(full(b, tsa=()), "bundle_signature")
+        self.assertIn("unsigned", codes(verify(b, tsa=())))
+        # A pinned key that did not sign the checkpoints.
+        other = ve.make_key("pragmatic/fixture.example", ve.TYPE_ED25519, vkey("witness.vkey")["public"])
+        self.assertFails(verify(load("bundle.json"), tsa=(), log_keys=[other]), "log_signature")
+
+    def test_ed25519_follows_rfc_8032_and_the_rust_rules(self):
+        pk = bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+        sig = bytes.fromhex("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b")
+        self.assertTrue(ve.ed25519_verify(pk, b"", sig))
+        self.assertFalse(ve.ed25519_verify(pk, b"x", sig))
+        pk2 = bytes.fromhex("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c")
+        sig2 = bytes.fromhex("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00")
+        self.assertTrue(ve.ed25519_verify(pk2, b"\x72", sig2))
+        # Non-canonical S (S + L) is rejected.
+        s = int.from_bytes(sig[32:], "little") + ve.ED_L
+        self.assertFalse(ve.ed25519_verify(pk, b"", sig[:32] + s.to_bytes(32, "little")))
+        # The identity as key and R, with S = 0, "verifies" every message
+        # under the bare equation: small-order points are rejected.
+        identity = (1).to_bytes(32, "little")
+        self.assertFalse(ve.ed25519_verify(identity, b"any", identity + bytes(32)))
+        # A non-canonical encoding of a key (y >= p) is rejected.
+        self.assertFalse(ve.ed25519_verify(b"\xff" * 31 + b"\x7f", b"", sig))
+
 
 class Adversarial(Fixtures):
     """Design section 9, and every other failure code reachable without
@@ -131,7 +202,7 @@ class Adversarial(Fixtures):
     @needs_openssl
     def test_self_signed_tsa(self):
         rogue = load("rogue.json")
-        b = load("bundle.json")
+        b = unsigned("bundle.json")
         for a in b["anchors"]:
             for w in a["witnesses"]:
                 if w["type"] == "rfc3161":
@@ -143,7 +214,7 @@ class Adversarial(Fixtures):
 
     @needs_openssl
     def test_omitted_anchor_caught_with_log(self):
-        b = load("bundle.json")
+        b = unsigned("bundle.json")
         b["anchors"].pop()
         r = verify(b)
         self.assertEqual(r["verdict"], "VERIFIED (PARTIAL)", r["findings"])
@@ -245,15 +316,25 @@ class Adversarial(Fixtures):
 
     def test_witness_logs(self):
         wl = ve.load_witness_log(fixture("witness-log.json"))
-        forked = copy.deepcopy(wl)
-        lines = forked["checkpoints"][0].split("\n")
+        r = full(load("bundle.json"), tsa=(), min_operators=1, witness_logs=[wl])
+        self.assertEqual(r["verdict"], "VERIFIED", r["findings"])
+        # A root the witness never signed: the history is not the witness's.
+        forged = copy.deepcopy(wl)
+        lines = forged["checkpoints"][0].split("\n")
         lines[2] = base64.b64encode(b"\x07" * 32).decode()
-        forked["checkpoints"][0] = "\n".join(lines)
-        self.assertFails(verify(load("bundle.json"), tsa=(), witness_logs=[forked]), "witness_log_fork")
+        forged["checkpoints"][0] = "\n".join(lines)
+        self.assertFails(full(load("bundle.json"), tsa=(), witness_logs=[forged]),
+                         "witness_log_untrusted")
+        # Without the witness's key, no history can be trusted.
+        self.assertFails(verify(load("bundle.json"), tsa=(), witness_logs=[wl]), "witness_log_untrusted")
         missing = copy.deepcopy(wl)
         del missing["checkpoints"][1]
-        self.assertFails(verify(load("bundle.json"), tsa=(), witness_logs=[missing]),
+        self.assertFails(full(load("bundle.json"), tsa=(), witness_logs=[missing]),
                          "witness_log_mismatch")
+        # A history for another log does not apply: the audit asked for fails.
+        other = copy.deepcopy(wl)
+        other["origin"] = "pragmatic/elsewhere"
+        self.assertFails(full(load("bundle.json"), tsa=(), witness_logs=[other]), "witness_log_origin")
 
     def test_log_mismatch(self):
         log = ve.load_log(fixture("log.json"))
@@ -282,9 +363,20 @@ class CommandLine(unittest.TestCase):
         self.assertIn("UNANCHORED", out)
 
     def test_usage(self):
-        code, _ = self.run_main(fixture("bundle.json"), "--min-operators", "0")
-        self.assertEqual(code, 64)
-        code, _ = self.run_main(fixture("bundle.json"), "--tsa-roots", "/nonexistent.pem")
+        bad = [
+            ["--min-operators", "0"],
+            ["--tsa-roots", "/nonexistent.pem"],
+            ["--witness-key", "garbage"],
+            ["--witness-key", "op=nothex"],
+            ["--log-key", fixture("trust/witness.vkey")],
+            ["--log-key", "/nonexistent.vkey"],
+            ["--log", "/nonexistent.json"],
+            ["--witness-log", fixture("bundle.json")],
+        ]
+        for extra in bad:
+            code, _ = self.run_main(fixture("bundle.json"), *extra)
+            self.assertEqual(code, 64, extra)
+        code, _ = self.run_main("/nonexistent-bundle.json")
         self.assertEqual(code, 64)
 
     def test_hostile_text_is_escaped(self):
@@ -320,6 +412,17 @@ class CommandLine(unittest.TestCase):
             code, out = self.run_main(tmp)
             self.assertEqual(code, 1, out)
             self.assertIn("journal_missing", out)
+            # A FIFO or a link in place of the journal is never read.
+            os.remove(os.path.join(tmp, "journal.pragmatic"))
+            os.mkfifo(os.path.join(tmp, "journal.pragmatic"))
+            code, out = self.run_main(tmp)
+            self.assertEqual(code, 1, out)
+            self.assertIn("bundle_file", out)
+            os.remove(os.path.join(tmp, "journal.pragmatic"))
+            os.symlink("/dev/zero", os.path.join(tmp, "journal.pragmatic"))
+            code, out = self.run_main(tmp)
+            self.assertEqual(code, 1, out)
+            self.assertIn("bundle_file", out)
         finally:
             shutil.rmtree(tmp)
 

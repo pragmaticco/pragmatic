@@ -43,7 +43,16 @@ pub fn render_evidence(bundle: &Bundle, report: &EvidenceReport) -> String {
     body.push_str(&anchors(report));
     body.push_str("<h2>timeline</h2>");
     match Journal::parse_evidence(&bundle.journal.bytes) {
-        Ok(p) if p.tail_len == 0 => body.push_str(&timeline(&p.journal)),
+        Ok(p) if p.tail_len == 0 => {
+            let (rows, next) = timeline(&p.journal, 0, None);
+            body.push_str(&rows);
+            if next.is_some() {
+                body.push_str(
+                    "<p class=\"lede\">The CSV rendering of this bundle has a row for every \
+                     entry.</p>",
+                );
+            }
+        }
         _ => body.push_str(&records_table(&bundle.records)),
     }
     page(
@@ -92,8 +101,9 @@ fn verdict(r: &EvidenceReport) -> String {
         ),
         Verdict::Failed => (
             "bad",
-            "An integrity check failed: the bundle is not what it claims to be. The failures \
-             are listed below."
+            "An integrity check failed, or an audit the verifier was asked for could not be \
+             completed: the bundle cannot be relied on as it stands. The failures are listed \
+             below."
                 .to_string(),
         ),
     };
@@ -112,6 +122,13 @@ fn facts(b: &Bundle, r: &EvidenceReport) -> String {
         SignatureStatus::Unsigned => "<b>unsigned</b>".to_string(),
         SignatureStatus::Invalid => "<span class=\"alarm\">signature INVALID</span>".to_string(),
     };
+    // Only the bundle signature covers these fields; unless a pinned key
+    // verified it, they are whatever the file says.
+    let claim = if matches!(r.bundle_signature, SignatureStatus::Verified { .. }) {
+        "signed"
+    } else {
+        "unsigned claim"
+    };
     let f = [
         format!("run <b>{}</b>", esc(&b.run_id)),
         format!("<b>{}</b> entries", r.entries),
@@ -122,8 +139,11 @@ fn facts(b: &Bundle, r: &EvidenceReport) -> String {
             b.redacted_slots.len()
         ),
         sig,
-        format!("by <b>{}</b>", esc(&text::clip(&b.generator, 64))),
-        format!("for <b>{}</b>", esc(&text::clip(&b.requested_by, 64))),
+        format!("by <b>{}</b> ({claim})", esc(&text::clip(&b.generator, 64))),
+        format!(
+            "for <b>{}</b> ({claim})",
+            esc(&text::clip(&b.requested_by, 64))
+        ),
     ];
     let items: String = f.iter().map(|x| format!("<div>{x}</div>")).collect();
     format!("<div class=\"facts\">{items}</div>")
@@ -290,25 +310,50 @@ fn slots_text(r: &Record, width: usize) -> String {
 }
 
 /// The records of a bundle as CSV (RFC 4180, CRLF line ends), one row per
-/// entry, for spreadsheets.
+/// entry, for spreadsheets, with the verification verdict on every row.
 ///
-/// Columns: `cursor, at_ns, at_utc, branch, kind, fields, slot_states,
-/// content, hash`. `content` joins the slots with ` | `; binary values are
-/// summarized and each cell is cut to 32,000 characters (spreadsheets hold
-/// at most 32,767). Cells that a spreadsheet would read as a formula
-/// (starting with `=`, `+`, `-`, `@`, a tab or a carriage return) are
-/// prefixed with `'`, since the content is untrusted.
-pub fn render_csv(bundle: &Bundle) -> String {
-    let mut out =
-        String::from("cursor,at_ns,at_utc,branch,kind,fields,slot_states,content,hash\r\n");
-    for r in &bundle.records {
+/// Columns: `verdict, anchored, cursor, at_ns, at_utc, branch, kind,
+/// fields, slot_states, content, hash`. `verdict` is the report's verdict
+/// (`VERIFIED`, `VERIFIED (PARTIAL)`, `UNANCHORED` or `FAILED`), the same
+/// on every row, so a spreadsheet passed on keeps it; `anchored` is `yes`
+/// for the entries an independent anchor covers. `content` joins the slots
+/// with ` | `; binary values are summarized and each cell is cut to 32,000
+/// characters (spreadsheets hold at most 32,767). Cells that a spreadsheet
+/// would read as a formula (starting with `=`, `+`, `-`, `@`, a tab or a
+/// carriage return) are prefixed with `'`, since the content is untrusted.
+///
+/// Rows are decoded from the bundle's journal, never taken from its
+/// `records` section as stated: a bundle whose records were edited after
+/// the fact fails verification, and its edits must not reach a
+/// spreadsheet. Only when the journal cannot be read at all are the stated
+/// records used, and the verdict on every row is then `FAILED`.
+pub fn render_csv(bundle: &Bundle, report: &EvidenceReport) -> String {
+    let decoded: Option<Vec<Record>> = Journal::parse_evidence(&bundle.journal.bytes)
+        .ok()
+        .filter(|p| p.tail_len == 0)
+        .map(|p| {
+            p.journal
+                .entries()
+                .iter()
+                .filter_map(Record::of_entry)
+                .collect()
+        });
+    let records = decoded.as_deref().unwrap_or(&bundle.records);
+    let verdict = report.verdict.label();
+    let mut out = String::from(
+        "verdict,anchored,cursor,at_ns,at_utc,branch,kind,fields,slot_states,content,hash\r\n",
+    );
+    for r in records {
         let states = r
             .slots
             .iter()
             .map(|s| state_name(s.state))
             .collect::<Vec<_>>()
             .join(" ");
+        let anchored = r.cursor < report.anchored_entries && report.verdict != Verdict::Failed;
         let cells = [
+            verdict.to_string(),
+            if anchored { "yes" } else { "no" }.to_string(),
             r.cursor.to_string(),
             r.at.to_string(),
             if r.at == 0 {

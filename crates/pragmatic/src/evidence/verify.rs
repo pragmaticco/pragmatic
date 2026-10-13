@@ -88,7 +88,10 @@ pub struct TrustPolicy {
     pub witness_keys: Vec<WitnessKey>,
     /// Pinned log keys (`--log-key`): the server's checkpoint key, which
     /// also signs bundles. Without one, both signatures are reported as
-    /// operator-asserted.
+    /// operator-asserted. With one, the auditor has said which log the
+    /// bundle must come from: the bundle must be signed by a pinned key, and
+    /// every checkpoint must be signed by a pinned key whose name is the
+    /// checkpoint's origin.
     pub log_keys: Vec<VerifierKey>,
     /// Distinct trusted operators an anchor needs to count (default 2).
     pub min_operators: usize,
@@ -224,6 +227,7 @@ codes! {
     BundleJson = "bundle_json", Failure;
     BundleSchema = "bundle_schema", Failure;
     BundleSignature = "bundle_signature", Failure;
+    BundleFile = "bundle_file", Failure;
     JournalMissing = "journal_missing", Failure;
     JournalParse = "journal_parse", Failure;
     JournalFormat = "journal_format", Failure;
@@ -252,13 +256,16 @@ codes! {
     LogMismatch = "log_mismatch", Failure;
     WitnessLogFork = "witness_log_fork", Failure;
     WitnessLogMismatch = "witness_log_mismatch", Failure;
+    WitnessLogOrigin = "witness_log_origin", Failure;
+    WitnessLogUntrusted = "witness_log_untrusted", Failure;
+    LogUnauditable = "log_unauditable", Failure;
     TsaUntrusted = "tsa_untrusted", Warning;
     TsaUnchecked = "tsa_unchecked", Warning;
     CosignatureUntrusted = "cosignature_untrusted", Warning;
     WitnessKeyExpired = "witness_key_expired", Warning;
     OperatorMismatch = "operator_mismatch", Warning;
     LogNewer = "log_newer", Warning;
-    WitnessLogOrigin = "witness_log_origin", Warning;
+    AnchorIdUnbound = "anchor_id_unbound", Warning;
     Unsigned = "unsigned", Info;
     OperatorAsserted = "operator_asserted", Info;
     NoAnchors = "no_anchors", Info;
@@ -390,8 +397,12 @@ pub struct AnchorReport {
     pub trusted_operators: Vec<String>,
     /// Sound and witnessed by at least `min_operators` trusted operators.
     pub independent: bool,
-    /// The earliest trusted witness time: the journal prefix existed no
-    /// later than this.
+    /// The time at least `min_operators` distinct trusted operators vouch
+    /// for: the journal prefix existed no later than this. Each trusted
+    /// operator's earliest witness time is taken, and of those the
+    /// `min_operators`-th earliest, so no single operator (one compromised
+    /// witness, say) can move it earlier on its own. `None` when fewer
+    /// than `min_operators` trusted operators give a time.
     pub earliest: Option<SignedTime>,
 }
 
@@ -467,17 +478,29 @@ impl EvidenceReport {
             .filter(|f| f.severity() == Severity::Failure)
     }
 
-    fn failed(run_id: String, code: Code, message: String, min_operators: usize) -> Self {
+    /// A `FAILED` report for a bundle that could not be read at all, with
+    /// one finding: `code` is [`Code::BundleJson`] or [`Code::BundleSchema`]
+    /// for a file that is not a bundle, [`Code::BundleFile`] for a
+    /// directory bundle whose files are not plain files of a sane size, or
+    /// [`Code::JournalMissing`] for one whose journal file does not match
+    /// its SHA-256.
+    pub fn unreadable(code: Code, message: impl Into<String>, min_operators: usize) -> Self {
+        let message = message.into();
+        let (step, name) = match code {
+            Code::BundleFile => ("2", "bundle files"),
+            Code::JournalMissing => ("2", "journal parses canonically"),
+            _ => ("1", "strict JSON, known keys"),
+        };
         EvidenceReport {
             verdict: Verdict::Failed,
-            run_id,
+            run_id: String::new(),
             entries: 0,
             anchored_entries: 0,
             min_operators,
             bundle_signature: SignatureStatus::Unsigned,
             checks: vec![Check {
-                step: "1",
-                name: "strict JSON, known keys",
+                step,
+                name,
                 status: CheckStatus::Fail,
                 detail: message.clone(),
             }],
@@ -517,7 +540,7 @@ pub fn verify_bytes(
                 BundleError::Json(_) => (Code::BundleJson, e.to_string()),
                 BundleError::Schema(_) => (Code::BundleSchema, e.to_string()),
             };
-            let report = EvidenceReport::failed(String::new(), code, msg, policy.min_operators);
+            let report = EvidenceReport::unreadable(code, msg, policy.min_operators);
             (None, report)
         }
     }
@@ -638,8 +661,8 @@ impl Verifier<'_> {
         self.records(&journal);
         self.run_start(&journal);
         let latest = self.anchors(&journal);
-        self.full_log(&journal, latest.as_ref());
-        self.witness_logs(latest.as_ref());
+        let log = self.full_log(latest.as_ref());
+        self.witness_logs(latest.as_ref(), log.as_deref());
         self.verdict(&journal);
         // Steps are reported in the order of design 5.3, whatever order
         // they had to run in (the verdict needs the log audits).
@@ -664,20 +687,42 @@ impl Verifier<'_> {
     // -- step 1: the bundle signature ---------------------------------------
 
     fn bundle_signature(&mut self) {
+        // A pinned log key is the auditor saying which log the bundle must
+        // come from. Such a bundle is always signed, and only the signature
+        // covers the fields no other check reaches (generator,
+        // requested_by, redaction, verification_spec), so a bundle that is
+        // unsigned or signed by another key could have had them changed by
+        // anyone on the way.
+        let pinned = !self.policy.log_keys.is_empty();
         let Some(sig) = &self.bundle.signature else {
             self.report.bundle_signature = SignatureStatus::Unsigned;
-            self.check("1", "bundle signature", CheckStatus::Info, "unsigned");
-            self.finding(Code::Unsigned, "the bundle is not signed");
+            if pinned {
+                self.outcome(
+                    "1",
+                    "bundle signature",
+                    Some((
+                        Code::BundleSignature,
+                        "the bundle is unsigned, but a log key is pinned: a bundle from that log is \
+                         signed, and without the signature its unsigned fields could have been \
+                         changed by anyone"
+                            .into(),
+                    )),
+                    "",
+                );
+            } else {
+                self.check("1", "bundle signature", CheckStatus::Info, "unsigned");
+                self.finding(Code::Unsigned, "the bundle is not signed");
+            }
             return;
         };
         let message = self.bundle.signature_message();
-        let pinned = self
+        let key = self
             .policy
             .log_keys
             .iter()
             .find(|k| k.public_key() == &sig.public_key);
         let valid = ed25519::verify(&sig.public_key, &message, &sig.value);
-        match (pinned, valid) {
+        match (key, valid) {
             (Some(key), true) if key.key_id() == sig.key_id => {
                 let name = key.name().to_string();
                 self.check(
@@ -688,14 +733,30 @@ impl Verifier<'_> {
                 );
                 self.report.bundle_signature = SignatureStatus::Verified { key: name };
             }
-            (Some(_), _) => {
+            (Some(_), _) | (None, false) => {
                 self.report.bundle_signature = SignatureStatus::Invalid;
+                let why = if key.is_some() {
+                    "the bundle signature does not verify with the pinned log key"
+                } else {
+                    "the bundle signature does not verify even with the key it names"
+                };
+                self.outcome(
+                    "1",
+                    "bundle signature",
+                    Some((Code::BundleSignature, why.into())),
+                    "",
+                );
+            }
+            (None, true) if pinned => {
+                self.report.bundle_signature = SignatureStatus::OperatorAsserted;
                 self.outcome(
                     "1",
                     "bundle signature",
                     Some((
                         Code::BundleSignature,
-                        "the bundle signature does not verify with the pinned log key".into(),
+                        "the bundle is signed by a key that is not pinned: the pinned log key \
+                         did not sign it"
+                            .into(),
                     )),
                     "",
                 );
@@ -711,18 +772,6 @@ impl Verifier<'_> {
                 self.finding(
                     Code::OperatorAsserted,
                     "the bundle signature's key is not pinned (pass --log-key)",
-                );
-            }
-            (None, false) => {
-                self.report.bundle_signature = SignatureStatus::Invalid;
-                self.outcome(
-                    "1",
-                    "bundle signature",
-                    Some((
-                        Code::BundleSignature,
-                        "the bundle signature does not verify even with the key it names".into(),
-                    )),
-                    "",
                 );
             }
         }
@@ -971,6 +1020,15 @@ impl Verifier<'_> {
             failure.map(|m| (Code::RunIdMismatch, m)),
             "run.start names the bundle's run",
         );
+        if self.bundle.anchor_id.is_some() {
+            self.finding(
+                Code::AnchorIdUnbound,
+                "the log names this run by HMAC under the per-run key in anchor_id, which the \
+                 bundle supplies and nothing binds to the run: anchors made under another key \
+                 cannot be told apart from other runs' leaves, so hidden or re-keyed anchors \
+                 cannot be detected, not even with --log",
+            );
+        }
     }
 
     // -- step 8 to 10: anchors ----------------------------------------------
@@ -996,7 +1054,7 @@ impl Verifier<'_> {
             .map(parse_checkpoint)
         {
             Some(Ok(p)) => {
-                self.log_signature(&p.note, "the latest checkpoint");
+                self.log_signature(&p, "the latest checkpoint");
                 Some(p)
             }
             Some(Err(e)) => {
@@ -1212,7 +1270,7 @@ impl Verifier<'_> {
                         ),
                     );
                 }
-                self.log_signature(&cp.note, &format!("anchor {seq}'s checkpoint"));
+                self.log_signature(&cp, &format!("anchor {seq}'s checkpoint"));
             }
         }
         if let Some(l) = latest {
@@ -1235,22 +1293,19 @@ impl Verifier<'_> {
     }
 
     /// A checkpoint's server signature against the pinned log keys, if any.
-    fn log_signature(&mut self, note: &Note, what: &str) {
+    fn log_signature(&mut self, cp: &ParsedCheckpoint, what: &str) {
         if self.policy.log_keys.is_empty() {
             return;
         }
-        if let Err(e) = note::verify_note(note, &self.policy.log_keys) {
-            self.finding(
-                Code::LogSignature,
-                format!("{what} is not signed by a pinned log key: {e}"),
-            );
+        if let Err(why) = signed_by_log(cp, &self.policy.log_keys) {
+            self.finding(Code::LogSignature, format!("{what} {why}"));
         }
     }
 
     /// The checkpoint's own signature, always operator-controlled.
     fn server_witness(&self, cp: &ParsedCheckpoint) -> WitnessReport {
-        let verified = !self.policy.log_keys.is_empty()
-            && note::verify_note(&cp.note, &self.policy.log_keys).is_ok();
+        let verified =
+            !self.policy.log_keys.is_empty() && signed_by_log(cp, &self.policy.log_keys).is_ok();
         WitnessReport {
             kind: "server-ed25519",
             label: cp.checkpoint.origin.clone(),
@@ -1456,10 +1511,7 @@ impl Verifier<'_> {
             unix: t.min(i64::MAX as u64) as i64,
             nanos: 0,
         });
-        let in_window = timestamp.is_some_and(|t| {
-            key.not_before.is_none_or(|nb| t >= nb) && key.not_after.is_none_or(|na| t <= na)
-        }) || (key.not_before.is_none() && key.not_after.is_none());
-        if !in_window {
+        if !in_window(key, timestamp) {
             let msg = format!(
                 "the cosignature from {name:?} is outside its pinned key's validity window"
             );
@@ -1494,12 +1546,9 @@ impl Verifier<'_> {
             .filter(|w| w.class == WitnessClass::Trusted)
             .filter_map(|w| w.operator.clone())
             .collect();
-        let earliest = witnesses
-            .iter()
-            .filter(|w| w.class == WitnessClass::Trusted)
-            .filter_map(|w| w.time)
-            .min();
-        let independent = sound && trusted.len() >= self.policy.min_operators.max(1);
+        let min = self.policy.min_operators.max(1);
+        let earliest = vouched_time(&witnesses, min);
+        let independent = sound && trusted.len() >= min;
         AnchorReport {
             seq: anchor.seq,
             entries: leaf.map_or(0, |l| l.entries),
@@ -1515,11 +1564,13 @@ impl Verifier<'_> {
 
     // -- step 11: full-log audits -------------------------------------------
 
-    fn full_log(&mut self, _j: &Journal, latest: Option<&ParsedCheckpoint>) {
+    /// The `--log` audit. Returns the hashes of every leaf of the log once
+    /// its first leaves are shown to hash to the latest checkpoint's root,
+    /// so the witness-log audit can check the witness's tree heads against
+    /// the same leaves.
+    fn full_log(&mut self, latest: Option<&ParsedCheckpoint>) -> Option<Vec<Digest>> {
         let audit = self.audit;
-        let Some(log) = &audit.log else {
-            return;
-        };
+        let log = audit.log.as_ref()?;
         const NAME: &str = "full log (--log)";
         let Some(latest) = latest else {
             self.outcome(
@@ -1531,7 +1582,7 @@ impl Verifier<'_> {
                 )),
                 "",
             );
-            return;
+            return None;
         };
         let size = latest.checkpoint.tree_size;
         if (log.leaves.len() as u64) < size {
@@ -1547,11 +1598,10 @@ impl Verifier<'_> {
                 )),
                 "",
             );
-            return;
+            return None;
         }
-        let covered = &log.leaves[..size as usize];
-        let hashes: Vec<Digest> = covered.iter().map(|l| merkle::leaf_hash(l)).collect();
-        if merkle::root(&hashes) != latest.checkpoint.root {
+        let hashes: Vec<Digest> = log.leaves.iter().map(|l| merkle::leaf_hash(l)).collect();
+        if merkle::root(&hashes[..size as usize]) != latest.checkpoint.root {
             self.outcome(
                 "11",
                 NAME,
@@ -1561,26 +1611,76 @@ impl Verifier<'_> {
                 )),
                 "",
             );
-            return;
+            return None;
         }
         self.report.log_leaves_checked = Some(size);
+        let before = self.failure_count();
+        self.bundled_leaves_match(&log.leaves, size);
+        if self.bundle.anchor_id.is_some() {
+            // The leaves carry HMAC(k_run, run_id) with k_run from the
+            // bundle, so leaves made under any other key look like other
+            // runs' leaves: the scan below would pass whatever was hidden.
+            self.outcome(
+                "11",
+                NAME,
+                Some((
+                    Code::LogUnauditable,
+                    "the bundle names the run by HMAC under a key it supplies itself \
+                     (anchor_id), and nothing binds that key to the run, so the log cannot show \
+                     anchors made under another key: hidden or re-keyed anchors cannot be ruled \
+                     out (audit runs anchored with anchor_run_ids = \"plain\")"
+                        .into(),
+                )),
+                "",
+            );
+            return Some(hashes);
+        }
+        self.omitted_leaves(&log.leaves, size);
+        let ok = self.failure_count() == before;
+        self.check(
+            "11",
+            NAME,
+            if ok { CheckStatus::Pass } else { CheckStatus::Fail },
+            if ok {
+                format!("all {size} leaves hash to the latest root; every leaf of this run is in the bundle")
+            } else {
+                "the log shows anchors the bundle does not account for".to_string()
+            },
+        );
+        Some(hashes)
+    }
+
+    /// Each bundle anchor's leaf must be the log's leaf at its index, and
+    /// inside the latest checkpoint's tree.
+    fn bundled_leaves_match(&mut self, leaves: &[Vec<u8>], size: u64) {
+        let bundle = self.bundle;
+        for a in &bundle.anchors {
+            if a.leaf_index >= size {
+                self.finding(
+                    Code::LogMismatch,
+                    format!("anchor {} is past the latest checkpoint", a.seq),
+                );
+            } else if leaves[a.leaf_index as usize] != a.leaf {
+                self.finding(
+                    Code::LogMismatch,
+                    format!(
+                        "the log's leaf {} differs from the bundle's anchor",
+                        a.leaf_index
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Every leaf of the log that names this run must be one of the
+    /// bundle's anchors.
+    fn omitted_leaves(&mut self, leaves: &[Vec<u8>], size: u64) {
         let bundle = self.bundle;
         let expected_id = leaf_id(&bundle.run_id, bundle.anchor_id.as_ref());
-        let in_bundle: BTreeMap<u64, &Vec<u8>> = bundle
-            .anchors
-            .iter()
-            .map(|a| (a.leaf_index, &a.leaf))
-            .collect();
-        let before = self.failure_count();
-        for (index, data) in log.leaves.iter().enumerate() {
+        let in_bundle: BTreeSet<u64> = bundle.anchors.iter().map(|a| a.leaf_index).collect();
+        for (index, data) in leaves.iter().enumerate() {
             let index = index as u64;
-            if let Some(&bundled) = in_bundle.get(&index) {
-                if bundled != data && index < size {
-                    self.finding(
-                        Code::LogMismatch,
-                        format!("the log's leaf {index} differs from the bundle's anchor"),
-                    );
-                }
+            if in_bundle.contains(&index) {
                 continue;
             }
             let Ok(leaf) = Leaf::decode(data) else {
@@ -1607,13 +1707,91 @@ impl Verifier<'_> {
                 );
             }
         }
-        for a in &bundle.anchors {
-            if a.leaf_index >= size {
-                self.finding(
-                    Code::LogMismatch,
-                    format!("anchor {} is past the latest checkpoint", a.seq),
-                );
-            }
+    }
+
+    fn witness_logs(&mut self, latest: Option<&ParsedCheckpoint>, log: Option<&[Digest]>) {
+        let audit = self.audit;
+        for wl in &audit.witness_logs {
+            self.witness_log(wl, latest, log);
+        }
+    }
+
+    /// The `--witness-log` audit: is the bundle's tree the tree the witness
+    /// saw? A witness cosigns a checkpoint only after checking that it
+    /// extends the last one it cosigned, so its history is one chain of
+    /// consistent tree heads. The bundle's tree is on that chain when a
+    /// tree head both sides know agrees at the witness's largest cosigned
+    /// size, or when the witness cosigned the bundle's latest checkpoint
+    /// itself; every size both sides know must agree (otherwise the log
+    /// showed two histories).
+    fn witness_log(
+        &mut self,
+        wl: &WitnessLog,
+        latest: Option<&ParsedCheckpoint>,
+        log: Option<&[Digest]>,
+    ) {
+        const NAME: &str = "witness log (--witness-log)";
+        let before = self.failure_count();
+        let Some(latest) = latest else {
+            self.outcome(
+                "11",
+                NAME,
+                Some((
+                    Code::WitnessLogMismatch,
+                    "the bundle has no latest checkpoint to check the witness's history against"
+                        .into(),
+                )),
+                "",
+            );
+            return;
+        };
+        if latest.checkpoint.origin != wl.origin {
+            self.outcome(
+                "11",
+                NAME,
+                Some((
+                    Code::WitnessLogOrigin,
+                    format!(
+                        "the witness log of {:?} is for the log {:?}, and the bundle's checkpoints are from {:?}: the history asked for does not apply",
+                        wl.witness, wl.origin, latest.checkpoint.origin
+                    ),
+                )),
+                "",
+            );
+            return;
+        }
+        let Some(history) = self.witness_history(wl) else {
+            self.check(
+                "11",
+                NAME,
+                CheckStatus::Fail,
+                "the history is not verifiably the witness's own",
+            );
+            return;
+        };
+        let largest = history.keys().next_back().copied();
+        let linked = self.compare_history(wl, &history, latest, log);
+        self.cosigned_anchors_listed(wl, &history);
+        if !linked {
+            let largest = largest.unwrap_or_default();
+            let reach = log.map_or(latest.checkpoint.tree_size, |h| h.len() as u64);
+            let why = if largest > reach {
+                format!(
+                    "the witness has cosigned tree size {largest}, beyond the {reach} leaves the bundle{} can check, and it did not cosign the bundle's latest checkpoint: pass a --log that reaches tree size {largest}",
+                    if log.is_some() { " and --log" } else { "" }
+                )
+            } else {
+                format!(
+                    "the witness's largest cosigned tree (size {largest}) is not one the bundle shows: pass --log to check it against the log's leaves"
+                )
+            };
+            self.finding(
+                Code::WitnessLogMismatch,
+                format!(
+                    "the bundle's tree cannot be shown to be the one {:?} saw: {why}",
+                    wl.witness
+                ),
+            );
         }
         let ok = self.failure_count() == before;
         self.check(
@@ -1621,50 +1799,85 @@ impl Verifier<'_> {
             NAME,
             if ok { CheckStatus::Pass } else { CheckStatus::Fail },
             if ok {
-                format!("all {size} leaves hash to the latest root; every leaf of this run is in the bundle")
+                format!(
+                    "{} checkpoint(s) cosigned by {:?} verify with its pinned key, and the bundle's tree is the one it saw, through tree size {}",
+                    wl.checkpoints.len(),
+                    wl.witness,
+                    largest.unwrap_or_default()
+                )
             } else {
-                "the log shows anchors the bundle does not account for".to_string()
+                "the witness's history disagrees with the bundle, or cannot be checked".to_string()
             },
         );
     }
 
-    fn witness_logs(&mut self, latest: Option<&ParsedCheckpoint>) {
-        let audit = self.audit;
-        for wl in &audit.witness_logs {
-            self.witness_log(wl, latest);
+    /// The history's tree heads, by size, once every checkpoint in it is
+    /// shown to be cosigned by a pinned key for the witness it names.
+    /// `None` (with findings) when it is not: a history whoever handed it
+    /// over could have written says nothing about what the witness saw.
+    fn witness_history(&mut self, wl: &WitnessLog) -> Option<BTreeMap<u64, Digest>> {
+        let keys: Vec<&WitnessKey> = self
+            .policy
+            .witness_keys
+            .iter()
+            .filter(|k| k.key.name() == wl.witness)
+            .collect();
+        if keys.is_empty() {
+            self.finding(
+                Code::WitnessLogUntrusted,
+                format!(
+                    "no witness key is pinned for {:?}, so its history cannot be told from one anybody wrote (pass --witness-key)",
+                    wl.witness
+                ),
+            );
+            return None;
         }
-    }
-
-    fn witness_log(&mut self, wl: &WitnessLog, latest: Option<&ParsedCheckpoint>) {
-        const NAME: &str = "witness log (--witness-log)";
-        if let Some(l) = latest {
-            if l.checkpoint.origin != wl.origin {
+        if wl.checkpoints.is_empty() {
+            self.finding(
+                Code::WitnessLogUntrusted,
+                format!("the history of {:?} is empty", wl.witness),
+            );
+            return None;
+        }
+        let vkeys: Vec<VerifierKey> = keys.iter().map(|k| k.key.clone()).collect();
+        let before = self.failure_count();
+        let mut history: BTreeMap<u64, Digest> = BTreeMap::new();
+        for (i, n) in wl.checkpoints.iter().enumerate() {
+            let c = match Checkpoint::parse(&n.body) {
+                Ok(c) => c,
+                Err(e) => {
+                    self.finding(
+                        Code::WitnessLogUntrusted,
+                        format!("checkpoint {i} of the history is not a checkpoint: {e}"),
+                    );
+                    continue;
+                }
+            };
+            if c.origin != wl.origin {
                 self.finding(
                     Code::WitnessLogOrigin,
                     format!(
-                        "the witness log of {:?} is for another log origin",
-                        wl.witness
+                        "checkpoint {i} of the history is for the log {:?}, not {:?}",
+                        c.origin, wl.origin
                     ),
                 );
-                self.check(
-                    "11",
-                    NAME,
-                    CheckStatus::Skipped,
-                    "the witness log is for another log",
-                );
-                return;
-            }
-        }
-        let before = self.failure_count();
-        let mut seen: BTreeMap<u64, Digest> = BTreeMap::new();
-        for note in &wl.checkpoints {
-            let Ok(c) = Checkpoint::parse(&note.body) else {
                 continue;
+            }
+            let trusted = match note::verify_note(n, &vkeys) {
+                Ok(signed) => signed.iter().any(|v| in_window(keys[v.key], v.timestamp)),
+                Err(_) => false,
             };
-            if c.origin != wl.origin {
+            if !trusted {
+                self.finding(
+                    Code::WitnessLogUntrusted,
+                    format!(
+                        "checkpoint {i} of the history (tree size {}) is not cosigned by a pinned key for {:?} within its validity window",
+                        c.tree_size, wl.witness
+                    ),
+                );
                 continue;
             }
-            if let Some(root) = seen.insert(c.tree_size, c.root) {
+            if let Some(root) = history.insert(c.tree_size, c.root) {
                 if root != c.root {
                     self.finding(
                         Code::WitnessLogFork,
@@ -1676,58 +1889,83 @@ impl Verifier<'_> {
                 }
             }
         }
-        let mut ours: Vec<(String, Checkpoint, bool)> = Vec::new();
+        (self.failure_count() == before).then_some(history)
+    }
+
+    /// Compare the history with every tree head the bundle vouches for: the
+    /// latest checkpoint, each anchor's checkpoint (each proven consistent
+    /// with the latest in step 8), and with a checked `--log`, the root of
+    /// every prefix of the log. Returns whether the bundle's tree is linked
+    /// to the witness's chain.
+    fn compare_history(
+        &mut self,
+        wl: &WitnessLog,
+        history: &BTreeMap<u64, Digest>,
+        latest: &ParsedCheckpoint,
+        log: Option<&[Digest]>,
+    ) -> bool {
+        let mut known: BTreeMap<u64, (Digest, String)> = BTreeMap::new();
         let bundle = self.bundle;
         for a in &bundle.anchors {
             if let Ok(cp) = parse_checkpoint(&a.checkpoint) {
-                let cosigned = a
-                    .witnesses
-                    .iter()
-                    .any(|w| matches!(w, Witness::Cosignature { name, .. } if *name == wl.witness));
-                ours.push((format!("anchor {}", a.seq), cp.checkpoint, cosigned));
+                let c = cp.checkpoint;
+                known.insert(c.tree_size, (c.root, format!("anchor {}", a.seq)));
             }
         }
-        if let Some(l) = latest {
-            ours.push(("the latest checkpoint".into(), l.checkpoint.clone(), false));
-        }
-        for (what, c, cosigned) in ours {
-            match seen.get(&c.tree_size) {
-                Some(root) if *root != c.root => self.finding(
+        known.insert(
+            latest.checkpoint.tree_size,
+            (latest.checkpoint.root, "the latest checkpoint".into()),
+        );
+        let sizes: Vec<u64> = history.keys().copied().collect();
+        let from_log = log.map(|h| merkle::prefix_roots(h, &sizes));
+        let largest = sizes.last().copied();
+        let mut linked = false;
+        for (i, (&size, root)) in history.iter().enumerate() {
+            let ours = known.get(&size).cloned().or_else(|| {
+                from_log
+                    .as_ref()
+                    .and_then(|r| r[i])
+                    .map(|r| (r, format!("the log's first {size} leaves")))
+            });
+            match ours {
+                Some((r, what)) if r != *root => self.finding(
                     Code::WitnessLogFork,
                     format!(
-                        "{what}: the witness cosigned another root for tree size {} (the log showed two histories)",
-                        c.tree_size
-                    ),
-                ),
-                None if cosigned => self.finding(
-                    Code::WitnessLogMismatch,
-                    format!(
-                        "{what} carries a cosignature from {:?}, but the witness's own log does not list it",
+                        "{what}: the witness {:?} cosigned another root for tree size {size} (the log showed two histories)",
                         wl.witness
                     ),
                 ),
+                Some(_) if Some(size) == largest => linked = true,
                 _ => {}
             }
         }
-        let ok = self.failure_count() == before;
-        self.check(
-            "11",
-            NAME,
-            if ok {
-                CheckStatus::Pass
-            } else {
-                CheckStatus::Fail
-            },
-            if ok {
-                format!(
-                    "{} cosigned checkpoint(s) from {:?}, consistent with the bundle",
-                    wl.checkpoints.len(),
-                    wl.witness
-                )
-            } else {
-                "the witness's history disagrees with the bundle".to_string()
-            },
-        );
+        let latest_cosigned =
+            history.get(&latest.checkpoint.tree_size) == Some(&latest.checkpoint.root);
+        linked || latest_cosigned
+    }
+
+    /// A bundle checkpoint that carries this witness's cosignature must be
+    /// in its history.
+    fn cosigned_anchors_listed(&mut self, wl: &WitnessLog, history: &BTreeMap<u64, Digest>) {
+        let bundle = self.bundle;
+        for a in &bundle.anchors {
+            let cosigned = a
+                .witnesses
+                .iter()
+                .any(|w| matches!(w, Witness::Cosignature { name, .. } if *name == wl.witness));
+            let Ok(cp) = parse_checkpoint(&a.checkpoint) else {
+                continue;
+            };
+            if cosigned && !history.contains_key(&cp.checkpoint.tree_size) {
+                self.finding(
+                    Code::WitnessLogMismatch,
+                    format!(
+                        "anchor {} carries a cosignature from {:?}, but the witness's own log does not list it",
+                        a.seq, wl.witness
+                    ),
+                );
+            }
+        }
     }
 
     // -- verdict ------------------------------------------------------------
@@ -1751,8 +1989,11 @@ impl Verifier<'_> {
             .map(|a| a.entries)
             .max();
         let min = self.policy.min_operators.max(1);
+        // An anchor of no entries commits only to the genesis head, which
+        // every unkeyed journal shares: it vouches for no content at all,
+        // so it never makes a bundle PARTIAL.
         self.report.verdict = match anchored {
-            None => Verdict::Unanchored,
+            None | Some(0) => Verdict::Unanchored,
             Some(n) if n >= j.len() => Verdict::Verified,
             Some(n) => Verdict::Partial {
                 unanchored: j.len() - n,
@@ -1768,10 +2009,33 @@ impl Verifier<'_> {
                 "the first {} entries are anchored with at least {min} distinct trusted operator(s); the last {unanchored} are not",
                 self.report.anchored_entries
             ),
+            _ if anchored == Some(0) => format!(
+                "the only anchors with {min} distinct trusted operator(s) cover 0 entries, which \
+                 commit to no content (every unkeyed journal starts from the same genesis head)"
+            ),
             _ => format!("no anchor has {min} distinct trusted operator(s)"),
         };
         self.check("10", "independence", CheckStatus::Info, detail);
     }
+}
+
+/// Whether a pinned log key signed a checkpoint under the checkpoint's own
+/// origin. A log signs as its origin (evidence format 6.3), and a key will
+/// sign any origin line it is given, so without this a log operator could
+/// fork its log under a renamed origin, signed by the same key, where no
+/// witness history for the real origin applies.
+fn signed_by_log(cp: &ParsedCheckpoint, keys: &[VerifierKey]) -> Result<(), String> {
+    let signed = note::verify_note(&cp.note, keys)
+        .map_err(|e| format!("is not signed by a pinned log key: {e}"))?;
+    let origin = &cp.checkpoint.origin;
+    if signed.iter().any(|v| keys[v.key].name() == origin) {
+        return Ok(());
+    }
+    Err(format!(
+        "names the origin {origin:?}, but the pinned log key that signed it is named {:?}: a \
+         log signs only checkpoints of its own origin",
+        keys[signed[0].key].name()
+    ))
 }
 
 /// `heads[n]` is the chain head after `n` entries (`heads[0]` the genesis).
@@ -1780,6 +2044,42 @@ fn prefix_heads(j: &Journal) -> Vec<Digest> {
     heads.push(j.genesis());
     heads.extend(j.entries().iter().map(|e| e.hash));
     heads
+}
+
+/// Whether a cosignature timestamp lies in a pinned witness key's validity
+/// window. A key without a window (one given on the command line) accepts
+/// any time, even a signature without a readable timestamp.
+fn in_window(key: &WitnessKey, timestamp: Option<u64>) -> bool {
+    if key.not_before.is_none() && key.not_after.is_none() {
+        return true;
+    }
+    timestamp.is_some_and(|t| {
+        key.not_before.is_none_or(|nb| t >= nb) && key.not_after.is_none_or(|na| t <= na)
+    })
+}
+
+/// The time `min` distinct trusted operators vouch for (design 5.3 steps
+/// 9 and 10): each trusted operator's earliest witness time, and of those
+/// the `min`-th earliest. Taking the plain earliest would let one operator
+/// (a compromised witness, a TSA with a wrong clock) backdate the anchor
+/// alone, although independence exists precisely so that no one operator
+/// is relied on.
+fn vouched_time(witnesses: &[WitnessReport], min: usize) -> Option<SignedTime> {
+    let mut per_operator: BTreeMap<&str, SignedTime> = BTreeMap::new();
+    for w in witnesses
+        .iter()
+        .filter(|w| w.class == WitnessClass::Trusted)
+    {
+        if let (Some(op), Some(t)) = (&w.operator, w.time) {
+            per_operator
+                .entry(op)
+                .and_modify(|e| *e = (*e).min(t))
+                .or_insert(t);
+        }
+    }
+    let mut times: Vec<SignedTime> = per_operator.into_values().collect();
+    times.sort_unstable();
+    times.get(min.max(1) - 1).copied()
 }
 
 /// `genTime` plus the stated accuracy: the latest instant the token can

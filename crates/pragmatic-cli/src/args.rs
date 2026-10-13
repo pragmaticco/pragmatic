@@ -30,6 +30,7 @@ const VALUED: &[&str] = &[
     "--log",
     "--witness-log",
     "--format",
+    "--from",
 ];
 
 /// Parsed arguments.
