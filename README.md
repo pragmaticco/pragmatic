@@ -7,7 +7,7 @@ re-pays for a token, and a tamper-evident journal that proves what your
 agent actually did.**
 
 [![CI](https://github.com/pragmaticco/pragmatic/actions/workflows/ci.yml/badge.svg)](https://github.com/pragmaticco/pragmatic/actions/workflows/ci.yml)
-[![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
 ![status: public beta](https://img.shields.io/badge/status-public%20beta-brightgreen.svg)
 
@@ -230,15 +230,16 @@ scope. [Read the concepts doc](docs/concepts.md).
 
 ## License & commercial use
 
-Pragmatic is **source-available** under the
-[Business Source License 1.1](LICENSE) - read it, modify it, self-host it.
+The runtime, the language SDKs and bindings, the CLI, the journal format and
+its verifier are **open source under the [Apache License 2.0](LICENSE)**. Use
+them anywhere, in production, at any scale, with no permission needed.
+Anyone, including an auditor who does not trust the operator, can verify a
+journal with them.
 
-- **Free** for non-production use, and for **production use by organizations
-  under US $1M annual revenue** (and not as a competing hosted service). See
-  the [Additional Use Grant](LICENSE) for exact terms.
-- **Production use beyond that requires a commercial license** -
-  [contact us](mailto:me@aniketh.net?subject=Pragmatic%20commercial%20license).
-- Each released version automatically converts to **Apache 2.0** four years
-  after release (its Change Date), so nothing is ever locked up forever.
+Pragmatic Research, Inc. sells the commercial layer built on top: the
+Pragmatic Server (shared journal storage, independent anchoring, retention,
+erasure, access control and evidence bundles) and the hosted witness.
+[Contact us](mailto:me@aniketh.net?subject=Pragmatic%20commercial%20license)
+for design-partner access.
 
 © 2026 Pragmatic Research, Inc.

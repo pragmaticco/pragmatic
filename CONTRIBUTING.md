@@ -45,6 +45,11 @@ version. See [SECURITY.md](SECURITY.md) for anything security-sensitive.
 
 ## License
 
-The project is licensed under the [Business Source License 1.1](LICENSE);
-each released version converts to Apache 2.0 on its Change Date. By
-contributing you agree your work is licensed under the same terms.
+The project is licensed under the [Apache License 2.0](LICENSE). By
+contributing you agree that your contribution is licensed under the same
+terms (section 5 of the license).
+
+Every commit must carry a `Signed-off-by:` line (`git commit -s`),
+certifying the [Developer Certificate of Origin](https://developercertificate.org/):
+that you wrote the change, or otherwise have the right to submit it under
+this license.
