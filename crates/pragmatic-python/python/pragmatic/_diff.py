@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 from typing import Any, List, Sequence
 
+from ._errors import JournalDesync
+
 _MISSING = object()
 _WIDTH = 60
 
@@ -71,3 +73,21 @@ def request_diff(recorded: Sequence[bytes], now: Sequence[bytes], limit: int = 5
         if len(out) >= limit:
             break
     return out[:limit]
+
+
+def with_diff(e: JournalDesync, recorded: Sequence[bytes], now: Sequence[bytes]) -> JournalDesync:
+    """``e`` with the differences between the recorded request parts and
+    the new ones appended to its message and kept in ``diff``. It carries
+    ``e``'s fault, so the attempt still ends with the desync it was."""
+    diff = request_diff(recorded, now)
+    if not diff:
+        return e
+    out = JournalDesync(
+        str(e) + "\n  " + "\n  ".join(diff),
+        cursor=e.cursor,
+        expected=e.expected,
+        found=e.found,
+        diff=diff,
+    )
+    out._pragmatic_fault = e._pragmatic_fault
+    return out

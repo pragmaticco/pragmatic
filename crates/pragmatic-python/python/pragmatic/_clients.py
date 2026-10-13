@@ -1,216 +1,154 @@
-"""Drop-in journaling for the Anthropic and OpenAI Python SDKs.
+"""Journaled Anthropic and OpenAI SDK clients (spec 6.5).
 
-``ctx.wrap(client)`` returns a proxy that behaves like ``client``. Model
-calls on the surfaces listed below are journaled: recorded fresh the first
-time, read back on resume and replay without touching the network.
-Everything else passes through to the real client untouched.
+``ctx.wrap(client)`` and ``pragmatic.wrap(client)`` return a genuine SDK
+client: ``client.copy(http_client=JournalingHttpClient(...))``, of a
+subclass of the client's own class that differs in three ways only:
 
-Record and replay hand the agent the same object: on record the SDK
-response is serialized, journaled, and rebuilt from the journal before it
-is returned, so the agent can never observe a difference.
+- ``copy()`` and ``with_options()`` keep the journaling HTTP client (and
+  journal any ``http_client`` passed to them), so every derived client
+  records too;
+- the API host of each copy is the host its requests may go to; a request
+  to any other host raises ``Unsupported``;
+- on OpenAI clients, ``websocket_base_url`` raises ``Unsupported``: the
+  websocket and realtime surfaces (``responses.connect()``,
+  ``realtime.connect()``, the Agents SDK websocket transport) read it
+  before they connect, and their traffic never passes through the HTTP
+  client, so it could not be journaled.
+
+``isinstance`` checks against the SDK classes hold, so frameworks that
+check the client's type (Pydantic AI, LangChain) accept it. Everything the
+SDK does goes through the journaling HTTP client: there is no list of
+supported methods.
+
+The floors are ``anthropic>=1.0`` and ``openai>=3.0``, the first releases
+built on ``httpx2``. Older releases raise ``Unsupported`` with the upgrade
+to make.
 """
 
 from __future__ import annotations
 
-import functools
-import json
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable
+import sys
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
-from ._codec import request_prompt, to_jsonable
+from ._errors import Unsupported
 
 if TYPE_CHECKING:
-    from ._runtime import Ctx
+    from ._draws import AttemptHttp
+
+FLOORS = {"anthropic": 1, "openai": 3}
+"""The first major version of each SDK built on httpx2."""
+
+OUTSIDE = ("error", "passthrough")
+
+_WS_ATTR = "_pragmatic_websocket_base_url"
+_WS_PLACEHOLDER = "wss://websockets-are-not-journaled.invalid"
+_CLASSES: Dict[type, type] = {}
 
 
-@dataclass(frozen=True)
-class _Surface:
-    api: str
-    provider: str
-    response_type: Callable[[], type]
+def _major(version: str) -> int:
+    head = version.split(".", 1)[0]
+    digits = "".join(c for c in head if c.isdigit())
+    return int(digits) if digits else 0
 
 
-def _anthropic_message() -> type:
-    from anthropic.types import Message
-
-    return Message
-
-
-def _anthropic_beta_message() -> type:
-    from anthropic.types.beta import BetaMessage
-
-    return BetaMessage
-
-
-def _openai_chat_completion() -> type:
-    from openai.types.chat import ChatCompletion
-
-    return ChatCompletion
-
-
-def _openai_response() -> type:
-    from openai.types.responses import Response
-
-    return Response
-
-
-_ANTHROPIC = {
-    ("messages", "create"): _Surface(
-        "anthropic.messages.create", "anthropic", _anthropic_message
-    ),
-    ("beta", "messages", "create"): _Surface(
-        "anthropic.beta.messages.create", "anthropic", _anthropic_beta_message
-    ),
-}
-_ANTHROPIC_UNSUPPORTED = {
-    ("messages", "stream"): "messages.stream",
-    ("beta", "messages", "stream"): "beta.messages.stream",
-    ("messages", "batches"): "messages.batches",
-}
-
-_OPENAI = {
-    ("chat", "completions", "create"): _Surface(
-        "openai.chat.completions.create", "openai", _openai_chat_completion
-    ),
-    ("responses", "create"): _Surface(
-        "openai.responses.create", "openai", _openai_response
-    ),
-}
-_OPENAI_UNSUPPORTED = {
-    ("chat", "completions", "stream"): "chat.completions.stream",
-    ("chat", "completions", "parse"): "chat.completions.parse",
-    ("responses", "stream"): "responses.stream",
-    ("responses", "parse"): "responses.parse",
-}
-
-
-def _provider_tables(client: Any):
-    module = type(client).__module__.split(".")[0]
-    if module == "anthropic":
-        return _ANTHROPIC, _ANTHROPIC_UNSUPPORTED
-    if module == "openai":
-        return _OPENAI, _OPENAI_UNSUPPORTED
-    raise TypeError(
-        f"ctx.wrap supports Anthropic and OpenAI SDK clients (sync or async); got "
-        f"{type(client).__module__}.{type(client).__name__}. For any other model "
-        "client, journal calls with ctx.draw(prompt, sample)."
-    )
-
-
-def _rebuild(surface: _Surface, outcome: str) -> Any:
-    data = json.loads(outcome)
-    cls = surface.response_type()
-    try:
-        return cls.model_validate(data)
-    except Exception:
-        # Tolerate responses newer than the installed SDK's schema, the same
-        # way the SDK itself does.
-        return cls.model_construct(**data)
-
-
-def _serialize(response: Any) -> str:
-    return json.dumps(to_jsonable(response), separators=(",", ":"), ensure_ascii=False)
-
-
-def _check_request(surface: _Surface, kwargs: dict) -> None:
-    if kwargs.get("stream") is True:
-        raise NotImplementedError(
-            f"{surface.api}(stream=True) is not journaled yet; call it without "
-            "stream=True inside a durable run"
+def provider_of(client: Any) -> str:
+    """``"anthropic"`` or ``"openai"`` for a client of a supported SDK at
+    or above its floor; ``TypeError`` or ``Unsupported`` otherwise."""
+    provider = type(client).__module__.split(".")[0]
+    if provider not in FLOORS:
+        raise TypeError(
+            "pragmatic journals Anthropic and OpenAI SDK clients (sync or async); got "
+            f"{type(client).__module__}.{type(client).__qualname__}. For another model "
+            "client, journal each call with ctx.draw(prompt, sample)."
         )
-
-
-def _provenance(surface: _Surface, kwargs: dict) -> str:
-    model = kwargs.get("model")
-    return f"{surface.provider}:{model}" if isinstance(model, str) else surface.provider
-
-
-def _sync_call(ctx: "Ctx", surface: _Surface, real: Callable, kwargs: dict) -> Any:
-    _check_request(surface, kwargs)
-    prompt = request_prompt(surface.api, kwargs)
-    outcome = ctx.draw(
-        prompt,
-        lambda: _serialize(real(**kwargs)),
-        provenance=_provenance(surface, kwargs),
-    )
-    return _rebuild(surface, outcome)
-
-
-async def _async_call(ctx: "Ctx", surface: _Surface, real: Callable, kwargs: dict) -> Any:
-    _check_request(surface, kwargs)
-    prompt = request_prompt(surface.api, kwargs)
-
-    async def sample() -> str:
-        return _serialize(await real(**kwargs))
-
-    outcome = await ctx.adraw(prompt, sample, provenance=_provenance(surface, kwargs))
-    return _rebuild(surface, outcome)
-
-
-def _journaled(ctx: "Ctx", surface: _Surface, real: Callable, is_async: bool) -> Callable:
-    if is_async:
-
-        @functools.wraps(real)
-        async def acreate(*args: Any, **kwargs: Any) -> Any:
-            if args:
-                raise TypeError(f"{surface.api} takes keyword arguments only")
-            return await _async_call(ctx, surface, real, kwargs)
-
-        return acreate
-
-    @functools.wraps(real)
-    def create(*args: Any, **kwargs: Any) -> Any:
-        if args:
-            raise TypeError(f"{surface.api} takes keyword arguments only")
-        return _sync_call(ctx, surface, real, kwargs)
-
-    return create
-
-
-def _unsupported(name: str) -> Callable:
-    def refuse(*_: Any, **__: Any) -> Any:
-        raise NotImplementedError(
-            f"{name} is not journaled yet; inside a durable run use the "
-            "non-streaming create() call"
+    floor = FLOORS[provider]
+    version = str(getattr(sys.modules.get(provider), "__version__", "0"))
+    if _major(version) < floor:
+        raise Unsupported(
+            f"pragmatic journals {provider} clients at the HTTP layer, which needs "
+            f"{provider}>={floor}.0 (the releases built on httpx2); this is {provider} "
+            f"{version}. Upgrade with: pip install -U '{provider}>={floor}.0'"
         )
-
-    return refuse
-
-
-class JournaledClient:
-    """A proxy over an SDK client (or one of its sub-resources) that routes
-    model calls through the journal."""
-
-    def __init__(self, target: Any, ctx: "Ctx", tables, is_async: bool, path: tuple = ()):
-        self._target = target
-        self._ctx = ctx
-        self._tables = tables
-        self._is_async = is_async
-        self._path = path
-
-    def __getattr__(self, name: str) -> Any:
-        attr = getattr(self._target, name)
-        path = self._path + (name,)
-        journaled, unsupported = self._tables
-        if path in journaled:
-            return _journaled(self._ctx, journaled[path], attr, self._is_async)
-        if path in unsupported:
-            return _unsupported(unsupported[path])
-        if path == ("with_options",):
-            # A reconfigured client is still journaled.
-            return lambda *a, **k: JournaledClient(
-                attr(*a, **k), self._ctx, self._tables, self._is_async
-            )
-        if any(p[: len(path)] == path for p in (*journaled, *unsupported)):
-            return JournaledClient(attr, self._ctx, self._tables, self._is_async, path)
-        return attr
-
-    def __repr__(self) -> str:
-        return f"<journaled {self._target!r}>"
+    return provider
 
 
-def wrap(client: Any, ctx: "Ctx") -> JournaledClient:
-    # SDK methods are wrapped by decorators that hide `async def`, so the
-    # client class decides: AsyncAnthropic, AsyncOpenAI, AsyncAzureOpenAI.
-    is_async = any(c.__name__.startswith("Async") for c in type(client).__mro__)
-    return JournaledClient(client, ctx, _provider_tables(client), is_async)
+def _ws_get(self: Any) -> Any:
+    from ._http import WEBSOCKETS_UNSUPPORTED
+
+    raise Unsupported(WEBSOCKETS_UNSUPPORTED)
+
+
+def _ws_set(self: Any, value: Any) -> None:
+    self.__dict__[_WS_ATTR] = value
+
+
+def _journaled_class(cls: type) -> type:
+    """The journaled subclass of an SDK client class (see the module
+    documentation). One per class, named like it."""
+    found = _CLASSES.get(cls)
+    if found is not None:
+        return found
+    from ._http import JOURNALING
+
+    base_copy = cls.copy  # type: ignore[attr-defined]
+    openai = cls.__module__.split(".")[0] == "openai"
+
+    def copy(self: Any, *args: Any, **kwargs: Any) -> Any:
+        http_client = kwargs.get("http_client")
+        if http_client is not None and not isinstance(http_client, JOURNALING):
+            kwargs["http_client"] = self._client.rebound(http_client)
+        if openai and kwargs.get("websocket_base_url") is None:
+            kwargs["websocket_base_url"] = self.__dict__.get(_WS_ATTR) or _WS_PLACEHOLDER
+        new = base_copy(self, *args, **kwargs)
+        new._client.binding.allow(new.base_url)
+        return new
+
+    copy.__doc__ = base_copy.__doc__
+    namespace: Dict[str, Any] = {
+        "__module__": cls.__module__,
+        "__qualname__": cls.__qualname__,
+        "__doc__": cls.__doc__,
+        "__pragmatic_journaled__": True,
+        "copy": copy,
+        "with_options": copy,
+    }
+    if openai:
+        namespace["websocket_base_url"] = property(_ws_get, _ws_set)
+    sub = type(cls.__name__, (cls,), namespace)
+    _CLASSES[cls] = sub
+    return sub
+
+
+def wrap(client: Any, *, outside: str = "error", http: Optional["AttemptHttp"] = None) -> Any:
+    """A journaled copy of an Anthropic or OpenAI SDK client: bound to the
+    attempt ``http`` (``ctx.wrap``), or following the caller's attempt
+    (``pragmatic.wrap``). See ``pragmatic.wrap``."""
+    if outside not in OUTSIDE:
+        raise ValueError(f"outside must be 'error' or 'passthrough', not {outside!r}")
+    provider = provider_of(client)
+    import httpx2
+
+    from ._http import JOURNALING, AsyncJournalingHttpClient, Binding, JournalingHttpClient
+
+    inner = getattr(client, "_client", None)
+    if isinstance(inner, JOURNALING):
+        inner = inner._inner
+    if isinstance(inner, httpx2.AsyncClient):
+        journaling: Any = AsyncJournalingHttpClient
+    elif isinstance(inner, httpx2.Client):
+        journaling = JournalingHttpClient
+    else:
+        raise Unsupported(
+            f"this {provider} client sends through a {type(inner).__module__}."
+            f"{type(inner).__qualname__}; pragmatic journals clients built on httpx2: pass "
+            "http_client=httpx2.Client() (or httpx2.AsyncClient()), or none"
+        )
+    binding = Binding(http, outside, provider)
+    journaled = client.copy(http_client=journaling(inner, binding))
+    if not getattr(journaled, "__pragmatic_journaled__", False):
+        websocket = journaled.__dict__.pop("websocket_base_url", None)
+        journaled.__class__ = _journaled_class(type(journaled))
+        if provider == "openai":
+            journaled.__dict__[_WS_ATTR] = websocket
+    binding.allow(journaled.base_url)
+    return journaled

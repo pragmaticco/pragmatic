@@ -183,7 +183,14 @@ impl Attempt {
 
     /// The ownership check every step makes before it touches anything,
     /// returning the branch the step runs on.
-    fn enter(&self, py: Python<'_>) -> PyResult<Branch> {
+    ///
+    /// A `relaxed` check accepts any caller whose context carries this
+    /// attempt's token, whatever its thread or task. It is for the model
+    /// calls of journaled HTTP clients (spec 6.5): frameworks issue those
+    /// from tasks and worker threads of their own that inherit the agent's
+    /// context, and the core matches several open draws on one branch by
+    /// their intents (spec 2.7).
+    fn enter(&self, py: Python<'_>, relaxed: bool) -> PyResult<Branch> {
         let current = context_var(py)?.call_method0("get")?;
         if current.is_none() {
             return Err(not_in_run(py, self.hint()));
@@ -192,6 +199,9 @@ impl Attempt {
             current.extract().map_err(|_| not_in_run(py, self.hint()))?;
         if token != self.token {
             return Err(not_in_run(py, self.hint()));
+        }
+        if relaxed {
+            return Ok(branch);
         }
         match self.owner {
             Owner::Thread(id) => {
@@ -225,14 +235,35 @@ impl Attempt {
         T: Send,
         F: FnOnce(&mut Session, &Branch) -> Result<T, Fault> + Send,
     {
-        let branch = self.enter(py)?;
+        self.step_as(py, false, f)
+    }
+
+    /// [`step`](Self::step) with the ownership check `relaxed` or not (see
+    /// [`enter`](Self::enter)).
+    fn step_as<T, F>(&self, py: Python<'_>, relaxed: bool, f: F) -> PyResult<(T, Option<u64>)>
+    where
+        T: Send,
+        F: FnOnce(&mut Session, &Branch) -> Result<T, Fault> + Send,
+    {
+        let branch = self.enter(py, relaxed)?;
+        self.locked(py, &branch, f)
+    }
+
+    /// Run a core primitive under the session lock with the GIL released,
+    /// with no ownership check: for the binding's own completions (see
+    /// [`Attempt::complete_draw`]).
+    fn locked<T, F>(&self, py: Python<'_>, branch: &Branch, f: F) -> PyResult<(T, Option<u64>)>
+    where
+        T: Send,
+        F: FnOnce(&mut Session, &Branch) -> Result<T, Fault> + Send,
+    {
         let out = py.detach(|| {
             let mut state = lock(&self.state);
             let Some(owned) = state.as_mut() else {
                 return Err(StepError::Finished);
             };
             let s = owned.session();
-            match f(s, &branch) {
+            match f(s, branch) {
                 Ok(v) => Ok((v, pending_upto(s))),
                 Err(fault) => {
                     let sticky = s.failure() == Some(&fault);
@@ -358,6 +389,22 @@ fn bytes<'py>(py: Python<'py>, v: &Value) -> Bound<'py, PyBytes> {
     PyBytes::new(py, v.as_bytes())
 }
 
+/// The request parts of the `DrawIntent` at `cursor`, or `None` when the
+/// entry is something else or a part is not sealed (erased content is never
+/// a wildcard, spec 2.8).
+fn sealed_draw_parts(s: &Session, cursor: u64) -> Option<Vec<Value>> {
+    match s.entry(cursor).map(|e| &e.event) {
+        Some(Event::DrawIntent { parts, .. }) => parts
+            .iter()
+            .map(|c| match c {
+                Content::Sealed(v) => Some(v.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    }
+}
+
 #[pymethods]
 impl Attempt {
     /// The token `CURRENT` must hold for code stepping this attempt.
@@ -405,7 +452,7 @@ impl Attempt {
 
     /// The caller's branch, after the ownership check.
     fn branch(&self, py: Python<'_>) -> PyResult<Vec<u32>> {
-        self.enter(py)
+        self.enter(py, false)
     }
 
     /// True while the caller's branch still has recorded steps to replay.
@@ -424,16 +471,19 @@ impl Attempt {
 
     /// Begin a model call. Returns `("replayed", intent, head, body, meta)`
     /// or `("fresh", intent, upto)`: the intent must be durable (`persist`)
-    /// before the model is called.
-    #[pyo3(signature = (parts, provenance))]
+    /// before the model is called. `relaxed` takes the ownership check of
+    /// journaled HTTP clients (see `enter`).
+    #[pyo3(signature = (parts, provenance, *, relaxed=false))]
     fn draw_begin<'py>(
         &self,
         py: Python<'py>,
         parts: Vec<Vec<u8>>,
         provenance: String,
+        relaxed: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let parts: Vec<Value> = parts.into_iter().map(Value::from).collect();
-        let (start, upto) = self.step(py, move |s, b| s.draw_begin(b, &provenance, parts))?;
+        let (start, upto) =
+            self.step_as(py, relaxed, move |s, b| s.draw_begin(b, &provenance, parts))?;
         Ok(match start {
             DrawStart::Replayed {
                 intent,
@@ -461,6 +511,54 @@ impl Attempt {
         Ok(self
             .step(py, move |s, _| s.draw_end(intent, meta, head, body))?
             .1)
+    }
+
+    /// Complete the model call at `intent` without the ownership check, for
+    /// a journaled HTTP client that commits a stream wherever it ends: in
+    /// the task or thread that reads it, when it is closed, when it is
+    /// collected (`weakref.finalize`), or when the attempt ends (spec 6.5).
+    /// Returns `upto`. The draw's branch is the one its intent is on.
+    fn complete_draw(
+        &self,
+        py: Python<'_>,
+        intent: u64,
+        meta: String,
+        head: Vec<u8>,
+        body: Vec<u8>,
+    ) -> PyResult<Option<u64>> {
+        let (head, body) = (Value::from(head), Value::from(body));
+        Ok(self
+            .locked(py, &Vec::new(), move |s, _| {
+                s.draw_end(intent, meta, head, body)
+            })?
+            .1)
+    }
+
+    /// The request parts recorded by the next start on the caller's branch
+    /// when it is a `DrawIntent` whose parts are all sealed, else `None`.
+    /// For request normalization (spec 6.6): the Python layer compares the
+    /// normalized parts and, when they agree, begins the draw with these.
+    #[pyo3(signature = (*, relaxed=false))]
+    fn next_draw_parts<'py>(
+        &self,
+        py: Python<'py>,
+        relaxed: bool,
+    ) -> PyResult<Option<Vec<Bound<'py, PyBytes>>>> {
+        let (parts, _) = self.step_as(py, relaxed, |s, b| {
+            Ok(s.next_start(b).and_then(|c| sealed_draw_parts(s, c)))
+        })?;
+        Ok(parts.map(|ps| ps.iter().map(|v| bytes(py, v)).collect()))
+    }
+
+    /// Count `calls` model calls a journaled client let through unrecorded
+    /// (`outside="passthrough"`), for `attempt.end.passthrough_calls`. No
+    /// ownership check: such calls come from code outside the attempt.
+    fn count_passthrough(&self, py: Python<'_>, calls: u64) -> PyResult<()> {
+        self.locked(py, &Vec::new(), move |s, _| {
+            s.count_passthrough(calls);
+            Ok(())
+        })?;
+        Ok(())
     }
 
     /// Begin an effect. Returns `("replayed", result)`, `("failed", kind,
@@ -585,18 +683,7 @@ impl Attempt {
         py: Python<'py>,
         cursor: u64,
     ) -> PyResult<Option<Vec<Bound<'py, PyBytes>>>> {
-        let (parts, _) = self.step(py, move |s, _| {
-            Ok(match s.entry(cursor).map(|e| &e.event) {
-                Some(Event::DrawIntent { parts, .. }) => parts
-                    .iter()
-                    .map(|c| match c {
-                        Content::Sealed(v) => Some(v.clone()),
-                        _ => None,
-                    })
-                    .collect::<Option<Vec<Value>>>(),
-                _ => None,
-            })
-        })?;
+        let (parts, _) = self.step_as(py, true, move |s, _| Ok(sealed_draw_parts(s, cursor)))?;
         Ok(parts.map(|ps| ps.iter().map(|v| bytes(py, v)).collect()))
     }
 

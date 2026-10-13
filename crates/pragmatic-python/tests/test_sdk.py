@@ -18,11 +18,7 @@ import pragmatic
 anthropic = pytest.importorskip("anthropic")
 openai = pytest.importorskip("openai")
 
-# Newer SDK releases ship on `httpx2`; older ones on `httpx`.
-try:
-    import httpx2 as httpx
-except ImportError:
-    import httpx
+httpx = pytest.importorskip("httpx2")
 
 
 class Crash(Exception):
@@ -361,19 +357,6 @@ def test_openai_responses(tmp_path):
     }
     audit = rt.replay("r1", agent)
     assert audit.output == "Done." and len(api.requests) == 2
-
-
-def test_streaming_is_refused_not_silently_unjournaled(tmp_path):
-    api = MockAPI([])
-    rt = pragmatic.Runtime(tmp_path)
-
-    def agent(ctx):
-        client = ctx.wrap(anthropic.Anthropic(api_key="test", http_client=api.sync_client()))
-        client.messages.create(model="m", max_tokens=1, messages=[], stream=True)
-
-    with pytest.raises(NotImplementedError):
-        rt.run("r1", agent)
-    assert api.requests == []
 
 
 def test_durable_marker_rejects_changed_program(tmp_path):

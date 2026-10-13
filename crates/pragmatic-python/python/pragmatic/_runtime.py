@@ -45,10 +45,12 @@ from typing import (
 )
 
 from . import _native, _otel
-from ._clients import JournaledClient, wrap as _wrap
+from ._clients import wrap as _wrap
 from ._codec import canonical, to_jsonable
-from ._diff import request_diff
-from ._errors import JournalDesync, PragmaticError, ServerError
+from ._diff import with_diff
+from ._draws import AttemptHttp
+from ._errors import JournalDesync, PragmaticError, ServerError, unwrap_fault
+from ._normalize import Normalizer
 from ._failures import replayed as _replayed_failure, type_name as _type_name
 from ._reports import Entry, RunSummary, VerifyReport
 from ._server import ServerStore, check_url, is_server_url
@@ -338,12 +340,19 @@ class Ctx:
     ``ctx.gather`` or ``asyncio.to_thread``.
     """
 
-    __slots__ = ("_att", "_io", "_rt")
+    __slots__ = ("_att", "_io", "_rt", "_http")
 
     def __init__(self, attempt: Any, driver: Any, runtime: "Runtime"):
         self._att = attempt
         self._io = driver
         self._rt = runtime
+        self._http = AttemptHttp(attempt, driver, runtime._normalizer)
+
+    def _step(self) -> None:
+        """Before any journaled step: a model stream the agent has not
+        started reading on this branch is written off (spec 6.5)."""
+        if self._http.open:
+            self._http.settle_untouched()
 
     @property
     def run_id(self) -> str:
@@ -365,11 +374,21 @@ class Ctx:
 
     # -- model calls ------------------------------------------------------
 
-    def wrap(self, client: Any) -> JournaledClient:
-        """Return ``client`` (an Anthropic or OpenAI SDK client, sync or
-        async) with its model calls journaled. Use the result exactly like
-        the original client."""
-        return _wrap(client, self)
+    def wrap(self, client: Any, *, outside: str = "error") -> Any:
+        """A journaled copy of ``client``, an Anthropic (``anthropic>=1.0``)
+        or OpenAI (``openai>=3.0``) SDK client, sync or async, bound to this
+        attempt. It is a genuine client of the same class: every request it
+        sends is journaled (``create``, streams and their helpers,
+        ``.parse()``, raw and streaming responses, token counts), and on
+        resume and replay the response comes back from the journal byte for
+        byte, so the SDK builds the very same objects.
+
+        ``outside="passthrough"`` lets calls made outside this attempt (from
+        a thread that does not carry its context) through unrecorded,
+        counted in ``attempt.end.passthrough_calls``; by default they raise
+        ``NotInRun``. Use ``pragmatic.wrap`` for a client that follows
+        whichever run calls it."""
+        return _wrap(client, outside=outside, http=self._http)
 
     def _draw_begin(self, parts: List[bytes], provenance: str) -> Tuple[Any, ...]:
         try:
@@ -387,18 +406,7 @@ class Ctx:
             recorded = None
         if not recorded:
             return e
-        diff = request_diff(recorded, parts)
-        if not diff:
-            return e
-        out = JournalDesync(
-            str(e) + "\n  " + "\n  ".join(diff),
-            cursor=e.cursor,
-            expected=e.expected,
-            found=e.found,
-            diff=diff,
-        )
-        out._pragmatic_fault = e._pragmatic_fault
-        return out
+        return with_diff(e, recorded, parts)
 
     @staticmethod
     def _replayed_body(start: Tuple[Any, ...]) -> bytes:
@@ -423,6 +431,7 @@ class Ctx:
         message), so an agent that catches the exception replays the same
         way: replay raises ``DrawFailed``, which is also an instance of the
         original exception type."""
+        self._step()
         with _otel.draw(self.run_id, self._span_branch(), provenance) as span:
             start = self._draw_begin([_text(prompt)], provenance)
             if start[0] == "replayed":
@@ -448,6 +457,7 @@ class Ctx:
         self, prompt: str, sample: Callable[[], Awaitable[str]], *, provenance: str = "python"
     ) -> str:
         """``draw`` for an async model call."""
+        self._step()
         with _otel.draw(self.run_id, self._span_branch(), provenance) as span:
             start = self._draw_begin([_text(prompt)], provenance)
             if start[0] == "replayed":
@@ -501,6 +511,7 @@ class Ctx:
         message) and its exception propagates; replay raises
         ``EffectFailed``, which is also an instance of the original
         exception type, so the agent's ``except`` clause behaves the same."""
+        self._step()
         with _otel.effect(self.run_id, self._span_branch(), name) as span:
             start = self._effect_start(name, arg)
             if start[0] == "replayed":
@@ -542,6 +553,7 @@ class Ctx:
 
     async def aeffect(self, name: str, arg: str, perform: Callable[..., Any]) -> str:
         """``effect`` for an async (or sync) ``perform``."""
+        self._step()
         with _otel.effect(self.run_id, self._span_branch(), name) as span:
             start = self._effect_start(name, arg)
             if start[0] == "replayed":
@@ -609,12 +621,14 @@ class Ctx:
         """Receive a value sent with ``Runtime.send`` (journaled). An empty
         inbox raises ``PragmaticError`` (a timeout), which replays too once
         the agent carries on past it."""
+        self._step()
         value, upto = self._att.recv(channel)
         self._io.durable(upto)
         return _decode(value)
 
     def now(self) -> int:
         """A journaled clock read, in nanoseconds since the Unix epoch."""
+        self._step()
         nanos, upto = self._att.now()
         self._io.durable(upto)
         return nanos
@@ -627,6 +641,7 @@ class Ctx:
         return epoch + _dt.timedelta(microseconds=nanos // 1000)
 
     def _random(self, source: str, args: str) -> bytes:
+        self._step()
         value, upto = self._att.random(source, args)
         self._io.durable(upto)
         return value
@@ -661,6 +676,7 @@ class Ctx:
         """True if this run takes the code patch ``name`` (spec 2.9): runs
         recorded before the patch keep their old path, new runs take the new
         one."""
+        self._step()
         taken, upto = self._att.patched(name)
         self._io.durable(upto)
         return taken
@@ -669,6 +685,7 @@ class Ctx:
         """Consume the marker of patch ``name`` if this run took it; never
         records one. Replaces ``patched`` once no run without the patch can
         still resume."""
+        self._step()
         self._att.deprecate_patch(name)
 
     def contract(self, holds: bool, msg: str) -> None:
@@ -677,9 +694,11 @@ class Ctx:
             raise _native.fault_exception("ContractViol", msg)
 
     def _program_marker(self, name: str, digest: str) -> None:
+        self._step()
         self._io.durable(self._att.program_marker(name, digest))
 
     async def _aprogram_marker(self, name: str, digest: str) -> None:
+        self._step()
         await self._io.adurable(self._att.program_marker(name, digest))
 
     # -- parallel regions -------------------------------------------------
@@ -704,12 +723,15 @@ class Ctx:
                 )
         if not fns:
             return []
+        self._step()
         children, upto = self._att.fork(len(fns))
         await self._io.adurable(upto)
         loop = asyncio.get_running_loop()
         tasks = [loop.create_task(self._child(tuple(c), fn)) for c, fn in zip(children, fns)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         ok = [not isinstance(r, BaseException) for r in results]
+        if not any(_is_crash(r) for r in results):
+            self._http.settle_regions(children)
         checks = self._att.join([list(c) for c in children], ok)
         for result, check in zip(results, checks):
             if isinstance(result, BaseException):
@@ -763,18 +785,30 @@ def _agent_name(agent: Any) -> str:
     return getattr(_unwrap(agent), "__qualname__", None) or type(agent).__name__
 
 
-def _end_failed(att: Any, exc: BaseException) -> None:
-    """End an attempt whose agent raised. An exception that is not an
-    ``Exception`` (an interrupt, a cancelled task, ``SystemExit``) is a
-    crash: nothing more is journaled (spec 2.7, rule 7). Anything else is
-    recorded in ``attempt.end``, with the runtime's own fault when the
-    exception carries one. The agent's exception is what the caller sees,
-    so a failure to end is not raised over it."""
+def _is_crash(result: Any) -> bool:
+    """True for what a crash raises: a ``BaseException`` that is not an
+    ``Exception`` (an interrupt, a cancellation), once unwrapped from a
+    journaled client's carrier."""
+    if not isinstance(result, BaseException):
+        return False
+    return not isinstance(unwrap_fault(result), Exception)
+
+
+def _end_failed(att: Any, http: AttemptHttp, exc: BaseException) -> None:
+    """End an attempt whose agent raised (``exc`` already unwrapped from a
+    journaled client's carrier). An exception that is not an ``Exception``
+    (an interrupt, a cancelled task, ``SystemExit``) is a crash: nothing
+    more is journaled (spec 2.7, rule 7). Anything else is recorded in
+    ``attempt.end``, with the runtime's own fault when the exception carries
+    one. The agent's exception is what the caller sees, so a failure to end
+    is not raised over it."""
     if not isinstance(exc, Exception):
+        http.abandon()
         att.abandon()
         return
     handle = getattr(exc, "_pragmatic_fault", None)
     try:
+        http.end()
         if handle is not None:
             att.finish("fault", handle)
         else:
@@ -841,8 +875,13 @@ class Runtime:
       local disk.
     - ``oracle`` is an optional default ``(str) -> str`` model for
       ``ctx.oracle``; agents that use ``ctx.wrap(client)`` do not need one.
-    - ``timeout`` is the server read timeout in seconds; ``volatile`` lists
-      request-normalization rules (JSON paths) for journaled HTTP clients.
+    - ``timeout`` is the server read timeout in seconds.
+    - ``volatile`` lists request fields replay may ignore, as JSON paths
+      into the request body of journaled model calls (``"$.metadata.
+      session_id"``, ``"$.messages[*].id"``), on top of the built-in rule
+      for the OpenAI Agents SDK's per-run prompt cache keys. Every rule
+      loosens what a replay proves, so the rules in force are named in each
+      ``attempt.start`` note (spec 6.6).
     - ``dir=`` is a deprecated alias of ``store``.
     """
 
@@ -884,6 +923,7 @@ class Runtime:
         self._store = store
         self._oracle = oracle
         self.volatile: Tuple[str, ...] = tuple(volatile or ())
+        self._normalizer = Normalizer(self.volatile)
         self._native = _native.Runtime(native_store(store), native_key)
 
     @staticmethod
@@ -930,6 +970,7 @@ class Runtime:
             subjects=list(subjects) if subjects else None,
             on_code_change=on_code_change,
             program=_program_identity(agent),
+            normalization=self._normalizer.names,
         )
 
     def _sync(
@@ -955,10 +996,15 @@ class Runtime:
                         result = self._await_privately(agent, result)
                     output = _encode_output(result)
                 except BaseException as exc:
-                    _end_failed(att, exc)
-                    raise
+                    error = unwrap_fault(exc)
+                    _end_failed(att, ctx._http, error)
+                    if error is exc:
+                        raise
+                    raise error from None
+                ctx._http.end()
                 return att.finish("ok", output)
         finally:
+            ctx._http.retire()
             CURRENT.reset(token)
 
     @staticmethod
@@ -1001,6 +1047,7 @@ class Runtime:
             att.own_current_task()
             token = CURRENT.set((att.token, ()))
             failure: Optional[BaseException] = None
+            carried = False
             output = b""
             try:
                 with _otel.attempt(run_id, mode):
@@ -1010,17 +1057,26 @@ class Runtime:
                             result = await result
                         output = _encode_output(result)
                     except BaseException as exc:
-                        failure = exc
+                        failure = unwrap_fault(exc)
+                        carried = failure is not exc
             finally:
                 CURRENT.reset(token)
-            if failure is None:
-                fut, cancelled = await _uncancellable(
-                    loop.run_in_executor(executor, att.finish, "ok", output)
+            try:
+                if failure is None:
+                    ctx._http.end()
+                    fut, cancelled = await _uncancellable(
+                        loop.run_in_executor(executor, att.finish, "ok", output)
+                    )
+                    if cancelled:
+                        raise asyncio.CancelledError()
+                    return fut.result()
+                await _uncancellable(
+                    loop.run_in_executor(executor, _end_failed, att, ctx._http, failure)
                 )
-                if cancelled:
-                    raise asyncio.CancelledError()
-                return fut.result()
-            await _uncancellable(loop.run_in_executor(executor, _end_failed, att, failure))
+            finally:
+                ctx._http.retire()
+            if carried:
+                raise failure from None
             raise failure
         finally:
             executor.shutdown(wait=False)

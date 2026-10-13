@@ -51,6 +51,13 @@ class Step:
             if value is not None:
                 self.span.set_attribute(_ATTR.get(key, key), value)
 
+    def end(self) -> None:
+        """End a span started with ``start_draw`` (once; later calls do
+        nothing)."""
+        span, self.span = self.span, None
+        if span is not None:
+            span.end()
+
 
 _ATTR = {
     "cursor": "pragmatic.cursor",
@@ -76,12 +83,7 @@ def attempt(run_id: str, mode: str) -> Iterator[Step]:
         yield Step(span)
 
 
-@contextlib.contextmanager
-def draw(run_id: str, branch: Sequence[int], provenance: str) -> Iterator[Step]:
-    tracer = _get_tracer()
-    if tracer is None:
-        yield Step(None)
-        return
+def _draw_attrs(run_id: str, branch: Sequence[int], provenance: str) -> tuple:
     provider, _, model = provenance.partition(":")
     attrs = {
         "gen_ai.operation.name": "chat",
@@ -91,9 +93,29 @@ def draw(run_id: str, branch: Sequence[int], provenance: str) -> Iterator[Step]:
     }
     if model:
         attrs["gen_ai.request.model"] = model
-    name = f"chat {model}" if model else "chat"
+    return (f"chat {model}" if model else "chat"), attrs
+
+
+@contextlib.contextmanager
+def draw(run_id: str, branch: Sequence[int], provenance: str) -> Iterator[Step]:
+    tracer = _get_tracer()
+    if tracer is None:
+        yield Step(None)
+        return
+    name, attrs = _draw_attrs(run_id, branch, provenance)
     with tracer.start_as_current_span(name, attributes=attrs) as span:
         yield Step(span)
+
+
+def start_draw(run_id: str, branch: Sequence[int], provenance: str) -> Step:
+    """The span of one journaled HTTP exchange, ended with ``Step.end()``
+    when its result is written: a stream's span lasts until the stream
+    ends or is closed, so it cannot be a context manager."""
+    tracer = _get_tracer()
+    if tracer is None:
+        return Step(None)
+    name, attrs = _draw_attrs(run_id, branch, provenance)
+    return Step(tracer.start_span(name, attributes=attrs))
 
 
 @contextlib.contextmanager

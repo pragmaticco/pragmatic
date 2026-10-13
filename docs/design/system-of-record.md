@@ -4,7 +4,8 @@ Status: design, revision 3 (2026-10-13), after an adversarial review across
 cryptography, replay correctness, storage and failure handling, compliance,
 developer experience and completeness, amended after the review of the core
 runtime (2.4, 2.6 to 2.8, 2.11, 2.12, 2.14, 3.1 to 3.3, 6.7) and while
-building the Python runtime layer (3.1, 4.4, 4.6, 6.2, 6.3, 6.7). This
+building the Python runtime layer (3.1, 4.4, 4.6, 6.2, 6.3, 6.7) and its
+journaled model clients (2.6, 2.11, 3.0, 3.1, 6.5, 6.6, 6.7). This
 document is the contract
 between the components built for 0.6. Everything marked MUST is
 normative; where code and this document disagree, one of them is a bug.
@@ -234,7 +235,13 @@ Slots are content and are erasable.
 "model": "...", "stop_reason": "...", "usage": {"input_tokens": n,
 "output_tokens": n, "cache_read_tokens": n, "cache_write_tokens": n,
 "reasoning_tokens": n}, "latency_ms": n}`. `partial` marks a stream that
-was closed before it ended. `error_type` names what the caller's model
+was closed before it ended (a stream whose recorded bytes end in the
+provider's terminal event, such as `data: [DONE]` or `message_stop`, is
+`ok` even when the caller closed it before the connection ended, which
+the OpenAI SDK always does). An HTTP response with a status of 400 or
+more is `error` with its `status`; a body that broke while it was read is
+`error` with its `status`, `error_kind` and `error_type`, and the message
+in the head (6.5). `error_type` names what the caller's model
 client raised when the call failed outside HTTP (a core `Fault` kind such
 as `Unavailable` for a Rust oracle, or a Python exception's
 `module.QualName`), with the message in the body slot, so replay raises the
@@ -394,7 +401,7 @@ no personal data; anything personal goes in a payload slot.
 | kind | written by | data | payload slots |
 |---|---|---|---|
 | `run.start` | SDK | `{"run_id": exact id, "nonce": 32 hex, "sdk", "sdk_version", "format": 2, "labels": {...}}` | 0: `{"subjects": [...]}` (optional) |
-| `attempt.start` | SDK | `{"attempt": n, "mode": "run"\|"resume", "sdk", "sdk_version", "principal", "program": {"name", "hash"}, "host", "pid", "traceparent", "torn_bytes", "torn_at_cursor"}` | none |
+| `attempt.start` | SDK | `{"attempt": n, "mode": "run"\|"resume", "sdk", "sdk_version", "principal", "program": {"name", "hash"}, "host", "pid", "traceparent", "torn_bytes", "torn_at_cursor"}`, plus `"normalization": [rule names]` when the SDK matches draws under normalization (6.6) | none |
 | `attempt.end` | SDK | `{"attempt": n, "outcome": "ok"\|"fault"\|"error", "fault_kind": tag, "fault_cursor": n\|null, "fresh": n, "replayed": n, "usage_fresh": {...}, "passthrough_calls": n}` | 0: output (on ok); 1: fault or error message |
 | `program.change` | SDK | `{"branch", "cursor", "from", "to"}` | none |
 | `recovery` | SDK | `{"intent": cursor, "result": cursor, "branch", "name", "decision": "commit"\|"compensate"\|"retry"}`, plus `"saga": "begin"\|"done"` for a Supervisor saga's compensation | none |
@@ -404,6 +411,11 @@ no personal data; anything personal goes in a payload slot.
 
 - `principal` and `by` are token ids (or the local OS user), never names
   or emails.
+- `usage_fresh` is computed by the core: the sum, per counter, of the
+  `usage` objects in the meta of the `DrawResult`s this attempt appended
+  (counters that are not non-negative integers are skipped). Replayed
+  draws add nothing. `passthrough_calls` is what the SDK reported through
+  `Session::count_passthrough` (6.5).
 - `program` in `attempt.start` is the agent's source hash, recorded even
   without `durable` as information. It does not change replay strictness.
 - `labels`: at most 32 pairs, keys `[a-z0-9_.-]{1,64}`, values at most 256
@@ -719,6 +731,8 @@ impl Session {
     pub fn deprecate_patch(&mut self, b, name) -> Result<(), Fault>;
     pub fn program_marker(&mut self, b, name, hash) -> Result<(), Fault>;
     pub fn is_replaying(&self, b) -> bool;
+    pub fn next_start(&self, b) -> Option<Cursor>;                  // peek, for normalized draw matching (6.6)
+    pub fn count_passthrough(&mut self, calls: u64);                // attempt.end.passthrough_calls (6.5)
     pub fn unpersisted(&self) -> Option<(u64, Vec<u8>, Digest)>;   // (at, frames, head after)
     pub fn mark_persisted(&mut self, upto_entries: u64);
     pub fn sync(&mut self) -> Result<(), Fault>;                    // persist inline through the sink
@@ -738,7 +752,9 @@ persisted inline. A receive whose `ChannelRecv` never becomes durable
 (its persist fails, or the attempt is abandoned) goes back to the front of
 its channel. `Session::join_each` returns each child's completeness check,
 so a host that runs region children itself can raise the failure of the
-lowest-index failed child.
+lowest-index failed child. `RunOptions.normalization` names the
+request-normalization rules a host matches draws under; `attempt.start`
+records them (6.6).
 
 `Ctx<'a>` is `{ session: &'a mut Session, branch: Branch }` and keeps
 today's methods (`oracle`, `effect`, `recv`, `now`, `contract`,
@@ -1645,9 +1661,8 @@ overrides `send()`. This works for Anthropic and OpenAI, sync and async.
 - **Version floors:** `anthropic>=1.0` and `openai>=3.0`, the first
   releases built on `httpx2`. Older SDKs raise `Unsupported` with an
   upgrade hint.
-- **Starting point:** the research prototype in
-  `crates/pragmatic-python/prototypes/journal_http.py` (copied from the
-  research scratch space).
+- **Starting point:** the research prototype, since superseded by
+  `crates/pragmatic-python/python/pragmatic/_http.py` and its tests.
 - **Tests:** use `httpx2.MockTransport`, never httpx-patching libraries.
 - **Not covered, with the documented alternative:**
   - MCP tool calls, which use the `mcp` package's own client: journal them
@@ -1686,6 +1701,90 @@ Every HTTP exchange is a draw:
 - `attempt.end.passthrough_calls` counts calls made under
   `outside="passthrough"`.
 
+Resolved while building the clients:
+
+- **Part 0** is the canonical JSON (3.7 serialization) of `{"method",
+  "path", "query", "headers", "body"}`: `query` as sorted `[name, value]`
+  pairs, without parameters whose names contain `key`, `token`, `secret`,
+  `sig`, `password`, `auth` or `credential` (gateways that take
+  credentials in the URL would otherwise put them in the journal, and a
+  rotated credential must not desync a replay); `headers` holding only `anthropic-version`, `anthropic-beta` and
+  `openai-beta` when sent, since they select API behavior and are not
+  transport headers; `body` with each `messages` or `input` list replaced
+  by `{"$parts": n}`, so part 0 says which parts follow and the request can
+  be rebuilt from its parts for normalization (6.6) and the desync diff.
+  The parts are canonical re-encodings of the wire body, the same for the
+  same call whatever order the SDK wrote the keys in. A body that is not
+  JSON (a multipart upload) is recorded as a final part as sent, and part
+  0 carries `"raw_body": true`.
+- **The head's header allowlist** is `content-type`, `request-id`,
+  `x-request-id`, `retry-after`, `retry-after-ms` and `x-should-retry`:
+  what the SDKs read to parse, identify and retry a response. On record
+  the caller gets the same headers as replay will, so the two cannot
+  differ. The body is the decoded bytes; `content-encoding` and
+  `content-length` are never served.
+- **Retry hints on replay.** Both SDKs treat `retry-after-ms: 0` as no
+  hint and fall back to exponential backoff (half a second and up), so a
+  replayed error response (status 400 or more) is served with
+  `retry-after-ms: 1`. A recorded hint over 60 seconds is kept as
+  recorded: the OpenAI SDK refuses to retry past two minutes, and a
+  shorter hint would turn that refusal into a retry the recording never
+  made. A transport error has no headers to carry a hint, so its replay
+  waits the SDK's own backoff before the recorded retry.
+- **Error results.** A response with a status of 400 or more is read
+  whole inside `send()` (the SDK may close a retried one unread) and
+  recorded with outcome `error` and its `status`. A transport error is
+  recorded with `error_kind`, `error_type` (the httpx2 class) and the
+  message in the body slot, and an empty head; replay raises a
+  `DrawFailed` that is also an instance of the recorded httpx2 class, so
+  the SDK wraps and retries it as it did. A body that breaks while it is
+  read keeps the bytes read, with the message as `"error"` in the head;
+  replay serves the bytes, then raises the same failure.
+- **When a stream's result is written.** At the end of the body (durable
+  before the end reaches the caller); on `close()`; when the response is
+  collected (`weakref.finalize`); at the next journaled step on its
+  branch, for a stream the agent has not started reading (a stream that is
+  being read may stay open while tools run, 2.7); before a parallel region
+  joins, for streams on its children; and before `attempt.end`. Whichever
+  comes first writes `partial` with the bytes read so far, and from then
+  on the stream reads no further, so what the agent saw on record is what
+  replay serves. A close, a finalizer or the end of a region only appends
+  the result: they can run inside a store's persist (a garbage collection)
+  or on a thread that must not block, and the entry becomes durable with
+  the next persist or the attempt's finish. A crash writes nothing: the
+  intent stays dangling and resume makes the call again.
+- **The carrier** is `pragmatic.JournalFault` (`.error` holds the fault).
+  It carries everything a journal operation raises inside `send()` or a
+  stream, store exceptions included, since an SDK would otherwise retry an
+  `OSError` as a connection error. `rt.run` and the other entry points
+  unwrap it, also from exception groups, and `ctx.gather` treats a child
+  that raised one as failed. Code outside a run catches `JournalFault`.
+- **Ownership.** A journaled client's draws take a relaxed ownership
+  check: the caller's context must carry the attempt's token, whatever its
+  thread or task. Frameworks call the model from tasks and worker threads
+  they start from the agent's context (the Agents SDK's `run_streamed`,
+  LangGraph nodes), and the core matches several open draws on one branch
+  by their intents. A start issued while another in-flight draw on the
+  same branch has the identical request logs a warning on the `pragmatic`
+  logger.
+- **Passthrough attribution.** `ctx.wrap(client, outside="passthrough")`
+  sends calls made outside its attempt unrecorded and counts them in that
+  attempt's `passthrough_calls` while it runs. A `pragmatic.wrap` client's
+  passthrough calls happen outside every attempt and are attributed to
+  none. A call made from inside a different attempt is always `NotInRun`:
+  it would be missing from that attempt's record.
+- **The returned client** is an instance of a subclass of the client's
+  own class, with the same name, that keeps the journaling client through
+  `copy()` and `with_options()` (journaling any `http_client` passed to
+  them), allows requests only to the API hosts of the client and its
+  copies, and (OpenAI) makes `websocket_base_url` raise `Unsupported`:
+  every websocket surface (`responses.connect()`, `realtime.connect()`,
+  the Agents SDK websocket transport) reads it before connecting, and its
+  traffic never passes through the HTTP client.
+- **LangChain.** `ChatAnthropic` offers no way to pass a client in, so
+  `journal(llm)` returns a copy whose cached `_client` and `_async_client`
+  are journaled; `ChatOpenAI` takes its clients as fields.
+
 ### 6.6 Normalization (volatile request fields)
 
 Matching compares normalized request parts. The stored parts are always
@@ -1694,6 +1793,20 @@ the raw wire bytes. The built-in rules replace Agents SDK
 `Runtime(volatile=[...])` adds JSON-path rules. The rules are recorded in
 `attempt.start.data.normalization` by name, so an auditor can see what was
 loosened.
+
+Resolved while building the clients:
+
+- The built-in rule is named `agents-sdk:prompt_cache_key`; a volatile
+  rule's name is its path. Paths apply to the request body: `$` then
+  `.name`, `['name']`, `[n]`, `[*]` or `.*`; a bad path is a `ValueError`
+  when the runtime is built. A matched value becomes `<volatile>`.
+- "Raw wire bytes" means the parts as 6.5 encodes them, before any rule
+  is applied. To match, the SDK peeks at the next recorded start on the
+  branch (`Session::next_start`), rebuilds both bodies from their parts,
+  normalizes both, and when they agree begins the draw with the recorded
+  parts, so the core's exact comparison holds. A request no rule changes
+  is matched exactly, with no peek. A desync's diff compares the
+  normalized requests.
 
 ### 6.7 Other APIs
 
@@ -1726,6 +1839,8 @@ loosened.
 - `JournalDesync` for a draw carries a diff of normalized request parts:
   the first differing JSON paths, with values shortened. The message is
   never written to a journal field.
+- `pragmatic.JournalFault(BaseException)` carries a fault out of a model
+  SDK (6.5); it is not a `PragmaticError`.
 - Exceptions: `PragmaticError` ⊃ `JournalDesync`, `ReplayExhausted`,
   `Locked(retry_after)`, `Conflict(expected, actual)`, `LeaseLost`,
   `Deleted`, `Erased(cursor)`, `Unsupported`, `TooLarge`, `Unavailable`,

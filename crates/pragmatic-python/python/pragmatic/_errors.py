@@ -169,6 +169,48 @@ class NotInRun(PragmaticError):
     the attempt does not own. Use ``ctx.gather`` or ``asyncio.to_thread``."""
 
 
+class JournalFault(BaseException):
+    """A runtime fault raised from inside a journaled model client.
+
+    Model SDKs retry and wrap the exceptions their HTTP client raises (the
+    Anthropic SDK turns any foreign ``Exception`` into a retried
+    ``APIConnectionError``), and agent frameworks catch ``Exception`` around
+    model calls. A desync, a refused step or a failed persist must reach the
+    runtime unchanged instead, so a journaled client raises it inside this
+    carrier, which derives from ``BaseException`` only. ``rt.run`` and the
+    other entry points unwrap it: the caller sees the ``PragmaticError`` in
+    ``error``. Code outside a run (where nothing unwraps it) reads ``error``
+    itself."""
+
+    def __init__(self, error: PragmaticError):
+        super().__init__(f"{type(error).__name__}: {error}")
+        self.error = error
+
+
+def _carrier(exc: BaseException) -> Optional[JournalFault]:
+    if isinstance(exc, JournalFault):
+        return exc
+    group = getattr(exc, "exceptions", None)
+    if isinstance(group, tuple):
+        for e in group:
+            found = _carrier(e)
+            if found is not None:
+                return found
+    return None
+
+
+def unwrap_fault(exc: BaseException) -> BaseException:
+    """The exception a journaled client's carrier holds, or ``exc``. An
+    exception group (from an anyio task group, say) is searched for a
+    carrier, so a fault one task raised is not lost in the group. The
+    unwrapped exception takes the carrier's traceback, which runs through
+    the SDK frames that carried it."""
+    found = _carrier(exc)
+    if found is None:
+        return exc
+    return found.error.with_traceback(found.__traceback__)
+
+
 class ServerError(PragmaticError):
     """The server refused a request with a definitive error (spec 4.4):
     ``status`` and ``code`` are what it answered, ``url`` the request."""

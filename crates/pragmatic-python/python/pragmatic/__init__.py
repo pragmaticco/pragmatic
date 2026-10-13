@@ -27,11 +27,15 @@ any run replays exactly for debugging and audit.
     rt.replay("research-42", agent)    # audit: nothing is called at all
 
 Async agents use ``await rt.arun(...)`` and ``await ctx.gather(...)`` for
-parallel branches.
+parallel branches. Agent frameworks take a client journaled with
+``pragmatic.wrap(client)``, which records into whichever run calls it (and
+``pragmatic.integrations.langchain.journal(llm)`` for LangChain models).
 """
 
+from typing import Any as _Any
+
 from ._native import RunReport, __version__
-from ._clients import JournaledClient
+from ._clients import wrap as _wrap
 from ._errors import (
     Conflict,
     DanglingEffect,
@@ -40,6 +44,7 @@ from ._errors import (
     EffectUnrecorded,
     Erased,
     JournalDesync,
+    JournalFault,
     LeaseLost,
     Locked,
     NotInRun,
@@ -57,6 +62,31 @@ from ._server import ServerStore
 from ._stores import JOURNAL_HEADER, DirStore, MemoryStore, Store
 from ._tools import ToolCall, tool_calls
 
+
+def wrap(client: _Any, *, outside: str = "error") -> _Any:
+    """A journaled copy of ``client``, an Anthropic (``anthropic>=1.0``) or
+    OpenAI (``openai>=3.0``) SDK client, sync or async, that records into
+    whichever durable run calls it.
+
+    Build it once, at module level or in a framework's configuration (the
+    OpenAI Agents SDK's ``set_default_openai_client``, a Pydantic AI
+    provider), and use it from any number of runs: each call is journaled
+    in the attempt whose context it is made in, including the tasks and
+    worker threads a framework starts from the agent's context.
+
+    The result is a genuine client of the same class (``isinstance`` holds)
+    whose HTTP layer journals every request: ``create``, ``stream=True``
+    and the ``.stream()`` helpers, ``.parse()``, ``with_raw_response``,
+    ``with_streaming_response``, token counts, and SDK retries. Websocket
+    and realtime connections raise ``Unsupported``.
+
+    A call made outside every run raises ``NotInRun``, unless
+    ``outside="passthrough"``, which sends it unrecorded. Runtime faults
+    raised inside the SDK (a desync on replay, say) travel as a
+    ``JournalFault`` so that SDK retries and framework error handling
+    cannot swallow them; ``rt.run`` and friends raise the fault itself."""
+    return _wrap(client, outside=outside)
+
 __all__ = [
     "JOURNAL_HEADER",
     "Conflict",
@@ -70,7 +100,7 @@ __all__ = [
     "EffectUnrecorded",
     "Erased",
     "JournalDesync",
-    "JournaledClient",
+    "JournalFault",
     "LeaseLost",
     "Locked",
     "MemoryStore",
@@ -92,4 +122,5 @@ __all__ = [
     "__version__",
     "durable",
     "tool_calls",
+    "wrap",
 ]

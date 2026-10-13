@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import pytest
 
@@ -71,3 +71,30 @@ def _clean_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "PRAGMATIC_OTEL",
     ):
         monkeypatch.delenv(var, raising=False)
+
+
+_TRACER_PROVIDER: List[Any] = []
+
+
+@pytest.fixture
+def span_exporter(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """An in-memory exporter of the spans the SDK emits during one test,
+    with ``PRAGMATIC_OTEL=1``. OpenTelemetry takes one tracer provider per
+    process, so the provider is installed once and each test adds an
+    exporter of its own to it."""
+    sdk = pytest.importorskip("opentelemetry.sdk.trace")
+    export = pytest.importorskip("opentelemetry.sdk.trace.export")
+    in_memory = pytest.importorskip("opentelemetry.sdk.trace.export.in_memory_span_exporter")
+    from opentelemetry import trace
+
+    if not _TRACER_PROVIDER:
+        provider = sdk.TracerProvider()
+        trace.set_tracer_provider(provider)
+        if trace.get_tracer_provider() is not provider:
+            pytest.skip("another tracer provider is already installed")
+        _TRACER_PROVIDER.append(provider)
+    exporter = in_memory.InMemorySpanExporter()
+    _TRACER_PROVIDER[0].add_span_processor(export.SimpleSpanProcessor(exporter))
+    monkeypatch.setenv("PRAGMATIC_OTEL", "1")
+    yield exporter
+    exporter.shutdown()

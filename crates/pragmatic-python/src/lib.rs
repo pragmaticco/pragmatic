@@ -127,9 +127,12 @@ impl Runtime {
     /// Begin an attempt. `owner` is `"thread"` (a synchronous attempt,
     /// owned by the calling thread) or `"tasks"` (an async attempt, owned by
     /// the tasks the package registers). `recover` is the package's
-    /// normalized recovery policy, consulted on resume.
+    /// normalized recovery policy, consulted on resume. `normalization`
+    /// names the request-normalization rules of the journaled HTTP clients,
+    /// recorded in `attempt.start` (spec 6.6).
     #[pyo3(signature = (run_id, mode, *, budget=None, caps=None, labels=None, subjects=None,
-                        on_code_change=None, program=None, recover=None, owner="thread"))]
+                        on_code_change=None, program=None, recover=None, owner="thread",
+                        normalization=None))]
     #[allow(clippy::too_many_arguments)]
     fn begin(
         &self,
@@ -144,6 +147,7 @@ impl Runtime {
         program: Option<(String, String)>,
         recover: Option<Py<PyAny>>,
         owner: &str,
+        normalization: Option<Vec<String>>,
     ) -> PyResult<Attempt> {
         let mode = parse_mode(mode)?;
         let mut opts = RunOptions {
@@ -152,6 +156,7 @@ impl Runtime {
             subjects: subjects.unwrap_or_default(),
             on_code_change: parse_on_code_change(on_code_change)?,
             program,
+            normalization: normalization.unwrap_or_default(),
             ..RunOptions::default()
         };
         if let Some(c) = caps {

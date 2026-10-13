@@ -1,7 +1,7 @@
-"""Canonical JSON for journaled requests and results.
+"""Canonical JSON for journaled tool arguments and results.
 
-Replay matches a model call by its prompt bytes, so the same logical
-request must always encode to the same bytes: keys sorted, SDK sentinels
+Replay matches an effect by its argument bytes, so the same logical call
+must always encode to the same bytes: keys sorted, SDK sentinels
 (``NOT_GIVEN``/``omit``) dropped, pydantic models dumped the same way
 whether they came from the API or were rebuilt from the journal.
 """
@@ -11,10 +11,6 @@ from __future__ import annotations
 import base64
 import json
 from typing import Any
-
-# Keyword arguments that shape the HTTP transport, not the request the model
-# sees. They stay out of the journal (``extra_headers`` can carry secrets).
-TRANSPORT_KWARGS = frozenset({"timeout", "extra_headers", "extra_query"})
 
 _SENTINELS = frozenset({"NotGiven", "Omit"})
 
@@ -51,12 +47,3 @@ def canonical(value: Any) -> str:
     return json.dumps(
         to_jsonable(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False
     )
-
-
-def request_prompt(api: str, kwargs: dict) -> str:
-    """The journaled prompt for one SDK call: the API surface plus every
-    argument the model sees."""
-    request = {
-        k: v for k, v in kwargs.items() if k not in TRANSPORT_KWARGS and not _is_sentinel(v)
-    }
-    return canonical({"api": api, "request": request})

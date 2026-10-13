@@ -24,8 +24,8 @@ Homepage = "https://aniketh.net/pragmatic/"
 Repository = "https://github.com/pragmaticco/pragmatic"
 
 [project.optional-dependencies]
-anthropic = ["anthropic>=0.40"]
-openai = ["openai>=1.40"]
+anthropic = ["anthropic>=1.0"]
+openai = ["openai>=3.0"]
 
 [tool.maturin]
 module-name = "pragmatic._native"

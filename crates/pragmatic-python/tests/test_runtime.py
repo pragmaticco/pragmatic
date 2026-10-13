@@ -816,19 +816,8 @@ def test_views_of_stored_runs(tmp_path):
     assert set(start) == {"cursor", "at", "branch", "kind", "fields", "slots", "hash"}
 
 
-def test_open_spans_when_opentelemetry_is_enabled(monkeypatch):
-    sdk = pytest.importorskip("opentelemetry.sdk.trace")
-    export = pytest.importorskip("opentelemetry.sdk.trace.export")
-    in_memory = pytest.importorskip("opentelemetry.sdk.trace.export.in_memory_span_exporter")
-    from opentelemetry import trace
-
-    exporter = in_memory.InMemorySpanExporter()
-    provider = sdk.TracerProvider()
-    provider.add_span_processor(export.SimpleSpanProcessor(exporter))
-    trace.set_tracer_provider(provider)
-    if trace.get_tracer_provider() is not provider:
-        pytest.skip("another tracer provider is already installed")
-    monkeypatch.setenv("PRAGMATIC_OTEL", "1")
+def test_open_spans_when_opentelemetry_is_enabled(span_exporter):
+    exporter = span_exporter
     rt = pragmatic.Runtime(pragmatic.MemoryStore())
 
     def agent(ctx):
