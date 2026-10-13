@@ -129,9 +129,7 @@ impl Core {
         self.inbox(run_id)
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .entry(channel.to_string())
-            .or_default()
-            .push_back(value);
+            .deliver(channel, value);
     }
 
     /// Open the session of one attempt: a checkout for `Run` and `Resume`
@@ -295,7 +293,7 @@ impl OwnedAttempt {
     /// persisted are dropped, and the run's lock or lease is released.
     /// Messages whose receives never became durable go back to the inbox.
     pub fn abandon(mut self) {
-        self.session.requeue_unconfirmed();
+        self.session.requeue_unconfirmed(false);
     }
 }
 

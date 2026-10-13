@@ -41,8 +41,14 @@
 //! variables, so its threads are refused. The step's branch comes from the
 //! same variable, which is how `ctx.gather` routes each child's steps to its
 //! own branch.
+//!
+//! A synchronous attempt whose agent turns out to be async (a lambda that
+//! returns a coroutine, run on a private event loop) switches to task
+//! ownership when the package registers the private loop's main task as its
+//! root ([`Attempt::own_current_task`] with `root=True`), so tasks the agent
+//! creates itself are refused there as in `arun`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::thread::ThreadId;
 
@@ -127,6 +133,9 @@ pub struct Attempt {
     run_id: String,
     mode: Mode,
     owner: Owner,
+    /// True when ownership goes by task: always for [`Owner::Tasks`], and
+    /// for an [`Owner::Thread`] attempt once a root task is registered.
+    by_tasks: AtomicBool,
     tasks: Py<PySet>,
     state: Mutex<Option<OwnedAttempt>>,
     slot: Mutex<Slot>,
@@ -158,11 +167,13 @@ impl Attempt {
         owner: Owner,
     ) -> PyResult<Attempt> {
         let sink = owned.session().detach_sink();
+        let by_tasks = matches!(owner, Owner::Tasks);
         Ok(Attempt {
             token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
             run_id: run_id.to_string(),
             mode,
             owner,
+            by_tasks: AtomicBool::new(by_tasks),
             tasks: PySet::empty(py)?.unbind(),
             state: Mutex::new(Some(owned)),
             slot: Mutex::new(Slot { sink, busy: false }),
@@ -176,7 +187,8 @@ impl Attempt {
             "ctx used outside the attempt that owns it (run '{}'): journaled steps run in the \
              agent's own thread or task, in a ctx.gather child, or in a thread started with \
              asyncio.to_thread; use ctx.gather or asyncio.to_thread instead of \
-             asyncio.create_task, asyncio.gather, loop.run_in_executor or a new thread",
+             asyncio.create_task, asyncio.gather, asyncio.shield, loop.run_in_executor or a new \
+             thread, and asyncio.timeout instead of asyncio.wait_for before Python 3.12",
             self.run_id
         )
     }
@@ -203,27 +215,33 @@ impl Attempt {
         if relaxed {
             return Ok(branch);
         }
-        match self.owner {
-            Owner::Thread(id) => {
-                if std::thread::current().id() != id {
-                    return Err(not_in_run(py, self.hint()));
-                }
-            }
-            Owner::Tasks => {
-                let running = GET_RUNNING_LOOP
-                    .import(py, "asyncio", "_get_running_loop")?
-                    .call0()?;
-                if !running.is_none() {
-                    let task = CURRENT_TASK
-                        .import(py, "asyncio", "current_task")?
-                        .call1((running,))?;
-                    if task.is_none() || !self.tasks.bind(py).contains(task)? {
-                        return Err(not_in_run(py, self.hint()));
-                    }
-                }
+        if self.by_tasks.load(Ordering::Acquire) {
+            self.check_task(py)?;
+        } else if let Owner::Thread(id) = self.owner {
+            if std::thread::current().id() != id {
+                return Err(not_in_run(py, self.hint()));
             }
         }
         Ok(branch)
+    }
+
+    /// Task ownership: inside a running event loop the current task must be
+    /// in the attempt's task set; a thread with no running loop (one
+    /// `asyncio.to_thread` started, carrying the token) is accepted.
+    fn check_task(&self, py: Python<'_>) -> PyResult<()> {
+        let running = GET_RUNNING_LOOP
+            .import(py, "asyncio", "_get_running_loop")?
+            .call0()?;
+        if running.is_none() {
+            return Ok(());
+        }
+        let task = CURRENT_TASK
+            .import(py, "asyncio", "current_task")?
+            .call1((running,))?;
+        if task.is_none() || !self.tasks.bind(py).contains(task)? {
+            return Err(not_in_run(py, self.hint()));
+        }
+        Ok(())
     }
 
     /// Run a core primitive on the caller's branch: the ownership check,
@@ -425,8 +443,12 @@ impl Attempt {
     }
 
     /// Make the current task an owner of this attempt (the root task of
-    /// `arun`, and each `ctx.gather` child as it starts).
-    fn own_current_task(&self, py: Python<'_>) -> PyResult<()> {
+    /// `arun`, and each `ctx.gather` child as it starts). `root` marks the
+    /// main task of the private event loop a synchronous attempt runs an
+    /// async agent on: from then on the attempt is owned by its tasks, so
+    /// tasks the agent creates itself are refused as they are in `arun`.
+    #[pyo3(signature = (*, root=false))]
+    fn own_current_task(&self, py: Python<'_>, root: bool) -> PyResult<()> {
         let task = CURRENT_TASK
             .import(py, "asyncio", "current_task")?
             .call0()?;
@@ -435,7 +457,11 @@ impl Attempt {
                 "an async attempt must be owned by a task",
             ));
         }
-        self.tasks.bind(py).add(task)
+        self.tasks.bind(py).add(task)?;
+        if root {
+            self.by_tasks.store(true, Ordering::Release);
+        }
+        Ok(())
     }
 
     /// Stop treating the current task as an owner (a `ctx.gather` child
@@ -642,17 +668,27 @@ impl Attempt {
 
     /// Join the region the caller's branch forked. `ok[i]` says whether
     /// child `i` returned normally. Returns, per child, `None` or the
-    /// exception its completeness check raised.
+    /// exception its completeness check raised. A check that failed because
+    /// a persist failed raises the very exception the store raised, as
+    /// every other step does after a persist failure.
     fn join(
         &self,
         py: Python<'_>,
         children: Vec<Vec<u32>>,
         ok: Vec<bool>,
     ) -> PyResult<Vec<Option<Py<PyAny>>>> {
-        let (checks, _) = self.step(py, move |s, b| Ok(s.join_each(b, &children, &ok)))?;
+        let ((checks, failure), _) = self.step(py, move |s, b| {
+            let checks = s.join_each(b, &children, &ok);
+            Ok((checks, s.failure().cloned()))
+        })?;
         Ok(checks
             .into_iter()
-            .map(|c| c.err().map(|f| fault_err(py, f).into_value(py).into_any()))
+            .map(|c| {
+                c.err().map(|f| {
+                    let sticky = failure.as_ref() == Some(&f);
+                    self.raise_fault(py, f, sticky).into_value(py).into_any()
+                })
+            })
             .collect())
     }
 

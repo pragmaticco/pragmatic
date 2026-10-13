@@ -91,14 +91,33 @@ response, persisted before the response reaches the agent.
   `anthropic-beta`, `openai-beta`) and the body without its messages. Each
   message (`messages`, or the Responses API's `input` items) is a part of
   its own: a conversation resends its earlier messages with every call, and
-  as parts of their own they are stored once and can be erased once.
+  as parts of their own they are stored once and can be erased once. A
+  journal record holds at most 255 parts, so a longer conversation is
+  stored in chunks of messages (two, four or more to a part, the fewest
+  that fit); the chunks of earlier messages stay the same from call to
+  call and are still stored once.
 - **Transport headers are never recorded**: API keys, authorization,
   retry counts, idempotency keys, user agents. Nor are query parameters
   named like credentials (`api_key`, `token`, `sig` and the like).
+- **Credentials in the body are never recorded either.** In each tool and
+  MCP server definition (`tools[*]`, `mcp_servers[*]`), members named
+  `authorization`, `api_key`, `password`, `secret` or `token`, or ending in
+  `_token`, `_secret`, `_key` or `_password`, and every value of a
+  `headers` object, are recorded as `<credential>`. That covers Anthropic's
+  `mcp_servers[*].authorization_token` and the OpenAI Responses API's
+  `tools[*].authorization` and `tools[*].headers`. The same replacement
+  applies when a replay matches the request, so a rotated MCP token does
+  not stop a run from replaying. A tool's input schema is left alone.
+- **Uploads** (`files.create`, `beta.files.upload`,
+  `audio.transcriptions.create`, `images.edit`) are recorded as sent,
+  except that the multipart boundary, which the HTTP client draws at
+  random for every request, is replaced by a fixed one, so the same upload
+  matches on replay and resume.
 - **The response** is recorded as its status, the headers the SDK reads
-  (`content-type`, the request id, the retry hints), and the body bytes.
-  Rate-limit headers are dropped. The agent receives exactly those headers
-  on record too, so record and replay cannot differ.
+  (`content-type`, the request id, the Anthropic workspace id, the retry
+  hints), and the body bytes. Rate-limit headers are dropped. The agent
+  receives exactly those headers on record too; replay adds a retry hint
+  only to an error response the SDK may retry (see below).
 - **The meta** of each result holds the outcome, status, provider, model,
   stop reason, token usage and latency. It holds no content, so it
   survives erasure; `attempt.end` sums the usage of the attempt's fresh
@@ -120,8 +139,10 @@ stream. A stream's result is written at the first of:
 - the end of the body;
 - `close()` (leaving a `with` block, `stream.close()`);
 - the response being garbage-collected unread or half-read;
-- the agent's next journaled step on the same branch, for a stream it has
-  not started reading;
+- the next journaled step on the same branch by the thread or task that
+  opened the stream, for a stream it has not started reading (a call from
+  another thread or task, such as a parallel LangGraph node, never cuts
+  it);
 - the end of a `ctx.gather` child, for a stream on that child's branch;
 - the end of the attempt.
 
@@ -141,13 +162,27 @@ replays exactly:
   `RateLimitError`, with the same request id).
 - A `429` followed by a successful retry is two draws. Replay serves the
   `429` with `retry-after-ms: 1`, so the SDK retries at once instead of
-  waiting. (A recorded hint over a minute is kept, since an SDK may refuse
-  to retry after a long hint and replay must decide the same way.)
+  waiting, whatever the recorded hint asked for. The exception is a hint
+  the OpenAI SDK refused to wait for (over two minutes, so it gave up
+  instead of retrying): replay serves that hint again, so the SDK gives
+  up again, at no wait. A hint given as an HTTP date is recorded as the
+  delay it meant when the response arrived, since the date would mean
+  something else on a later replay. An error the SDK does not retry (a
+  `400`, say) replays with exactly the recorded headers.
 - A transport failure (a refused connection, a timeout) is recorded with
   its class and message, and replays as the same httpx2 exception, which
   the SDK turns into the same `APIConnectionError` or `APITimeoutError`.
-  It has no response to carry a retry hint, so its replay waits the SDK's
-  own backoff before the recorded retry.
+  The journaled message leaves out credentials: quoted header values (h11
+  quotes the value it refuses, such as an API key read from a file with
+  its trailing newline) and the values of credential headers are cut out.
+  A transport failure has no response to carry a retry hint, so its
+  replay waits the SDK's own backoff before the recorded retry.
+- A call cancelled while it runs (an `asyncio.timeout` or
+  `asyncio.wait_for` around it, a task group cancelling it, the Agents SDK
+  cancelling the model call when an input guardrail trips) is a result
+  too, with the bytes received so far, once the agent catches the
+  cancellation and carries on. Replay waits at that call until the task is
+  cancelled again, so the agent's timeout fires and takes the same path.
 - A body that breaks while it is read keeps the bytes read and the
   failure; replay serves the bytes, then raises the same failure.
 
@@ -195,6 +230,10 @@ happened. A client bound to one run is always refused inside another.
 - MCP tool calls use the `mcp` package's own client: journal them with
   `ctx.tool`.
 - LiteLLM's own Anthropic handler and SDKs on legacy `httpx`.
+- OpenAI clients with X.509 workload identity: they send every request
+  through a transport of their own, never through the HTTP client, so
+  wrapping one raises `Unsupported`. Use an API key or a token-based
+  workload identity for durable runs.
 - Any other model client: journal its calls with `ctx.draw(prompt,
   sample)` or `await ctx.adraw(...)`, where `prompt` identifies the request
   completely.
@@ -324,6 +363,14 @@ cancels its siblings, and the region raises the failure of the
 lowest-index failed child. Model calls through a journaled client go to the
 calling child's branch.
 
+A region can be timed out like any awaited step: when the task running
+`ctx.gather` is cancelled, the children are cancelled too, and once they
+have finished the region is closed, so an agent that catches the timeout
+carries on stepping on its own branch. A child that ends cancelled
+although the region was not (it cancelled itself, or a library did) is a
+failed child: the region raises a `PragmaticError` for it, whose
+`__cause__` is the `CancelledError`, never the cancellation itself.
+
 Two concurrent calls on *one* branch (a framework issuing calls from tasks
 of its own) are matched on replay in the order they were sent. When two
 in-flight calls on one branch carry identical requests, the SDK logs a
@@ -340,10 +387,37 @@ An attempt belongs to the thread that runs it (sync) or to its root task
 and the `ctx.gather` children (async); threads started with
 `asyncio.to_thread` are accepted too. Steps from other tasks or threads
 raise `NotInRun`, because the order they would land in the journal could
-not be reproduced. Model calls through a journaled client are the
-exception: any task or thread that inherited the run's context may make
-them, because frameworks make them from tasks and worker threads of their
-own.
+not be reproduced, and a refused step changes nothing. An async agent
+whose arguments are bound with a lambda (`rt.run(run_id, lambda c:
+agent(c, x))`) is owned exactly as with `arun`. Model calls through a
+journaled client are the exception: any task or thread that inherited the
+run's context may make them, because frameworks make them from tasks and
+worker threads of their own.
+
+### Timeouts
+
+Time a step out with `asyncio.timeout` (Python 3.11 and later):
+
+```python
+async def research(ctx):
+    try:
+        async with asyncio.timeout(30):
+            notes = await ctx.atool("search", search, "durable agents")
+    except TimeoutError:
+        notes = await ctx.atool("cached_search", cached_search, "durable agents")
+```
+
+The step that was cancelled is recorded as a failure, so the run ends
+normally, and replay waits at that step until the timeout fires again.
+`asyncio.wait_for` does the same from Python 3.12. Before 3.12 it runs the
+step in a task of its own, which the attempt does not own, so a tool or
+`ctx.adraw` under it raises `NotInRun` (calls through a journaled client
+are accepted); `asyncio.shield` does so on every version. On Python 3.9
+and 3.10, use a timeout that runs in the caller's task, such as the
+`async-timeout` package.
+
+Cancelling the run itself (the task that awaits `rt.arun`) is a crash:
+nothing more is recorded, and `rt.resume` continues the run later.
 
 ## Crashes, resume and recovery
 
@@ -368,6 +442,13 @@ rt.resume("research-42", research, recover=recover)
 
 Without a policy, local runs perform such tools again; runs on a server
 raise `DanglingEffect` until a policy decides.
+
+On a server, a write whose answer was lost is resent until the server
+answers (a repeat is recognized as a duplicate), and the store looks at
+the run once more before it gives up. When it does give up, a message
+received in that write goes back to its channel, unless the next attempt
+finds the receive in the journal after all: a message is never received
+twice.
 
 ## Changing code under recorded runs
 

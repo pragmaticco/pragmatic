@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -214,11 +215,14 @@ def test_a_conflict_is_reconciled_through_the_duplicate_rule(tmp_path, server):
         tail = b"".join(frames[3:8])
         store.persist("c", 3, tail, 5, frames[7][-HASH_LEN:].hex())
         assert server.entries("c") == 8
-        # A resent prefix is a duplicate, whatever else changed since.
-        store.persist("c", 2, frames[2], 1, frames[2][-HASH_LEN:].hex())
         # A gap cannot be reconciled.
         with pytest.raises(pragmatic.Conflict):
             store.persist("c", 9, frames[8], 1, frames[8][-HASH_LEN:].hex())
+        # A duplicate answer for frames the run has grown past means that
+        # another writer appended since (a takeover appends its custody
+        # note at least): the frames are durable, the lease is lost.
+        with pytest.raises(pragmatic.LeaseLost):
+            store.persist("c", 2, frames[2], 1, frames[2][-HASH_LEN:].hex())
     finally:
         store.checkin("c")
     assert server.journal("c") == path.read_bytes()[: 16 + sum(len(f) for f in frames[:8])]
@@ -433,3 +437,249 @@ def test_entries_are_read_page_by_page(server):
     entries = rt.store.entries("pages", page=2)
     assert [e["cursor"] for e in entries] == list(range(report.journal_len))
     assert server.count("GET", "/v1/runs/pages/entries$") == report.journal_len // 2 + 1
+
+
+# ---------------------------------------------------------------------------
+# Unknown outcomes, lease edges and early answers (spec 4.4 to 4.6, 6.3)
+# ---------------------------------------------------------------------------
+
+
+class _LosingStore(pragmatic.ServerStore):
+    """A ServerStore whose next append, once armed, the server stores but
+    whose answer is lost; ``between`` runs after the server wrote the frames
+    and before the client resends."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.armed = False
+        self.between = None
+
+    def _send_once(self, method, path, body, headers):
+        resp = super()._send_once(method, path, body, headers)
+        if self.armed and method == "POST" and path.split("?")[0].endswith("/frames"):
+            self.armed = False
+            assert resp.status == 200, "the server stored the frames"
+            self.between()
+            raise ConnectionResetError("the answer was lost")
+        return resp
+
+
+def test_a_duplicate_answer_from_a_run_taken_over_releases_nothing():
+    """W1's intent is stored and the answer lost; W1's lease lapses and W2
+    takes the run over, writes the intent off and performs the effect
+    afresh. W1's resend is answered ``duplicate: true`` (whatever the lease
+    state) by a run that has grown past it: W1 must not perform."""
+    with MockServer() as srv:
+        w1_store = _LosingStore(srv.url, TOKEN)
+        w1 = pragmatic.Runtime(w1_store)
+        w2 = runtime(srv)
+        performed = []
+
+        def charge(arg, idempotency_key):
+            performed.append(idempotency_key)
+            return "charged " + arg
+
+        def w1_agent(ctx):
+            w1_store.armed = True
+            return ctx.effect("charge", "10 EUR", charge)
+
+        w2_out = {}
+
+        def takeover():
+            with srv.lock:
+                srv.runs["pay"].lease.expires = 0.0
+            t = threading.Thread(
+                target=lambda: w2_out.setdefault(
+                    "report", w2.resume("pay", lambda ctx: ctx.effect("charge", "10 EUR", charge),
+                                        recover=lambda name, arg: None)
+                )
+            )
+            t.start()
+            t.join(30)
+
+        w1_store.between = takeover
+        with pytest.raises(pragmatic.LeaseLost):
+            w1.run("pay", w1_agent)
+        assert w2_out["report"].output == "charged 10 EUR"
+        assert len(performed) == 1, f"the effect was performed {len(performed)} times: {performed}"
+
+
+def test_checkin_stops_the_renewal_before_it_releases_the_lease(monkeypatch):
+    """A renewal resending through 503s when the attempt ends must stop
+    there: one that lands after the release would lease the run to a holder
+    nobody renews, and lock every writer out for a whole TTL."""
+    import pragmatic._server as server_mod
+
+    monkeypatch.setattr(server_mod, "CONNECT_TIMEOUT", 0.1)
+    with MockServer(ttl=6.0) as srv:
+        rt = pragmatic.Runtime(srv.url, token=TOKEN, timeout=0.2)
+
+        def agent(ctx):
+            # The first renewal (at ttl/3 = 2 s) meets five 503s.
+            srv.inject("POST", r"/lease$", "503", count=5)
+            time.sleep(2.2)
+            return "done"
+
+        assert rt.run("orphan", agent).output == "done"
+        for t in threading.enumerate():
+            if t.name == "pragmatic-lease-orphan":
+                t.join(10)
+        with srv.lock:
+            assert srv.runs["orphan"].lease is None
+        assert runtime(srv).resume("orphan", lambda ctx: "again").output == "again"
+
+
+def test_a_renewal_never_regrants_a_lease_released_during_an_outage(monkeypatch):
+    import pragmatic._server as server_mod
+
+    monkeypatch.setattr(server_mod, "CONNECT_TIMEOUT", 0.1)
+    with MockServer(ttl=3.0) as srv:
+        store = pragmatic.ServerStore(srv.url, TOKEN, timeout=0.2)
+        store.connect()
+        store.checkout("r", True)
+        srv.inject("POST", "/lease$", "503", count=10**6)
+        time.sleep(1.5)  # the first renewal (at ttl/3) is resending
+        store.checkin("r")
+        with srv.lock:
+            assert srv.runs["r"].lease is None, "checkin released the lease"
+            srv.faults.clear()  # the server is healthy again
+        time.sleep(1.5)
+        with srv.lock:
+            assert srv.runs["r"].lease is None, "a renewal leased the run again"
+        assert runtime(srv).run("r", lambda ctx: "x").output == "x"
+
+
+@pytest.mark.parametrize("summary", ["readable", "unavailable"])
+def test_a_receive_whose_answer_was_lost_is_received_once(monkeypatch, summary):
+    """The ChannelRecv is stored, its answer lost, and every resend refused
+    until the deadline. When the run's summary is readable the store finds
+    the frames there and the receive is durable after all; when it is not,
+    the receive stays in doubt until the next checkout finds it in the
+    journal. Either way job-1 is processed once."""
+    monkeypatch.setenv("PRAGMATIC_SYNC_DEADLINE", "0.5")
+    with MockServer() as srv:
+        rt = runtime(srv)
+        rt.send("q", "jobs", "job-1")
+        processed = []
+        fail_next = [True]
+
+        def agent(ctx):
+            if fail_next[0]:
+                fail_next[0] = False
+                srv.inject("POST", "/frames$", "drop", count=1)
+                srv.inject("POST", "/frames$", "503", count=10**6)
+                if summary == "unavailable":
+                    srv.inject("GET", "/v1/runs/q$", "503", count=10**6)
+            while True:
+                try:
+                    job = ctx.recv("jobs")
+                except pragmatic.Unavailable:
+                    raise
+                except pragmatic.PragmaticError:  # the inbox is empty
+                    return ",".join(processed)
+                processed.append(job)
+
+        with pytest.raises(pragmatic.Unavailable):
+            rt.run("q", agent)
+        with srv.lock:
+            srv.faults.clear()
+        processed.clear()
+        assert rt.resume("q", agent).output == "job-1"
+
+
+def test_the_lease_is_renewed_while_the_journal_downloads():
+    with MockServer(ttl=1.0) as srv:
+        rt = runtime(srv)
+        rt.run("dl", lambda ctx: ctx.uuid4() and "first")
+        srv.inject("GET", "/v1/runs/dl/journal$", "delay:1.6")
+        outcome = {}
+
+        def w1():
+            try:
+                outcome["w1"] = rt.resume("dl", lambda ctx: ctx.uuid4() and "w1").output
+            except pragmatic.PragmaticError as e:
+                outcome["w1"] = e
+
+        t = threading.Thread(target=w1)
+        t.start()
+        time.sleep(1.2)  # W1 is still downloading, under a renewed lease
+        with pytest.raises(pragmatic.Locked):
+            runtime(srv).resume("dl", lambda ctx: "w2")
+        t.join(30)
+        assert outcome["w1"] == "w1"
+
+
+class _EarlyAnswer:
+    """A raw HTTP server that answers 413 as soon as it has read a request's
+    headers and closes the connection with the body unread, as a server
+    with a body limit does."""
+
+    def __init__(self):
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(8)
+        self.url = f"http://127.0.0.1:{self.listener.getsockname()[1]}"
+        self.stop = threading.Event()
+        self.hits = []
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        self.listener.settimeout(0.2)
+        while not self.stop.is_set():
+            try:
+                conn, _ = self.listener.accept()
+            except OSError:
+                continue
+            with conn:
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+                self.hits.append(data.split(b"\r\n", 1)[0])
+                body = b'{"error":{"code":"payload_too_large","message":"too large","limit":1024}}'
+                conn.sendall(
+                    b"HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\n"
+                    b"Connection: close\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+                )
+
+    def close(self):
+        self.stop.set()
+        self.listener.close()
+
+
+def _persist_big(url, info):
+    from pragmatic._server import _Lease
+
+    store = pragmatic.ServerStore(url, TOKEN, timeout=2.0)
+    store.info = info
+    store._leases["big"] = _Lease("big", "holder", lease="L", ttl=60.0, deadline=time.monotonic() + 3.0)
+    payload = b"x" * (32 << 20)
+    frame = len(payload).to_bytes(4, "little") + payload + b"\x11" * 32
+    with pytest.raises(pragmatic.TooLarge) as caught:
+        store.persist("big", 0, frame, 1, "11" * 32)
+    return caught.value
+
+
+def test_a_frame_over_the_announced_limit_is_too_large_and_never_sent():
+    server = _EarlyAnswer()
+    try:
+        error = _persist_big(server.url, {"max_request_bytes": 1024, "max_frame_bytes": 1024})
+    finally:
+        server.close()
+    assert error.limit == 1024 and error.size == (32 << 20) + 36
+    assert server.hits == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows drops data received before a reset")
+def test_an_early_413_on_a_closed_connection_is_too_large_not_unavailable():
+    """Without announced limits the request is sent; the server answers 413
+    after the headers and closes, which fails the write. The answer is read
+    all the same: ``TooLarge`` after one send, never resent."""
+    server = _EarlyAnswer()
+    try:
+        _persist_big(server.url, {})
+    finally:
+        server.close()
+    assert len(server.hits) == 1

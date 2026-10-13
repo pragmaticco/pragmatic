@@ -149,13 +149,18 @@ async def research(ctx):
 ```
 
 Blocking work can step through `asyncio.to_thread`. Tasks made with
-`asyncio.create_task` or `asyncio.gather`, and threads from
-`loop.run_in_executor`, do not belong to the run: their steps raise
+`asyncio.create_task`, `asyncio.gather` or `asyncio.shield`, and threads
+from `loop.run_in_executor`, do not belong to the run: their steps raise
 `pragmatic.NotInRun`, because the order they would land in the journal
 could not be reproduced. Model calls through a journaled client are the
 exception: frameworks make them from tasks and threads of their own, so
 any caller that inherited the run's context may make them, and they are
 matched by request on replay.
+
+Time a step out with `asyncio.timeout` (or `asyncio.wait_for` from Python
+3.12): a step the agent cancels and carries on past is recorded as a
+failure, so the run ends normally, and replay waits at that step until the
+timeout fires again.
 
 ## Runs on a server
 

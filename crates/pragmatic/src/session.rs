@@ -61,8 +61,34 @@ use crate::json::Json;
 use crate::sha256::Digest;
 use crate::value::Value;
 
-/// Values delivered to a run's channels and not yet received.
-pub(crate) type Inbox = Arc<Mutex<HashMap<String, VecDeque<Value>>>>;
+/// A run's channel inbox, shared by the attempts of one process.
+pub(crate) type Inbox = Arc<Mutex<Mailbox>>;
+
+/// What a run's inbox holds: the values delivered to each channel and not
+/// yet received, and the receives whose persist failed with an unknown
+/// outcome.
+#[derive(Default)]
+pub(crate) struct Mailbox {
+    /// Undelivered values, oldest first, per channel.
+    queues: HashMap<String, VecDeque<Value>>,
+    /// Receives put back on their channels because their persist failed,
+    /// as `(cursor, channel, value)`. A failed persist does not prove that
+    /// nothing was written (a server can store frames and lose its answer),
+    /// so the next checkout looks for each one in the journal it loads, and
+    /// takes the value off its channel again if the `ChannelRecv` is there:
+    /// a message is never received twice.
+    in_doubt: Vec<(Cursor, String, Value)>,
+}
+
+impl Mailbox {
+    /// Deliver `value` at the back of `channel`.
+    pub(crate) fn deliver(&mut self, channel: &str, value: Value) {
+        self.queues
+            .entry(channel.to_string())
+            .or_default()
+            .push_back(value);
+    }
+}
 
 /// What an attempt does with the run's journal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -495,6 +521,9 @@ impl Session {
             passthrough_calls: 0,
         };
         session.index();
+        if mode != Mode::Replay {
+            session.settle_in_doubt();
+        }
         Ok(session)
     }
 
@@ -1033,13 +1062,15 @@ impl Session {
 
     /// Record that a persist done outside the session failed, which fails
     /// the session exactly as an inline persist error would. Messages whose
-    /// receives were not durable go back to the front of their channels, so
-    /// the next attempt receives them again (spec 3.1).
+    /// receives were not confirmed durable go back to the front of their
+    /// channels, so the next attempt receives them again (spec 3.1), unless
+    /// the journal that attempt checks out holds the receive after all (a
+    /// store can write frames and fail to say so; see [`Mailbox`]).
     pub fn persist_failed(&mut self, fault: Fault) {
         if self.failed.is_none() {
             self.failed = Some(fault);
         }
-        self.requeue_unconfirmed();
+        self.requeue_unconfirmed(true);
     }
 
     /// Take the sink out of the session, for hosts that persist on a thread
@@ -1070,14 +1101,52 @@ impl Session {
 
     /// Put the messages of receives that never became durable back at the
     /// front of their channels, newest first so the oldest ends up first.
-    pub(crate) fn requeue_unconfirmed(&mut self) {
+    /// `in_doubt` is true when a persist of them was tried and failed: the
+    /// next checkout then checks whether they were written after all.
+    pub(crate) fn requeue_unconfirmed(&mut self, in_doubt: bool) {
         let Some(inbox) = &self.inbox else {
             self.unconfirmed.clear();
             return;
         };
         let mut inbox = lock_inbox(inbox);
-        for (_, channel, value) in self.unconfirmed.drain(..).rev() {
-            inbox.entry(channel).or_default().push_front(value);
+        for (cursor, channel, value) in self.unconfirmed.drain(..).rev() {
+            if in_doubt {
+                inbox
+                    .in_doubt
+                    .push((cursor, channel.clone(), value.clone()));
+            }
+            inbox.queues.entry(channel).or_default().push_front(value);
+        }
+    }
+
+    /// Settle the receives an earlier attempt put back in doubt (see
+    /// [`Mailbox`]) against this session's journal, which is the run's
+    /// durable state: a receive whose `ChannelRecv` is at its cursor was
+    /// written, so its message is taken off the channel again; any other
+    /// was not, and its message stays for the next receive.
+    fn settle_in_doubt(&self) {
+        let Some(inbox) = &self.inbox else {
+            return;
+        };
+        let mut inbox = lock_inbox(inbox);
+        for (cursor, channel, value) in std::mem::take(&mut inbox.in_doubt) {
+            let written = matches!(
+                self.journal.get(cursor).map(|e| &e.event),
+                Some(Event::ChannelRecv { channel: ch, value: v })
+                    if *ch == channel
+                        && match v {
+                            Content::Sealed(stored) => *stored == value,
+                            _ => true,
+                        }
+            );
+            if !written {
+                continue;
+            }
+            if let Some(queue) = inbox.queues.get_mut(&channel) {
+                if let Some(at) = queue.iter().position(|v| *v == value) {
+                    queue.remove(at);
+                }
+            }
         }
     }
 
@@ -1538,6 +1607,7 @@ impl Session {
         }
         let front = self.inbox.as_ref().and_then(|inbox| {
             lock_inbox(inbox)
+                .queues
                 .get(channel)
                 .and_then(VecDeque::front)
                 .cloned()
@@ -1559,6 +1629,7 @@ impl Session {
         // fails.
         if let Some(inbox) = &self.inbox {
             lock_inbox(inbox)
+                .queues
                 .get_mut(channel)
                 .and_then(VecDeque::pop_front);
         }
@@ -2083,7 +2154,7 @@ impl Session {
     }
 }
 
-fn lock_inbox(inbox: &Inbox) -> std::sync::MutexGuard<'_, HashMap<String, VecDeque<Value>>> {
+fn lock_inbox(inbox: &Inbox) -> std::sync::MutexGuard<'_, Mailbox> {
     inbox.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -2616,14 +2687,12 @@ mod tests {
     }
 
     fn deliver(inbox: &Inbox, channel: &str, value: &str) {
-        lock_inbox(inbox)
-            .entry(channel.to_string())
-            .or_default()
-            .push_back(Value::from(value));
+        lock_inbox(inbox).deliver(channel, Value::from(value));
     }
 
     fn queued(inbox: &Inbox, channel: &str) -> Vec<String> {
         lock_inbox(inbox)
+            .queues
             .get(channel)
             .map(|q| q.iter().map(|v| v.as_str().into_owned()).collect())
             .unwrap_or_default()
@@ -2704,6 +2773,62 @@ mod tests {
         s.persist_failed(Fault::LeaseLost);
         // Only the receive that never became durable is handed back.
         assert_eq!(queued(&inbox, "jobs"), ["second"]);
+    }
+
+    #[test]
+    fn a_receive_written_despite_a_failed_persist_is_not_received_again() {
+        let (backend, mut s, inbox) = recording_with_inbox("doubt");
+        let root = ROOT.to_vec();
+        deliver(&inbox, "jobs", "first");
+        deliver(&inbox, "jobs", "second");
+        let mut sink = s.detach_sink().unwrap();
+        assert_eq!(s.recv(&root, "jobs").unwrap().as_str(), "first");
+        // The store writes the frames and then fails to say so (a server
+        // whose answer was lost): the session cannot tell, and hands the
+        // message back.
+        let (at, frames, head) = s.unpersisted().unwrap();
+        sink.persist(at, &frames, &head).unwrap();
+        s.persist_failed(Fault::Unavailable("the answer was lost".into()));
+        assert_eq!(queued(&inbox, "jobs"), ["first", "second"]);
+        drop(sink);
+        drop(s);
+        // The next checkout finds the receive in the journal and takes the
+        // message off the channel again.
+        let co = backend.checkout("doubt", false, None).unwrap();
+        let opts = RunOptions::default();
+        let _next = Session::new(
+            "doubt",
+            Mode::Resume,
+            co.journal,
+            Some((co.sink, co.guard)),
+            &opts,
+            Some(inbox.clone()),
+        )
+        .unwrap();
+        assert_eq!(queued(&inbox, "jobs"), ["second"]);
+    }
+
+    #[test]
+    fn a_receive_whose_persist_failed_unwritten_is_received_again() {
+        let (backend, mut s, inbox) = recording_with_inbox("lost");
+        let root = ROOT.to_vec();
+        deliver(&inbox, "jobs", "first");
+        let _sink = s.detach_sink().unwrap();
+        assert_eq!(s.recv(&root, "jobs").unwrap().as_str(), "first");
+        s.persist_failed(Fault::Unavailable("nothing was written".into()));
+        drop(s);
+        let co = backend.checkout("lost", false, None).unwrap();
+        let opts = RunOptions::default();
+        let _next = Session::new(
+            "lost",
+            Mode::Resume,
+            co.journal,
+            Some((co.sink, co.guard)),
+            &opts,
+            Some(inbox.clone()),
+        )
+        .unwrap();
+        assert_eq!(queued(&inbox, "jobs"), ["first"]);
     }
 
     #[test]

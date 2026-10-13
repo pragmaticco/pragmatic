@@ -10,10 +10,16 @@ carries. ``LIVE`` maps attempt tokens to the attempts that are running.
 Open streams. A streamed response's ``DrawResult`` is written when the
 stream ends, or with the bytes read so far (``partial``) when it is closed
 early, collected unread (``weakref.finalize``), left untouched while the
-agent takes its next step on the same branch, or left open when a
-``ctx.gather`` child or the attempt ends, whichever comes first. A stream
-whose result is written reads no further, so what the agent saw on record
-is what replay serves.
+caller that opened it takes its next step on the same branch, or left open
+when a ``ctx.gather`` child or the attempt ends, whichever comes first. A
+stream whose result is written reads no further, so what the agent saw on
+record is what replay serves.
+
+The next-step rule is per caller (the thread and the asyncio task that
+opened the stream): journaled clients take calls from any thread or task
+that carries the run's context (LangGraph runs parallel nodes on worker
+threads), and one caller's step must never cut a stream another caller has
+opened and not yet started reading.
 
 Nothing here persists from a close or a finalizer: those can run inside
 another persist (a garbage collection triggered by a store) or on a thread
@@ -27,6 +33,7 @@ This module needs no HTTP library; ``_http`` holds the httpx2 side.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import threading
@@ -43,6 +50,18 @@ LIVE: "weakref.WeakValueDictionary[int, AttemptHttp]" = weakref.WeakValueDiction
 """The running attempts, by token, for ``pragmatic.wrap`` to route to."""
 
 log = logging.getLogger("pragmatic")
+
+
+Caller = Tuple[int, int]
+
+
+def caller() -> Caller:
+    """Who is stepping: the thread and, inside a running event loop, the
+    current task (by id; 0 without one). A stream remembers who opened it,
+    for the next-step rule."""
+    loop = asyncio._get_running_loop()
+    task = asyncio.current_task(loop) if loop is not None else None
+    return (threading.get_ident(), id(task) if task is not None else 0)
 
 
 def _digest(parts: Sequence[bytes]) -> bytes:
@@ -130,18 +149,15 @@ class AttemptHttp:
             self.open.pop(rec.intent, None)
             self.inflight.pop(rec.intent, None)
 
-    def settle_untouched(self, branch: Optional[Tuple[int, ...]] = None) -> None:
-        """The next-step rule: a stream on the caller's branch that the agent
-        has not started reading is written off as ``partial`` (empty)."""
+    def settle_untouched(self, branch: Tuple[int, ...], who: Caller) -> None:
+        """The next-step rule: a stream ``who`` opened on ``branch`` and has
+        not started reading is written off as ``partial`` (empty). Streams
+        other callers opened are left alone (see the module
+        documentation)."""
         if not self.open:
             return
-        if branch is None:
-            current = CURRENT.get()
-            if current is None or current[0] != self.token:
-                return
-            branch = tuple(current[1])
         for rec in self._open_records():
-            if rec.branch == branch and not rec.touched:
+            if rec.branch == branch and rec.caller == who and not rec.touched:
                 rec.settle_quietly()
 
     def settle_regions(self, children: Sequence[Sequence[int]]) -> None:
@@ -162,14 +178,16 @@ class AttemptHttp:
         current = CURRENT.get()
         return tuple(current[1]) if current is not None else ()
 
-    def begin(self, request: _wire.Request, provenance: str) -> Tuple[Any, ...]:
+    def begin(self, request: _wire.Request, provenance: str, who: Caller) -> Tuple[Any, ...]:
         """Begin the draw of one exchange on the caller's branch: the
         native ``draw_begin`` with the relaxed ownership check of journaled
-        clients. Under normalization (spec 6.6) the recorded request is
-        compared normalized and, when it matches, the draw begins with the
-        recorded parts, so the core's exact comparison holds."""
+        clients (the caller's context carries this attempt's token, which
+        ``Binding.resolve`` checked). Under normalization (spec 6.6) the
+        recorded request is compared normalized and, when it matches, the
+        draw begins with the recorded parts, so the core's exact comparison
+        holds."""
         branch = self.branch()
-        self.settle_untouched(branch)
+        self.settle_untouched(branch, who)
         parts = request.parts()
         send = parts
         normalized, changed = self.normalizer(request.body)

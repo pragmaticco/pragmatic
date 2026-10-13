@@ -9,12 +9,18 @@ call at all and that the agent saw exactly what it saw when recording.
 from __future__ import annotations
 
 import asyncio
+import base64
+import concurrent.futures
+import contextvars
+import email.utils
 import gc
 import json
 import logging
+import socket
+import sys
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, List
 
 import pytest
 
@@ -25,7 +31,17 @@ openai = pytest.importorskip("openai")
 httpx2 = pytest.importorskip("httpx2")
 pydantic = pytest.importorskip("pydantic")
 
-from model_api import ANTHROPIC_MODEL, OPENAI_MODEL, STRUCTURED, TEXT, ModelAPI  # noqa: E402
+from model_api import (  # noqa: E402
+    ANTHROPIC_MODEL,
+    OPENAI_MODEL,
+    STRUCTURED,
+    TEXT,
+    ModelAPI,
+    anthropic_json,
+    anthropic_sse,
+    chat_completion,
+    responses_obj,
+)
 
 PROVIDERS = ["anthropic", "openai"]
 MSGS = [{"role": "user", "content": "hi"}]
@@ -67,6 +83,15 @@ def draws(rt: pragmatic.Runtime, run_id: str) -> list:
     return [e["fields"]["meta"] for e in rt.entries(run_id) if e["kind"] == "DrawResult"]
 
 
+def intents(rt: pragmatic.Runtime, run_id: str) -> list:
+    """The DrawIntent entries of a run, in order."""
+    return [e for e in rt.entries(run_id) if e["kind"] == "DrawIntent"]
+
+
+def journal_text(rt: pragmatic.Runtime, run_id: str) -> str:
+    return json.dumps(rt.entries(run_id))
+
+
 def notes(rt: pragmatic.Runtime, run_id: str, kind: str) -> list:
     return [
         e["fields"]["data"]
@@ -90,6 +115,18 @@ def text_of(resp: Any, provider: str) -> str:
     if provider == "anthropic":
         return resp.content[0].text
     return resp.choices[0].message.content
+
+
+def stream_text(stream: Any, provider: str) -> str:
+    if provider == "anthropic":
+        return "".join(e.delta.text for e in stream if e.type == "content_block_delta")
+    return "".join(ch.choices[0].delta.content or "" for ch in stream if ch.choices)
+
+
+async def astream_text(stream: Any, provider: str) -> str:
+    if provider == "anthropic":
+        return "".join([e.delta.text async for e in stream if e.type == "content_block_delta"])
+    return "".join([ch.choices[0].delta.content or "" async for ch in stream if ch.choices])
 
 
 def event_names(stream: Any, provider: str) -> list:
@@ -1138,3 +1175,572 @@ def test_a_gather_child_may_return_with_a_stream_still_open(tmp_path, api):
     rt = pragmatic.Runtime(tmp_path)
     record_then_replay(rt, api, "r", agent)
     assert sorted(m["outcome"] for m in draws(rt, "r")) == ["ok", "ok", "partial"]
+
+
+# ---------------------------------------------------------------------------
+# Ownership and the next-step rule (spec 6.2, 6.5)
+# ---------------------------------------------------------------------------
+
+
+def test_a_step_refused_for_ownership_touches_nothing(tmp_path, api):
+    """A step from a task the attempt does not own is refused before it
+    applies the next-step rule, so the agent's unread stream survives it."""
+    base = api.client("anthropic", True)
+
+    async def agent(ctx):
+        c = ctx.wrap(base)
+        stream = await create(c, "anthropic", stream=True)
+
+        async def intruder():
+            try:
+                ctx.now()
+            except pragmatic.NotInRun:
+                return "refused"
+            return "accepted"
+
+        assert await asyncio.create_task(intruder()) == "refused"
+        return await astream_text(stream, "anthropic")
+
+    rt = pragmatic.Runtime(tmp_path)
+    assert record_then_replay(rt, api, "r", agent).output == TEXT
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_a_call_from_another_thread_never_cuts_an_unread_stream(tmp_path, api, provider):
+    """Worker threads that carry the agent's context (how LangGraph runs the
+    parallel nodes of a sync graph) call one journaled client: one worker's
+    call must not write off the stream another has opened and not yet
+    read."""
+    base = api.client(provider, False)
+
+    def agent(ctx):
+        c = ctx.wrap(base)
+        opened, other_done = threading.Event(), threading.Event()
+
+        def streaming() -> str:
+            s = create(c, provider, stream=True)
+            opened.set()
+            other_done.wait(5)
+            return stream_text(s, provider)
+
+        def other() -> None:
+            opened.wait(5)
+            create(c, provider)
+            other_done.set()
+
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            a = pool.submit(contextvars.copy_context().run, streaming)
+            b = pool.submit(contextvars.copy_context().run, other)
+            b.result()
+            return a.result()
+
+    rt = pragmatic.Runtime(tmp_path)
+    assert record_then_replay(rt, api, "r", agent).output == TEXT
+    assert sorted(m["outcome"] for m in draws(rt, "r")) == ["ok", "ok"]
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_a_call_from_another_task_never_cuts_an_unread_stream(tmp_path, api, provider):
+    base = api.client(provider, True)
+
+    async def agent(ctx):
+        c = ctx.wrap(base)
+        opened, other_done = asyncio.Event(), asyncio.Event()
+
+        async def streaming() -> str:
+            s = await create(c, provider, stream=True)
+            opened.set()
+            await other_done.wait()
+            return await astream_text(s, provider)
+
+        async def other() -> None:
+            await opened.wait()
+            await create(c, provider)
+            other_done.set()
+
+        reader = asyncio.create_task(streaming())
+        await asyncio.create_task(other())
+        return await reader
+
+    rt = pragmatic.Runtime(tmp_path)
+    assert record_then_replay(rt, api, "r", agent).output == TEXT
+
+
+# ---------------------------------------------------------------------------
+# Cancellation (spec 2.12, 6.5)
+# ---------------------------------------------------------------------------
+
+
+def slow_client(provider: str, delay: float) -> Any:
+    """An async client whose API answers after ``delay`` seconds."""
+
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        body = json.loads(request.content)
+        await asyncio.sleep(delay)
+        if provider == "anthropic":
+            return httpx2.Response(200, headers={"request-id": "r"}, json=anthropic_json(body, TEXT))
+        return httpx2.Response(200, headers={"x-request-id": "r"}, json=chat_completion(body, TEXT))
+
+    http = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+    cls = anthropic.AsyncAnthropic if provider == "anthropic" else openai.AsyncOpenAI
+    return cls(api_key="sk-test", http_client=http, max_retries=0)
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_a_call_cancelled_by_a_timeout_is_a_result(tmp_path, provider):
+    base = slow_client(provider, 30)
+
+    async def agent(ctx):
+        c = ctx.wrap(base)
+        try:
+            await asyncio.wait_for(create(c, provider), timeout=0.05)
+        except asyncio.TimeoutError:
+            return "fell back"
+        return "answered"
+
+    rt = pragmatic.Runtime(tmp_path)
+    assert rt.run("r", agent).output == "fell back"
+    [meta] = draws(rt, "r")
+    assert meta["outcome"] == "error" and meta["error_kind"] == "cancelled"
+    assert meta["error_type"] == "asyncio.exceptions.CancelledError"
+    # Replay waits for the agent's own timeout, then takes the same path.
+    started = time.monotonic()
+    assert rt.replay("r", agent).output == "fell back"
+    assert time.monotonic() - started >= 0.05
+
+
+class _Stalling(httpx2.AsyncByteStream):
+    """A body that sends ``head`` and then stalls."""
+
+    def __init__(self, head: bytes):
+        self.head = head
+
+    async def __aiter__(self):
+        yield self.head
+        await asyncio.sleep(30)
+
+    async def aclose(self) -> None:
+        pass
+
+
+def test_a_stream_cancelled_mid_body_keeps_the_bytes_read(tmp_path):
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        body = anthropic_sse(json.loads(request.content), ["Hel", "lo"])
+        cut = body.index(b"event: content_block_stop")
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream", "request-id": "r"},
+            stream=_Stalling(body[:cut]),
+        )
+
+    base = anthropic.AsyncAnthropic(
+        api_key="sk-test", http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+    )
+
+    async def agent(ctx):
+        c = ctx.wrap(base)
+        seen: List[str] = []
+
+        async def read() -> None:
+            stream = await create(c, "anthropic", stream=True)
+            async for event in stream:
+                if event.type == "content_block_delta":
+                    seen.append(event.delta.text)
+
+        try:
+            await asyncio.wait_for(read(), timeout=0.2)
+        except asyncio.TimeoutError:
+            pass
+        return "".join(seen)
+
+    rt = pragmatic.Runtime(tmp_path)
+    assert rt.run("r", agent).output == "Hello"
+    [meta] = draws(rt, "r")
+    assert meta["outcome"] == "error" and meta["error_kind"] == "cancelled"
+    assert rt.replay("r", agent).output == "Hello"
+
+
+# ---------------------------------------------------------------------------
+# Long conversations (spec 2.15, 6.5)
+# ---------------------------------------------------------------------------
+
+
+def long_history(n: int) -> list:
+    """A conversation of ``n`` messages, long enough that a chunk of two is
+    deduplicated (256 bytes or more)."""
+    out = [{"role": "user", "content": "start " + "x" * 150}]
+    for i in range(1, n):
+        role = "assistant" if i % 2 else "user"
+        out.append({"role": role, "content": f"turn {i} " + "y" * 150})
+    return out
+
+
+@pytest.mark.parametrize("api_kind", ["anthropic", "chat", "responses"])
+def test_a_conversation_longer_than_a_record_holds_is_journaled(tmp_path, api, api_kind):
+    provider = "anthropic" if api_kind == "anthropic" else "openai"
+    base = api.client(provider, False)
+    history = long_history(300)
+    grown = history + [{"role": "assistant", "content": "z" * 150}, {"role": "user", "content": "w" * 150}]
+
+    def call(c: Any, messages: list) -> str:
+        if api_kind == "anthropic":
+            return text_of(c.messages.create(model=ANTHROPIC_MODEL, max_tokens=8, messages=messages), provider)
+        if api_kind == "chat":
+            return text_of(c.chat.completions.create(model=OPENAI_MODEL, messages=messages), provider)
+        return c.responses.create(model=OPENAI_MODEL, input=messages).output_text
+
+    def agent(ctx):
+        c = ctx.wrap(base)
+        return json.dumps([call(c, history), call(c, grown)])
+
+    rt = pragmatic.Runtime(tmp_path)
+    rec = record_then_replay(rt, api, "long", agent)
+    assert json.loads(rec.output) == [TEXT, TEXT]
+    first, second = intents(rt, "long")
+    key = "messages" if api_kind != "responses" else "input"
+    assert json.loads(first["slots"][0]["text"])["body"][key] == {"$chunk": 2, "$parts": 300}
+    assert len(first["slots"]) == 151 and len(second["slots"]) == 152
+    # The earlier messages are chunked the same way in the grown request,
+    # so the second call stores them as references to the first.
+    assert all(slot["state"] == "ref" for slot in second["slots"][1:151])
+    # A request that changed anywhere in the chunked messages still desyncs.
+    history[123]["content"] = "edited"
+    with pytest.raises(pragmatic.JournalDesync):
+        rt.replay("long", agent)
+
+
+# ---------------------------------------------------------------------------
+# Multipart uploads (spec 6.5)
+# ---------------------------------------------------------------------------
+
+
+class FileAPI:
+    """Files, transcriptions and image edits, for both SDKs."""
+
+    def __init__(self) -> None:
+        self.calls: List[bytes] = []
+
+    def handler(self, request: httpx2.Request) -> httpx2.Response:
+        request.read()
+        self.calls.append(request.content)
+        path = request.url.path
+        if path.endswith("/v1/files") and request.headers.get("anthropic-version"):
+            return httpx2.Response(200, headers={"request-id": "req_f"}, json={
+                "id": "file_1", "type": "file", "filename": "notes.txt", "mime_type": "text/plain",
+                "size_bytes": 5, "created_at": "2026-10-13T00:00:00Z", "downloadable": False,
+            })
+        if path.endswith("/v1/files"):
+            return httpx2.Response(200, headers={"x-request-id": "req_f"}, json={
+                "id": "file-1", "object": "file", "bytes": 5, "created_at": 1760000000,
+                "filename": "notes.txt", "purpose": "assistants", "status": "processed",
+            })
+        if path.endswith("/v1/audio/transcriptions"):
+            return httpx2.Response(200, headers={"x-request-id": "req_a"}, json={"text": "hello there"})
+        if path.endswith("/v1/images/edits"):
+            return httpx2.Response(200, headers={"x-request-id": "req_i"},
+                                   json={"created": 1760000000, "data": [{"b64_json": "aW1n"}]})
+        return httpx2.Response(404, json={"error": {"message": f"no route {path}"}})
+
+
+def upload(c: Any, kind: str) -> str:
+    if kind == "openai-file":
+        return c.files.create(file=("notes.txt", b"hello"), purpose="assistants").id
+    if kind == "anthropic-file":
+        return c.beta.files.upload(file=("notes.txt", b"hello", "text/plain")).id
+    if kind == "transcription":
+        return c.audio.transcriptions.create(file=("a.wav", b"RIFF....WAVE"), model="whisper-1").text
+    return c.images.edit(image=("i.png", b"\x89PNG...."), prompt="add a hat").data[0].b64_json
+
+
+@pytest.mark.parametrize("kind", ["openai-file", "anthropic-file", "transcription", "image-edit"])
+def test_multipart_uploads_record_replay_and_resume(tmp_path, kind):
+    files = FileAPI()
+    http = httpx2.Client(transport=httpx2.MockTransport(files.handler))
+    cls = anthropic.Anthropic if kind == "anthropic-file" else openai.OpenAI
+    base = cls(api_key="sk-test", http_client=http)
+    crash = {"on": True}
+
+    def agent(ctx):
+        out = upload(ctx.wrap(base), kind)
+        if crash["on"]:
+            crash["on"] = False
+            raise Crash()
+        return out
+
+    rt = pragmatic.Runtime(tmp_path)
+    with pytest.raises(Crash):
+        rt.run("up", agent)
+    # The upload is journaled with a fixed boundary in place of the random
+    # one, so the resumed and replayed uploads match it.
+    [intent] = intents(rt, "up")
+    assert json.loads(intent["slots"][0]["text"])["boundary"] == "pragmatic-multipart-boundary"
+    body = intent["slots"][-1]
+    raw = body["text"].encode() if body["text"] is not None else base64.b64decode(body["base64"])
+    assert raw.startswith(b"--pragmatic-multipart-boundary\r\n")
+    rec = rt.resume("up", agent)
+    rep = rt.replay("up", agent)
+    assert rec.output == rep.output and len(files.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Credentials in request bodies and error messages (spec 6.5)
+# ---------------------------------------------------------------------------
+
+
+def mcp_request(c: Any, provider: str, token: str) -> Any:
+    if provider == "anthropic":
+        return c.beta.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=64,
+            messages=MSGS,
+            mcp_servers=[
+                {"type": "url", "name": "crm", "url": "https://mcp.example", "authorization_token": token}
+            ],
+            betas=["mcp-client-2025-11-20"],
+        )
+    return c.responses.create(
+        model=OPENAI_MODEL,
+        input="hi",
+        tools=[
+            {
+                "type": "mcp",
+                "server_label": "crm",
+                "server_url": "https://mcp.example",
+                "authorization": token,
+                "headers": {"X-Tenant-Key": token},
+                "require_approval": "never",
+            }
+        ],
+    )
+
+
+def plain_api(provider: str) -> Any:
+    """A client whose API ignores the request's tools."""
+    calls: list = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls.append(request.url.path)
+        body = json.loads(request.content)
+        if provider == "anthropic":
+            return httpx2.Response(200, headers={"request-id": "r"}, json=anthropic_json({**body, "tools": []}, TEXT))
+        return httpx2.Response(200, headers={"x-request-id": "r"}, json=responses_obj({**body, "tools": []}, TEXT))
+
+    http = httpx2.Client(transport=httpx2.MockTransport(handler))
+    cls = anthropic.Anthropic if provider == "anthropic" else openai.OpenAI
+    return cls(api_key="sk-test", http_client=http), calls
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_mcp_credentials_stay_out_of_the_journal_and_may_rotate(tmp_path, provider):
+    base, calls = plain_api(provider)
+    token = ["mcp-oauth-s3cr3t"]
+
+    def agent(ctx):
+        return mcp_request(ctx.wrap(base), provider, token[0]).id
+
+    rt = pragmatic.Runtime(tmp_path)
+    rec = rt.run("mcp", agent)
+    assert "mcp-oauth-s3cr3t" not in journal_text(rt, "mcp")
+    [intent] = intents(rt, "mcp")
+    body = json.loads(intent["slots"][0]["text"])["body"]
+    if provider == "anthropic":
+        assert body["mcp_servers"][0]["authorization_token"] == "<credential>"
+    else:
+        assert body["tools"][0]["authorization"] == "<credential>"
+        assert body["tools"][0]["headers"] == {"X-Tenant-Key": "<credential>"}
+    # OAuth access tokens expire within the hour: the replay an auditor runs
+    # next week holds a fresh one, and must still match.
+    token[0] = "a-rotated-token"
+    assert rt.replay("mcp", agent).output == rec.output and len(calls) == 1
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_a_transport_error_does_not_put_the_api_key_in_the_journal(tmp_path, provider):
+    """h11 quotes an illegal header value in its error, and a key read from
+    a file keeps its trailing newline, which makes it illegal."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    port = srv.getsockname()[1]
+
+    def serve() -> None:
+        try:
+            while True:
+                conn, _ = srv.accept()
+                conn.close()
+        except OSError:
+            pass
+
+    threading.Thread(target=serve, daemon=True).start()
+    key = "sk-live-0123456789SECRET\n"
+    http = httpx2.Client()
+    if provider == "anthropic":
+        base: Any = anthropic.Anthropic(
+            api_key=key, base_url=f"http://127.0.0.1:{port}", http_client=http, max_retries=0
+        )
+        error_cls: Any = anthropic.APIConnectionError
+    else:
+        base = openai.OpenAI(api_key=key, base_url=f"http://127.0.0.1:{port}/v1", http_client=http, max_retries=0)
+        error_cls = openai.APIConnectionError
+
+    def agent(ctx):
+        try:
+            create(ctx.wrap(base), provider)
+        except error_cls:
+            return "connection error"
+        return "answered"
+
+    rt = pragmatic.Runtime(tmp_path)
+    try:
+        assert rt.run("k", agent).output == "connection error"
+    finally:
+        srv.close()
+    assert "SECRET" not in journal_text(rt, "k")
+    assert rt.replay("k", agent).output == "connection error"
+
+
+# ---------------------------------------------------------------------------
+# Response headers and retry hints on replay (spec 6.5)
+# ---------------------------------------------------------------------------
+
+
+def test_header_derived_attributes_match_an_unwrapped_client(tmp_path):
+    """Every attribute the SDKs build from response headers (request ids,
+    the Anthropic workspace id) is the same through a journaled client, on
+    record and on replay, for responses and for API errors."""
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        body = json.loads(request.content)
+        headers = {"request-id": "req_1", "x-request-id": "req_1", "anthropic-workspace-id": "wrkspc_01"}
+        if body.get("max_tokens") == 1:
+            return httpx2.Response(400, headers=headers, json={
+                "type": "error", "error": {"type": "invalid_request_error", "message": "bad"},
+            })
+        if request.url.path.endswith("/v1/messages"):
+            return httpx2.Response(200, headers=headers, json=anthropic_json(body, TEXT))
+        return httpx2.Response(200, headers=headers, json=chat_completion(body, TEXT))
+
+    def http() -> Any:
+        return httpx2.Client(transport=httpx2.MockTransport(handler))
+
+    ant = anthropic.Anthropic(api_key="sk-test", http_client=http())
+    oai = openai.OpenAI(api_key="sk-test", http_client=http())
+
+    def observe(a: Any, o: Any) -> str:
+        m = a.messages.create(model=ANTHROPIC_MODEL, max_tokens=8, messages=MSGS)
+        c = o.chat.completions.create(model=OPENAI_MODEL, messages=MSGS)
+        try:
+            a.messages.create(model=ANTHROPIC_MODEL, max_tokens=1, messages=MSGS)
+        except anthropic.BadRequestError as e:
+            error = [e.request_id, e.workspace_id]
+        return json.dumps([m._request_id, m._workspace_id, c._request_id, error])
+
+    plain = observe(ant, oai)
+    assert json.loads(plain) == ["req_1", "wrkspc_01", "req_1", ["req_1", "wrkspc_01"]]
+
+    def agent(ctx):
+        return observe(ctx.wrap(ant), ctx.wrap(oai))
+
+    rt = pragmatic.Runtime(tmp_path)
+    assert rt.run("w", agent).output == plain
+    assert rt.replay("w", agent).output == plain
+
+
+def rate_limited_with(headers: dict) -> httpx2.Response:
+    return httpx2.Response(
+        429,
+        headers={"content-type": "application/json", "request-id": "req_429", **headers},
+        json={"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}},
+    )
+
+
+def test_a_retry_the_sdk_refused_over_a_dated_hint_is_refused_on_replay(tmp_path, api):
+    """The OpenAI SDK gives up when a hint asks for more than two minutes.
+    A hint given as an HTTP date means less and less as time passes, and a
+    replay days later would see it in the past and retry: the delay it
+    meant is recorded and served on replay instead."""
+    later = email.utils.formatdate(time.time() + 600, usegmt=True)
+    api.fail_next(rate_limited_with({"retry-after": later}))
+    base = api.client("openai", False)
+
+    def agent(ctx):
+        try:
+            create(ctx.wrap(base), "openai")
+        except openai.RateLimitError:
+            return "rate limited"
+        return "answered"
+
+    rt = pragmatic.Runtime(tmp_path)
+    assert record_then_replay(rt, api, "r", agent).output == "rate limited"
+    assert len(api.calls) == 1
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_a_replayed_retry_never_waits_the_recorded_hint(tmp_path, api, monkeypatch, provider):
+    """90 seconds is under the OpenAI SDK's ceiling, and the Anthropic SDK
+    has none: both wait it on record, and neither may on replay."""
+    sdk = anthropic if provider == "anthropic" else openai
+    sleeps: list = []
+    monkeypatch.setattr(sdk._base_client.time, "sleep", lambda s: sleeps.append(s))
+    api.fail_next(rate_limited_with({"retry-after": "90"}))
+    base = api.client(provider, False)
+
+    def agent(ctx):
+        return text_of(create(ctx.wrap(base), provider), provider)
+
+    rt = pragmatic.Runtime(tmp_path)
+    rt.run("r", agent)
+    assert sleeps == [90.0]
+    sleeps.clear()
+    assert rt.replay("r", agent).output == TEXT
+    assert sleeps and max(sleeps) < 1.0, sleeps
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_an_error_the_sdk_does_not_retry_replays_with_the_recorded_headers(tmp_path, api, provider):
+    api.fail_next(httpx2.Response(400, headers={"content-type": "application/json"}, json={
+        "type": "error", "error": {"type": "invalid_request_error", "message": "bad"},
+    }))
+    base = api.client(provider, False)
+
+    def agent(ctx):
+        try:
+            create(ctx.wrap(base), provider)
+        except (anthropic.BadRequestError, openai.BadRequestError) as e:
+            return json.dumps(sorted(e.response.headers.keys()))
+        return "no error"
+
+    rt = pragmatic.Runtime(tmp_path)
+    assert record_then_replay(rt, api, "r", agent).output == json.dumps(["content-type"])
+
+
+# ---------------------------------------------------------------------------
+# Clients that bypass the HTTP client (spec 6.5)
+# ---------------------------------------------------------------------------
+
+
+def test_x509_workload_identity_clients_are_refused_at_wrap_time(tmp_path):
+    from openai.auth import x509_workload_identity
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == "/oauth/token":
+            return httpx2.Response(200, json={
+                "access_token": "tok", "token_type": "Bearer", "expires_in": 3600,
+                "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            })
+        return httpx2.Response(200, headers={"x-request-id": "r"},
+                               json=chat_completion(json.loads(request.content), TEXT))
+
+    base = openai.OpenAI(
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
+        workload_identity=x509_workload_identity(identity_provider_id="idp", service_account_id="sa"),
+        max_retries=0,
+    )
+    assert text_of(create(base, "openai"), "openai") == TEXT
+
+    def agent(ctx):
+        with pytest.raises(pragmatic.Unsupported, match="X.509 workload identity"):
+            ctx.wrap(base)
+        return "refused"
+
+    assert pragmatic.Runtime(tmp_path).run("x", agent).output == "refused"

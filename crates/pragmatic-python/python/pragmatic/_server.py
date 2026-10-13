@@ -13,15 +13,28 @@ Standard library only. The store speaks the server's HTTP API v1:
   Every request is safe to resend: appends carry their position (``at``) and
   the server answers a repeat with ``duplicate: true`` (4.6), lease requests
   name their holder, and a repeated ``PUT`` that finds the run created goes
-  on with ``POST lease`` as the create order does anyway.
+  on with ``POST lease`` as the create order does anyway. A server that
+  answers before it has read a request's whole body (a 413 for a body over
+  its limit) and closes the connection makes the write fail; its answer is
+  read all the same, so it is never mistaken for a connection error.
+- **Unknown outcomes.** An append whose resends ran out may still have been
+  stored (an earlier try whose answer was lost): before raising
+  ``Unavailable`` the store looks once at the run's entries and head, and
+  reports success if its frames are there. A duplicate answer from a run
+  that has grown past the frames (another writer took it over and appended
+  at least its custody note) is ``LeaseLost``: the frames are durable, but
+  this writer no longer holds the run and must not act on them.
 - **Leases.** A checkout acquires the run's lease, creating the run when
   asked (POST lease; on ``not_found`` PUT; on ``run_exists`` POST lease
-  again), downloads the journal and starts a dedicated OS thread that
-  renews the lease every ``ttl/3`` for the whole checkout, through model
-  calls, effects and recovery callbacks alike. The client keeps its own
-  deadline, the time a grant was requested plus ``ttl - ttl/4`` on its
-  monotonic clock, and never compares wall clocks. A lease the server gives
-  to someone else is lost: the next persist raises ``LeaseLost``.
+  again), starts a dedicated OS thread that renews the lease every
+  ``ttl/3`` for the whole checkout (the journal download, model calls,
+  effects and recovery callbacks alike), and downloads the journal. The
+  client keeps its own deadline, the time a grant was requested plus
+  ``ttl - ttl/4`` on its monotonic clock, and never compares wall clocks. A
+  lease the server gives to someone else is lost: the next persist raises
+  ``LeaseLost``. Checkin stops the renewal thread, which never resends once
+  asked to stop and gives back any grant that arrives after that, and then
+  releases the lease, so a released lease is never granted again.
 - **Verification.** Every downloaded journal is verified (chain and
   commitments, by the native layer) and must end at the entry count and head
   the server sent with it, and the head the server returns after every
@@ -30,8 +43,10 @@ Standard library only. The store speaks the server's HTTP API v1:
 Errors map to exceptions per the table in spec 4.4: ``run_locked`` is
 ``Locked(retry_after)``, ``lease_lost`` and ``lease_expired`` are
 ``LeaseLost``, ``run_deleted`` is ``Deleted`` (the run is never recreated),
-``payload_too_large`` is ``TooLarge``, ``conflict`` is reconciled through the
-duplicate rule or raised as ``Conflict``, a missing run is
+``payload_too_large`` is ``TooLarge`` (raised without sending for a frame
+over the ``max_request_bytes`` or ``max_frame_bytes`` the server announced),
+``conflict`` is reconciled through the duplicate rule or raised as
+``Conflict``, a missing run is
 ``FileNotFoundError``, and other refusals (``unauthorized``, ``forbidden``,
 ``invalid_frames``, ``regressed``, ``bad_request``) are ``ServerError``.
 """
@@ -171,6 +186,15 @@ class _Lease:
             self.deadline = sent_at + ttl - ttl / 4
 
 
+def _early_answer(conn: http.client.HTTPConnection) -> Optional[http.client.HTTPResponse]:
+    """The answer a server sent before the request's body was written
+    whole, if one arrived; ``None`` otherwise."""
+    try:
+        return conn.getresponse()
+    except (OSError, http.client.HTTPException):
+        return None
+
+
 def _frames(frames: bytes) -> List[Tuple[int, int]]:
     """The ``(start, end)`` byte range of every frame in ``frames``."""
     out = []
@@ -261,10 +285,21 @@ class ServerStore:
     def _send_once(self, method: str, path: str, body: Optional[bytes], headers: Mapping[str, str]) -> _Response:
         sent_at = time.monotonic()
         conn = self._connection()
-        conn.request(method, self._base + path, body=body, headers=dict(headers))
-        resp = conn.getresponse()
+        broken = False
+        try:
+            conn.request(method, self._base + path, body=body, headers=dict(headers))
+        except OSError as failed:
+            # A server may answer before it has read the whole body (a 413
+            # as soon as a body passes its limit) and close the connection,
+            # which fails the write. Its answer may be waiting all the same.
+            early = _early_answer(conn)
+            if early is None:
+                raise failed
+            resp, broken = early, True
+        else:
+            resp = conn.getresponse()
         data = resp.read()
-        if resp.will_close:
+        if broken or resp.will_close:
             self._drop_connection()
         hdrs = {k.lower(): v for k, v in resp.getheaders()}
         return _Response(resp.status, hdrs, data, sent_at)
@@ -287,11 +322,14 @@ class ServerStore:
         body: Optional[bytes] = None,
         headers: Optional[Mapping[str, str]] = None,
         deadline: Optional[Deadline] = None,
+        stop: Optional[threading.Event] = None,
     ) -> _Response:
         """Send a request, resending the identical request on connect errors,
         timeouts and 502, 503 and 504 until ``deadline`` (a monotonic time,
         or a function returning one). ``None`` sends once. At least one try
-        is always made."""
+        is always made. Once ``stop`` is set nothing more is resent (the
+        backoff wakes up for it), so its owner can be stopped within one
+        request."""
         hdrs = self._headers(headers)
         tries = 0
         while True:
@@ -311,10 +349,17 @@ class ServerStore:
             now = time.monotonic()
             if limit is None or now >= limit:
                 raise Unavailable(f"{method} {self.url}{path} failed until the deadline: {failure}")
+            if stop is not None and stop.is_set():
+                raise Unavailable(f"{method} {self.url}{path} stopped: {failure}")
             delay = min(2.0, 0.05 * (2**tries)) * (0.5 + random.random() / 2)
             if retry_after is not None:
                 delay = max(delay, float(retry_after))
-            time.sleep(max(0.0, min(delay, limit - now)))
+            wait = max(0.0, min(delay, limit - now))
+            if stop is not None:
+                if stop.wait(wait):
+                    raise Unavailable(f"{method} {self.url}{path} stopped: {failure}")
+            else:
+                time.sleep(wait)
             tries += 1
 
     def _sync_deadline(self) -> float:
@@ -407,23 +452,40 @@ class ServerStore:
         lease = _Lease(run_id, str(uuid.uuid4()))
         try:
             created = self._acquire(lease, create)
-            if created:
-                result: Tuple[bytes, int, str] = (_native.JOURNAL_HEADER, 0, "")
-            else:
-                result = self._download(run_id, lease)
-            lease.thread = threading.Thread(
-                target=self._renew, args=(lease,), name=f"pragmatic-lease-{run_id}", daemon=True
-            )
+            # Renewing starts before the download: the lease must hold for
+            # the whole checkout, however long the journal takes to arrive.
+            self._start_renewal(lease)
             with self._lock:
                 self._leases[run_id] = lease
-            lease.thread.start()
+            if created:
+                return (_native.JOURNAL_HEADER, 0, "")
+            result = self._download(run_id, lease)
+            if lease.lost:
+                raise LeaseLost(f"the lease on run {run_id!r} was lost ({lease.lost}) on {self.url}")
             return result
         except BaseException:
             with self._lock:
                 self._leases.pop(run_id, None)
+            self._stop_renewal(lease)
             if lease.lease:
                 self._release(lease)
             raise
+
+    def _start_renewal(self, lease: _Lease) -> None:
+        lease.thread = threading.Thread(
+            target=self._renew, args=(lease,), name=f"pragmatic-lease-{lease.run_id}", daemon=True
+        )
+        lease.thread.start()
+
+    def _stop_renewal(self, lease: _Lease) -> None:
+        """Stop the renewal thread and wait for it: it resends nothing once
+        stopped, so one request's worth of time is enough. One still in a
+        request after that gives back any grant it receives (see
+        ``_renew``)."""
+        lease.stop.set()
+        thread = lease.thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(self.timeout + CONNECT_TIMEOUT)
 
     def _acquire(self, lease: _Lease, create: bool) -> bool:
         """The create order of spec 4.6. Returns True if this call created
@@ -462,12 +524,18 @@ class ServerStore:
         )
 
     def _download(self, run_id: str, lease: Optional[_Lease]) -> Tuple[bytes, int, str]:
+        """The run's journal, under ``lease`` when given (resent until the
+        earlier of the sync and lease deadlines) or as a snapshot."""
         headers = {"Accept": "application/octet-stream"}
+        deadline: Deadline = self._sync_deadline()
         if lease is not None:
             headers["Pragmatic-Lease"] = lease.lease
-        resp = self._request(
-            "GET", self._path(run_id, "/journal"), headers=headers, deadline=self._sync_deadline()
-        )
+            sync = deadline
+
+            def deadline() -> float:
+                return min(sync, lease.deadline)
+
+        resp = self._request("GET", self._path(run_id, "/journal"), headers=headers, deadline=deadline)
         if resp.status != 200:
             if resp.status == 404 and resp.code in ("", "not_found"):
                 raise FileNotFoundError(f"run {run_id!r} does not exist on {self.url}")
@@ -484,7 +552,10 @@ class ServerStore:
 
     def _renew(self, lease: _Lease) -> None:
         """The renewal thread: renew every ``ttl/3`` until checkin, or until
-        the server gives the lease to someone else."""
+        the server gives the lease to someone else. Once checkin has set
+        ``stop`` it resends nothing, and a grant that still arrives (a
+        renewal checkin could not wait out) is given back at once, so a
+        lease checkin released is never held again (spec 6.3)."""
         body = json.dumps({"holder": lease.holder}).encode()
         while not lease.stop.wait(max(0.05, lease.ttl / 3)):
             try:
@@ -494,10 +565,14 @@ class ServerStore:
                     body=body,
                     headers={"Content-Type": "application/json"},
                     deadline=lambda: lease.deadline,
+                    stop=lease.stop,
                 )
             except Exception:  # noqa: BLE001 - keep trying until the lease is gone
                 continue
             if lease.stop.is_set():
+                if resp.status == 200:
+                    granted = (resp.json() or {}).get("lease") or lease.lease
+                    self._release_id(lease.run_id, str(granted))
                 return
             if resp.status == 200:
                 lease.grant(resp.json() or {}, resp.sent_at)
@@ -522,15 +597,34 @@ class ServerStore:
             raise ValueError(f"{len(ranges)} frames given where {frame_count} were announced")
         start = time.monotonic()
         limit = int((self.info or {}).get("max_request_bytes") or 0)
+        self._check_sizes(ranges, limit)
         for lo, hi in self._batches(ranges, limit):
             chunk = frames[ranges[lo][0] : ranges[hi - 1][1]]
             self._append(lease, at + lo, chunk, ranges[lo : hi], start)
 
+    def _check_sizes(self, ranges: List[Tuple[int, int]], request_limit: int) -> None:
+        """Refuse, without sending it, a frame larger than the server
+        announced it accepts (``max_frame_bytes``, ``max_request_bytes``):
+        such a request can never succeed, and a server that answers it
+        early and closes the connection would otherwise look unreachable."""
+        frame_limit = int((self.info or {}).get("max_frame_bytes") or 0)
+        for lo, hi in ranges:
+            size = hi - lo
+            for limit in (frame_limit, request_limit):
+                if limit and size > limit:
+                    raise TooLarge(
+                        f"a {size}-byte journal frame is larger than the server at {self.url} "
+                        f"accepts ({limit} bytes)",
+                        size=size,
+                        limit=limit,
+                    )
+
     @staticmethod
     def _batches(ranges: List[Tuple[int, int]], limit: int) -> Iterator[Tuple[int, int]]:
         """Group frames into requests of at most ``limit`` bytes (one frame
-        per request if a single frame is larger; the server answers that one
-        with ``payload_too_large``)."""
+        per request if a single frame is larger, when the server did not
+        announce its limits; it answers that one with
+        ``payload_too_large``)."""
         lo = 0
         while lo < len(ranges):
             hi = lo + 1
@@ -553,26 +647,45 @@ class ServerStore:
 
         while True:
             k = len(hashes)
-            resp = self._request(
-                "POST",
-                self._path(lease.run_id, "/frames") + "?" + urlencode({"at": at}),
-                body=chunk,
-                headers={
-                    "Content-Type": "application/octet-stream",
-                    "Pragmatic-Lease": lease.lease,
-                    "Pragmatic-Frames": str(k),
-                    "Pragmatic-Head": hashes[-1],
-                },
-                deadline=deadline,
-            )
+            try:
+                resp = self._request(
+                    "POST",
+                    self._path(lease.run_id, "/frames") + "?" + urlencode({"at": at}),
+                    body=chunk,
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "Pragmatic-Lease": lease.lease,
+                        "Pragmatic-Frames": str(k),
+                        "Pragmatic-Head": hashes[-1],
+                    },
+                    deadline=deadline,
+                )
+            except Unavailable:
+                if self._landed(lease.run_id, at, hashes):
+                    return
+                raise
             if resp.status == 200:
                 doc = resp.json() or {}
-                if doc.get("head") != hashes[-1] or int(doc.get("entries", -1)) < at + k:
+                entries = int(doc.get("entries", -1))
+                if doc.get("head") != hashes[-1] or entries < at + k:
                     raise Conflict(
                         at + k,
                         int(doc.get("entries") or 0),
                         f"the server's head for run {lease.run_id!r} after entry {at + k} is not "
                         "the head this writer computed",
+                    )
+                if entries > at + k:
+                    # A duplicate answer (4.6 answers one whatever the lease
+                    # state) from a run that grew past these frames: another
+                    # writer holds the run, and appended at least the
+                    # custody note of its takeover. The frames are durable,
+                    # but acting on them could repeat what the new holder
+                    # did (recovery may have written an intent off and
+                    # performed it again), so the lease is lost.
+                    lease.lost = "lease_lost"
+                    raise LeaseLost(
+                        f"the lease on run {lease.run_id!r} was lost: the run holds {entries} "
+                        f"entries where this writer appended up to {at + k} ({self.url})"
                     )
                 return
             if resp.code in ("lease_lost", "lease_expired", "run_locked"):
@@ -601,6 +714,24 @@ class ServerStore:
                 f"run {lease.run_id!r} holds {entries} entries on {self.url}; this writer appends at {at}",
             )
 
+    def _landed(self, run_id: str, at: int, hashes: List[str]) -> bool:
+        """After an append's resends ran out: whether its frames were stored
+        anyway (an earlier try whose answer was lost), judged from one look
+        at the run's entry count and head. ``False`` when the run cannot be
+        read or has grown past the frames, which then stay in doubt."""
+        try:
+            resp = self._request("GET", self._path(run_id))
+        except Unavailable:
+            return False
+        doc = resp.json() if resp.status == 200 else None
+        if not isinstance(doc, dict):
+            return False
+        try:
+            entries = int(doc.get("entries"))
+        except (TypeError, ValueError):
+            return False
+        return entries == at + len(hashes) and doc.get("head") == hashes[-1]
+
     def _position(self, run_id: str, resp: _Response) -> Tuple[int, str]:
         """The server's ``(entries, head)`` for a run: from a conflict answer
         when it carries them, from the run summary otherwise."""
@@ -614,23 +745,24 @@ class ServerStore:
         return int(doc.get("entries") or 0), str(doc.get("head") or "")
 
     def checkin(self, run_id: str) -> None:
-        """Stop renewing and release the lease (best effort: a lease that is
-        not released expires on its own)."""
+        """Stop renewing, then release the lease (best effort: a lease that
+        is not released expires on its own)."""
         with self._lock:
             lease = self._leases.pop(run_id, None)
         if lease is None:
             return
-        lease.stop.set()
-        if lease.thread is not None and lease.thread is not threading.current_thread():
-            lease.thread.join(self.timeout + CONNECT_TIMEOUT)
+        self._stop_renewal(lease)
         self._release(lease)
 
     def _release(self, lease: _Lease) -> None:
+        self._release_id(lease.run_id, lease.lease)
+
+    def _release_id(self, run_id: str, lease_id: str) -> None:
         try:
             self._request(
                 "DELETE",
-                self._path(lease.run_id, "/lease"),
-                headers={"Pragmatic-Lease": lease.lease},
+                self._path(run_id, "/lease"),
+                headers={"Pragmatic-Lease": lease_id},
                 deadline=time.monotonic() + min(self.sync_deadline, 10.0),
             )
         except Exception:  # noqa: BLE001 - the lease expires on its own

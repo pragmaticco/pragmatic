@@ -23,6 +23,12 @@ supported methods.
 The floors are ``anthropic>=1.0`` and ``openai>=3.0``, the first releases
 built on ``httpx2``. Older releases raise ``Unsupported`` with the upgrade
 to make.
+
+OpenAI clients with X.509 workload identity are refused (``Unsupported``):
+they send the token exchange and every API request through a transport of
+their own (``http_client._transport_for_url``), never through ``send()``,
+so their calls could not be journaled. Handing them the wrapped client's
+transport would let every call bypass the journal.
 """
 
 from __future__ import annotations
@@ -70,6 +76,24 @@ def provider_of(client: Any) -> str:
             f"{version}. Upgrade with: pip install -U '{provider}>={floor}.0'"
         )
     return provider
+
+
+_OWN_TRANSPORT_AUTH = ("SyncX509WorkloadIdentityAuth", "AsyncX509WorkloadIdentityAuth")
+
+
+def _check_transport(client: Any, provider: str) -> None:
+    """Refuse a client whose requests bypass its HTTP client's ``send()``
+    (see the module documentation)."""
+    if provider != "openai":
+        return
+    auth = getattr(client, "_workload_identity_auth", None)
+    if type(auth).__name__ in _OWN_TRANSPORT_AUTH:
+        raise Unsupported(
+            "this OpenAI client uses X.509 workload identity, which sends every request "
+            "through a transport of its own instead of the HTTP client, so its calls cannot be "
+            "journaled: use an API key or a token-based workload identity for durable runs, or "
+            "record its calls with ctx.draw"
+        )
 
 
 def _ws_get(self: Any) -> Any:
@@ -126,6 +150,7 @@ def wrap(client: Any, *, outside: str = "error", http: Optional["AttemptHttp"] =
     if outside not in OUTSIDE:
         raise ValueError(f"outside must be 'error' or 'passthrough', not {outside!r}")
     provider = provider_of(client)
+    _check_transport(client, provider)
     import httpx2
 
     from ._http import JOURNALING, AsyncJournalingHttpClient, Binding, JournalingHttpClient

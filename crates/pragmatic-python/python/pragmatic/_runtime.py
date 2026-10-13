@@ -17,6 +17,17 @@ checkin) run there, in order, and at most one persist is in flight. The
 synchronous steps (``ctx.now()`` and friends) wait for that executor too
 when they are called from an async agent, which stalls the loop for one
 persist; their values are released only once durable all the same.
+
+Cancellation. Cancelling the attempt from outside is a crash: nothing
+further is journaled (spec 2.7, rule 7). But an agent may cancel one of its
+own awaited steps and carry on (``asyncio.timeout``, ``asyncio.wait_for``,
+a task group cancelling a sibling). Once its intent is appended, such a
+step records the cancellation as its failure, appending only, the way a
+closed stream does: if the cancellation turns out to be the attempt's
+crash, the entry is never persisted and the attempt is abandoned with it;
+if the agent carries on, the entry becomes durable with the next persist
+and the attempt can end. Replay waits at that step until the task is
+cancelled again, so the agent's own timeout takes the path it took.
 """
 
 from __future__ import annotations
@@ -48,10 +59,15 @@ from . import _native, _otel
 from ._clients import wrap as _wrap
 from ._codec import canonical, to_jsonable
 from ._diff import with_diff
-from ._draws import AttemptHttp
+from ._draws import AttemptHttp, caller as _caller
 from ._errors import JournalDesync, PragmaticError, ServerError, unwrap_fault
 from ._normalize import Normalizer
-from ._failures import replayed as _replayed_failure, type_name as _type_name
+from ._failures import (
+    is_cancellation as _is_cancellation,
+    replayed as _replayed_failure,
+    type_name as _type_name,
+    wait_for_cancellation as _wait_for_cancellation,
+)
 from ._reports import Entry, RunSummary, VerifyReport
 from ._server import ServerStore, check_url, is_server_url
 from ._stores import DirStore, MemoryStore, native_store
@@ -349,10 +365,13 @@ class Ctx:
         self._http = AttemptHttp(attempt, driver, runtime._normalizer)
 
     def _step(self) -> None:
-        """Before any journaled step: a model stream the agent has not
-        started reading on this branch is written off (spec 6.5)."""
+        """Before any journaled step: the next-step rule of spec 6.5, which
+        writes off a model stream this caller opened on its branch and has
+        not started reading. The ownership check comes first, so a step
+        refused with ``NotInRun`` touches nothing (spec 6.2)."""
         if self._http.open:
-            self._http.settle_untouched()
+            branch = tuple(self._att.branch())
+            self._http.settle_untouched(branch, _caller())
 
     @property
     def run_id(self) -> str:
@@ -409,18 +428,43 @@ class Ctx:
         return with_diff(e, recorded, parts)
 
     @staticmethod
-    def _replayed_body(start: Tuple[Any, ...]) -> bytes:
+    def _replayed_failure(start: Tuple[Any, ...]) -> Optional[Tuple[str, str]]:
+        """The ``(type name, message)`` of a replayed draw that failed, or
+        ``None`` if it succeeded."""
         _, _intent, _head, body, meta = start
         try:
             doc = json.loads(meta)
         except ValueError:
             doc = {}
         if doc.get("outcome") == "error":
-            raise _replayed_failure("draw", doc.get("error_type") or "", _decode(body))
-        return body
+            return doc.get("error_type") or "", _decode(body)
+        return None
+
+    @classmethod
+    def _replayed_body(cls, start: Tuple[Any, ...]) -> bytes:
+        failure = cls._replayed_failure(start)
+        if failure is not None:
+            raise _replayed_failure("draw", *failure)
+        return start[3]
+
+    @classmethod
+    async def _areplayed_body(cls, start: Tuple[Any, ...]) -> bytes:
+        failure = cls._replayed_failure(start)
+        if failure is not None and _is_cancellation(failure[0]):
+            await _wait_for_cancellation()
+        return cls._replayed_body(start)
 
     def _fail_draw(self, intent: int, exc: BaseException) -> Optional[int]:
-        return self._att.draw_end(intent, _error_meta(_type_name(exc)), b"", str(exc).encode())
+        return self._att.draw_end(intent, _error_meta(_type_name(exc)), b"", _failure_text(exc))
+
+    def _cancel_draw(self, intent: int, exc: BaseException) -> None:
+        """Record a cancelled draw, appending only (see the module
+        documentation). The cancellation is what propagates, so a session
+        that cannot record it reports its own fault at the next step."""
+        try:
+            self._fail_draw(intent, exc)
+        except Exception:  # noqa: BLE001 - see the docstring
+            pass
 
     def draw(self, prompt: str, sample: Callable[[], str], *, provenance: str = "python") -> str:
         """Journal one model call made by ``sample()``. ``prompt`` must
@@ -456,20 +500,29 @@ class Ctx:
     async def adraw(
         self, prompt: str, sample: Callable[[], Awaitable[str]], *, provenance: str = "python"
     ) -> str:
-        """``draw`` for an async model call."""
+        """``draw`` for an async model call. A cancelled call the agent
+        carries on past is recorded as a failure, and replay waits there
+        until the task is cancelled again (see the module documentation)."""
         self._step()
         with _otel.draw(self.run_id, self._span_branch(), provenance) as span:
             start = self._draw_begin([_text(prompt)], provenance)
             if start[0] == "replayed":
                 span.set(cursor=start[1], replayed=True, input_tokens=0, output_tokens=0)
-                return _decode(self._replayed_body(start))
+                return _decode(await self._areplayed_body(start))
             _, intent, upto = start
             span.set(cursor=intent, replayed=False)
-            await self._io.adurable(upto)
+            try:
+                await self._io.adurable(upto)
+            except asyncio.CancelledError as e:
+                self._cancel_draw(intent, e)
+                raise
             try:
                 outcome = await sample()
                 if not isinstance(outcome, str):
                     raise TypeError("adraw's sample() must return str")
+            except asyncio.CancelledError as e:
+                self._cancel_draw(intent, e)
+                raise
             except Exception as e:
                 await self._io.adurable(self._fail_draw(intent, e))
                 raise
@@ -491,11 +544,29 @@ class Ctx:
     # -- tools and effects ------------------------------------------------
 
     def _fail_effect(self, intent: int, exc: BaseException) -> Optional[int]:
-        return self._att.effect_end(intent, failure=(_type_name(exc), str(exc)))
+        return self._att.effect_end(intent, failure=(_type_name(exc), _failure_text(exc).decode()))
+
+    def _cancel_effect(self, intent: int, exc: BaseException) -> None:
+        """Record a cancelled effect, appending only (see ``_cancel_draw``).
+        Whether the world saw it is as unknown as for any perform that
+        raised: a crash leaves it to recovery, which retries an unobserved
+        failed effect by default (spec 2.12)."""
+        try:
+            self._fail_effect(intent, exc)
+        except Exception:  # noqa: BLE001 - the cancellation is what propagates
+            pass
 
     def _effect_start(self, name: str, arg: Union[str, bytes]) -> Tuple[Any, ...]:
         start = self._att.effect_begin(name, _text(arg))
         if start[0] == "failed":
+            raise _replayed_failure("effect", start[1], start[2])
+        return start
+
+    async def _aeffect_start(self, name: str, arg: Union[str, bytes]) -> Tuple[Any, ...]:
+        start = self._att.effect_begin(name, _text(arg))
+        if start[0] == "failed":
+            if _is_cancellation(start[1]):
+                await _wait_for_cancellation()
             raise _replayed_failure("effect", start[1], start[2])
         return start
 
@@ -552,24 +623,32 @@ class Ctx:
             raise _native.effect_unrecorded(name, intent, data) from e
 
     async def aeffect(self, name: str, arg: str, perform: Callable[..., Any]) -> str:
-        """``effect`` for an async (or sync) ``perform``."""
+        """``effect`` for an async (or sync) ``perform``. A cancelled perform
+        the agent carries on past is recorded as a failure, and replay waits
+        there until the task is cancelled again (see the module
+        documentation)."""
         self._step()
         with _otel.effect(self.run_id, self._span_branch(), name) as span:
-            start = self._effect_start(name, arg)
+            start = await self._aeffect_start(name, arg)
             if start[0] == "replayed":
                 span.set(replayed=True)
                 return _decode(start[1])
             _, intent, key, upto = start
             span.set(cursor=intent, replayed=False)
-            await self._io.adurable(upto)
-            # A cancelled perform leaves the intent open on purpose: resume's
-            # recovery policy decides whether the world saw the effect.
+            try:
+                await self._io.adurable(upto)
+            except asyncio.CancelledError as e:
+                self._cancel_effect(intent, e)
+                raise
             try:
                 result = perform(arg, idempotency_key=key) if _accepts_key(perform) else perform(arg)
                 if inspect.isawaitable(result):
                     result = await result
                 if not isinstance(result, str):
                     raise TypeError(f"the perform of effect {name!r} must return str")
+            except asyncio.CancelledError as e:
+                self._cancel_effect(intent, e)
+                raise
             except Exception as e:
                 await self._io.adurable(self._fail_effect(intent, e))
                 raise
@@ -713,7 +792,14 @@ class Ctx:
         when another fails, and if any failed the region raises the failure
         of the lowest-index failed child, never the first in time. Replay
         matches each child's branch on its own, so children that interleave
-        differently on replay still replay exactly."""
+        differently on replay still replay exactly.
+
+        Cancelling the task that awaits the region (a timeout around it)
+        cancels the children too, and closes the region once they have
+        finished, so the agent can carry on stepping on its own branch. A
+        child that ends cancelled while the region was not is a failed
+        child, raised as a ``PragmaticError`` whose ``__cause__`` is the
+        ``CancelledError``."""
         for fn in fns:
             if inspect.iscoroutine(fn) or not callable(fn):
                 _close(fn)
@@ -724,18 +810,47 @@ class Ctx:
         if not fns:
             return []
         self._step()
-        children, upto = self._att.fork(len(fns))
-        await self._io.adurable(upto)
+        forked, upto = self._att.fork(len(fns))
+        children = [tuple(c) for c in forked]
+        try:
+            await self._io.adurable(upto)
+        except BaseException:
+            self._abandon_region(children)
+            raise
         loop = asyncio.get_running_loop()
-        tasks = [loop.create_task(self._child(tuple(c), fn)) for c, fn in zip(children, fns)]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        ok = [not isinstance(r, BaseException) for r in results]
-        if not any(_is_crash(r) for r in results):
+        tasks = [loop.create_task(self._child(c, fn)) for c, fn in zip(children, fns)]
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except BaseException:
+            # This task was cancelled while the children ran. asyncio.gather
+            # has cancelled them too and waited for every one to finish.
+            if all(t.done() for t in tasks):
+                self._abandon_region(children)
+            raise
+        return self._join(children, results)
+
+    def _abandon_region(self, children: List[Tuple[int, ...]]) -> None:
+        """Join a region the parent was cancelled out of (or whose fork never
+        became durable) with every child failed, so the parent's branch can
+        step again if the agent carries on (spec 2.7, rule 5). A join
+        appends nothing, and the streams it writes off are only appended, so
+        a crash still journals nothing."""
+        self._http.settle_regions(children)
+        try:
+            self._att.join([list(c) for c in children], [False] * len(children))
+        except Exception:  # noqa: BLE001 - the cancellation is what propagates
+            pass
+
+    def _join(self, children: List[Tuple[int, ...]], results: List[Any]) -> list:
+        """Join a region whose children all finished, and raise the failure
+        of the lowest-index failed child (spec 2.7, rule 4)."""
+        failures = [_child_failure(i, r) for i, r in enumerate(results)]
+        if not any(_is_crash(f) for f in failures):
             self._http.settle_regions(children)
-        checks = self._att.join([list(c) for c in children], ok)
-        for result, check in zip(results, checks):
-            if isinstance(result, BaseException):
-                raise result
+        checks = self._att.join([list(c) for c in children], [f is None for f in failures])
+        for failure, check in zip(failures, checks):
+            if failure is not None:
+                raise failure
             if check is not None:
                 raise check
         return list(results)
@@ -783,6 +898,30 @@ def _running_loop() -> Optional[asyncio.AbstractEventLoop]:
 
 def _agent_name(agent: Any) -> str:
     return getattr(_unwrap(agent), "__qualname__", None) or type(agent).__name__
+
+
+def _failure_text(exc: BaseException) -> bytes:
+    """A failure's message as recorded: a cancellation without a message of
+    its own records ``cancelled``."""
+    text = str(exc)
+    if isinstance(exc, asyncio.CancelledError) and not text:
+        text = "cancelled"
+    return text.encode()
+
+
+def _child_failure(index: int, result: Any) -> Optional[BaseException]:
+    """What a ``ctx.gather`` child's result makes the region raise: ``None``
+    for a value, its exception otherwise. A child that ended cancelled while
+    the parent was not (it cancelled itself, or a library cancelled it) is
+    a failed child, raised as a ``PragmaticError``: the attempt was not
+    cancelled, and a ``CancelledError`` would make it end as a crash."""
+    if not isinstance(result, BaseException):
+        return None
+    if isinstance(result, asyncio.CancelledError):
+        error = PragmaticError(f"child {index} of the parallel region was cancelled")
+        error.__cause__ = result
+        return error
+    return result
 
 
 def _is_crash(result: Any) -> bool:
@@ -993,7 +1132,7 @@ class Runtime:
                 try:
                     result = agent(ctx)
                     if inspect.isawaitable(result):
-                        result = self._await_privately(agent, result)
+                        result = self._await_privately(agent, result, att)
                     output = _encode_output(result)
                 except BaseException as exc:
                     error = unwrap_fault(exc)
@@ -1008,16 +1147,24 @@ class Runtime:
             CURRENT.reset(token)
 
     @staticmethod
-    def _await_privately(agent: Agent, awaitable: Awaitable) -> Any:
-        """Drive the awaitable a sync-looking agent returned on a private
-        loop, or refuse inside a running one."""
+    def _await_privately(agent: Agent, awaitable: Awaitable, att: Any) -> Any:
+        """Drive the awaitable a sync-looking agent returned (a lambda that
+        binds an async agent's arguments) on a private loop, or refuse
+        inside a running one. The loop's main task becomes the attempt's
+        root task, so the attempt is owned as an ``arun`` attempt is: tasks
+        the agent creates itself are refused (spec 6.2, 6.4)."""
         if _running_loop() is not None:
             _close(awaitable)
             raise RuntimeError(
                 f"{_agent_name(agent)} returned an awaitable inside a running event loop; "
                 "use `await rt.arun(...)`"
             )
-        return asyncio.run(_as_coroutine(awaitable))
+
+        async def root() -> Any:
+            att.own_current_task(root=True)
+            return await awaitable
+
+        return asyncio.run(root())
 
     async def _async(
         self, mode: str, run_id: str, agent: Agent, recover: Optional[Callable], opts: dict

@@ -14,14 +14,25 @@ it; the ``DrawResult`` is written when the body ends (and is durable before
 the end reaches the caller), or with the bytes read so far when the stream
 is closed early (``partial``). A non-streaming response and every error
 response are read whole inside ``send()``. A transport error is a result
-too, so the SDK's retry loop replays exactly.
+too, so the SDK's retry loop replays exactly; its message is journaled
+without credentials (``_wire.scrub_message``).
+
+Cancellation. An async exchange whose task is cancelled (``asyncio.timeout``,
+``asyncio.wait_for``, a task group or a framework cancelling the call) is a
+result with ``error_type`` ``asyncio.exceptions.CancelledError``, with the
+bytes read so far. The result is only appended: if the cancellation is the
+attempt's crash, nothing more is persisted and the entry is dropped with
+the attempt (spec 2.7, rule 7); if the agent catches it and carries on, the
+entry becomes durable with the next persist, and the attempt can end.
 
 Replay. ``send()`` builds the response from the journal: the recorded
 status, headers and bytes, so the SDK parses into its own types from
 identical input. A recorded transport error is raised again, as an
 instance of the recorded httpx2 class, so the SDK wraps and retries it as
-it did. A retryable error response is served with ``retry-after-ms: 1``,
-so the SDK's retry costs no waiting.
+it did. A retryable error response is served with a retry hint that makes
+the SDK decide as it did, at no wait (``_wire.replay_headers``). A recorded
+cancellation waits until the task is cancelled again, so the agent's own
+timeout takes the path it took.
 
 Journal faults (a desync, a refused step, a failed persist) are raised
 inside a ``JournalFault`` carrier: SDKs and frameworks catch ``Exception``
@@ -30,6 +41,7 @@ around ``send()``, and a fault must reach the runtime unchanged.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
 import time
@@ -39,9 +51,14 @@ from typing import Any, Callable, List, Optional, Set, Tuple
 import httpx2
 
 from . import _otel, _wire
-from ._draws import CURRENT, LIVE, AttemptHttp
+from ._draws import CURRENT, LIVE, AttemptHttp, Caller, caller
 from ._errors import JournalFault, NotInRun, Unsupported
-from ._failures import replayed as _replayed_failure, type_name as _type_name
+from ._failures import (
+    is_cancellation,
+    replayed as _replayed_failure,
+    type_name as _type_name,
+    wait_for_cancellation,
+)
 
 _OPEN, _DONE, _DEAD = 0, 1, 2
 
@@ -166,11 +183,14 @@ class _Recording:
         "http",
         "intent",
         "branch",
+        "caller",
         "provider",
         "request_model",
+        "request_headers",
         "upstream",
         "status",
         "headers",
+        "retry_after",
         "content_type",
         "chunks",
         "state",
@@ -184,30 +204,31 @@ class _Recording:
 
     def __init__(
         self,
-        http: AttemptHttp,
-        intent: int,
-        branch: Tuple[int, ...],
-        provider: str,
-        request: _wire.Request,
+        exchange: "_Exchange",
         upstream: httpx2.Response,
         t0: float,
-        span: _otel.Step,
     ):
-        self.http = http
-        self.intent = intent
-        self.branch = branch
-        self.provider = provider
-        self.request_model = request.model
+        assert exchange.intent is not None
+        self.http = exchange.http
+        self.intent = exchange.intent
+        self.branch = exchange.branch
+        self.caller = exchange.caller
+        self.provider = exchange.provider
+        self.request_model = exchange.parsed.model
+        self.request_headers = exchange.request.headers.multi_items()
         self.upstream = upstream
         self.status = upstream.status_code
         self.headers = _wire.kept_headers(upstream.headers.multi_items())
+        self.retry_after = (
+            _wire.dated_retry_delay(self.headers, time.time()) if self.status >= 400 else None
+        )
         self.content_type = upstream.headers.get("content-type", "")
         self.chunks: List[bytes] = []
         self.state = _OPEN
         self.touched = False
         self.t0 = t0
         self.latency_ms: Optional[int] = None
-        self.span = span
+        self.span = exchange.span
         self.finalizer: Optional[weakref.finalize] = None
 
     def elapsed(self) -> datetime.timedelta:
@@ -257,7 +278,8 @@ class _Recording:
             error=error,
             error_type=_type_name(error) if error is not None else None,
         )
-        head = _wire.head_bytes(self.status, self.headers, str(error) if error is not None else None)
+        message = _message(error, self.request_headers) if error is not None else None
+        head = _wire.head_bytes(self.status, self.headers, message, self.retry_after)
         try:
             return self.http.complete(self.intent, meta, head, body)
         finally:
@@ -281,6 +303,16 @@ class _Recording:
             self.state = _DEAD
         if self.finalizer is not None:
             self.finalizer.detach()
+
+
+def _message(exc: BaseException, request_headers: List[Tuple[str, str]]) -> str:
+    """What the journal keeps of a failure's message: the text without
+    credentials (``_wire.scrub_message``); a cancellation's own message, if
+    it has one, or ``cancelled``."""
+    text = str(exc)
+    if isinstance(exc, asyncio.CancelledError) and not text:
+        text = "cancelled"
+    return _wire.scrub_message(text, request_headers)
 
 
 def _end_span(span: _otel.Step, meta: str) -> None:
@@ -355,6 +387,11 @@ class _AsyncTeeStream(httpx2.AsyncByteStream):
                 yield chunk
         except GeneratorExit:
             raise
+        except asyncio.CancelledError as e:
+            # Appended only (see the module documentation): durable if the
+            # agent carries on, dropped if this is the attempt's crash.
+            _settle_cancelled(rec, e)
+            raise
         except Exception as e:
             await _adurable(rec.http, _journal(rec.settle, "error", e))
             raise
@@ -364,6 +401,16 @@ class _AsyncTeeStream(httpx2.AsyncByteStream):
         rec = self._rec
         rec.settle_quietly()
         await rec.upstream.aclose()
+
+
+def _settle_cancelled(rec: _Recording, exc: BaseException) -> None:
+    """Write a cancelled read's result (the bytes read so far and the
+    cancellation), appending only. A session that failed has its own fault
+    to report at the next step; the cancellation is what propagates now."""
+    try:
+        rec.settle("error", exc)
+    except Exception:  # noqa: BLE001 - see the docstring
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -383,25 +430,35 @@ def _replica(type_name: str, message: str, request: httpx2.Request) -> BaseExcep
 
 class _Replayed:
     """A recorded response: status, headers, bytes, and the failure that
-    cut the body short, if one did."""
+    cut the body short, if one did. ``early`` is set (and ``status`` is 0)
+    when the exchange failed before any response."""
 
-    __slots__ = ("status", "headers", "body", "failure", "elapsed")
+    __slots__ = ("status", "headers", "body", "failure", "cancelled", "early", "elapsed")
 
-    def __init__(self, start: Tuple[Any, ...], request: httpx2.Request):
+    def __init__(self, start: Tuple[Any, ...], request: httpx2.Request, provider: str):
         _, _intent, head, body, meta = start
         doc = json.loads(meta)
-        if not head:
-            # The exchange failed before any response: raise it again.
-            raise _replica(doc.get("error_type") or "", body.decode("utf-8", "replace"), request)
-        recorded = json.loads(head)
-        self.status: int = recorded["status"]
-        self.headers = _wire.replay_headers(recorded["headers"], self.status)
-        self.body: bytes = body
-        self.failure: Optional[Callable[[], BaseException]] = None
-        if doc.get("outcome") == "error" and doc.get("error_type"):
-            name, message = doc["error_type"], recorded.get("error", "")
-            self.failure = lambda: _replica(name, message, request)
         self.elapsed = datetime.timedelta(milliseconds=doc.get("latency_ms") or 0)
+        self.failure: Optional[Callable[[], BaseException]] = None
+        name = doc.get("error_type") or ""
+        self.cancelled = is_cancellation(name)
+        self.early = not head
+        if self.early:
+            message = body.decode("utf-8", "replace")
+            self.failure = lambda: _replica(name, message, request)
+            self.status = 0
+            self.headers: List[List[str]] = []
+            self.body = b""
+            return
+        recorded = json.loads(head)
+        self.status = recorded["status"]
+        self.headers = _wire.replay_headers(
+            recorded["headers"], self.status, provider, recorded.get("retry_after")
+        )
+        self.body = body
+        if doc.get("outcome") == "error" and name:
+            message = recorded.get("error", "")
+            self.failure = lambda: _replica(name, message, request)
 
 
 class _ReplayStream(httpx2.SyncByteStream):
@@ -424,6 +481,8 @@ class _AsyncReplayStream(httpx2.AsyncByteStream):
     async def __aiter__(self):  # type: ignore[override]
         if self._r.body:
             yield self._r.body
+        if self._r.cancelled:
+            await wait_for_cancellation()
         if self._r.failure is not None:
             raise self._r.failure()
 
@@ -437,7 +496,7 @@ class _Exchange:
     """The journal side of one ``send()``: begin the draw, and record a
     transport failure."""
 
-    __slots__ = ("http", "provider", "request", "parsed", "branch", "intent", "span")
+    __slots__ = ("http", "provider", "request", "parsed", "branch", "caller", "intent", "span")
 
     def __init__(self, http: AttemptHttp, provider: str, request: httpx2.Request):
         self.http = http
@@ -445,12 +504,13 @@ class _Exchange:
         self.request = request
         self.parsed = _parse(request)
         self.branch = http.branch()
+        self.caller: Caller = caller()
         self.intent: Optional[int] = None
         self.span = _otel.Step(None)
 
     def begin(self) -> Tuple[Any, ...]:
         provenance = _provenance(self.provider, self.parsed)
-        start = _journal(self.http.begin, self.parsed, provenance)
+        start = _journal(self.http.begin, self.parsed, provenance, self.caller)
         self.span = _otel.start_draw(self.http.run_id, self.branch, provenance)
         if start[0] == "replayed":
             self.span.set(cursor=start[1], replayed=True, input_tokens=0, output_tokens=0)
@@ -461,7 +521,8 @@ class _Exchange:
         return start
 
     def failed(self, exc: BaseException, t0: float) -> Optional[int]:
-        """Record a transport failure as the exchange's result."""
+        """Record a transport failure (or a cancellation) as the exchange's
+        result. Its message is journaled without credentials."""
         latency = max(0, round((time.monotonic() - t0) * 1000))
         meta = _wire.meta(
             "error",
@@ -472,20 +533,28 @@ class _Exchange:
             error_type=_type_name(exc),
         )
         assert self.intent is not None
+        message = _message(exc, self.request.headers.multi_items()).encode("utf-8")
         try:
-            return _journal(self.http.complete, self.intent, meta, b"", str(exc).encode("utf-8"))
+            return _journal(self.http.complete, self.intent, meta, b"", message)
         finally:
             _end_span(self.span, meta)
 
+    def cancelled(self, exc: BaseException, t0: float) -> None:
+        """Record a cancellation that reached the exchange before its
+        response, appending only (see the module documentation)."""
+        try:
+            self.failed(exc, t0)
+        except (Exception, JournalFault):  # noqa: BLE001 - the cancellation is what propagates
+            pass
+
     def recording(self, upstream: httpx2.Response, t0: float) -> _Recording:
-        assert self.intent is not None
-        return _Recording(
-            self.http, self.intent, self.branch, self.provider, self.parsed, upstream, t0, self.span
-        )
+        return _Recording(self, upstream, t0)
 
 
 def _watch(http: AttemptHttp, rec: _Recording, response: httpx2.Response) -> None:
-    """Track an open stream, and write it off if the caller drops it."""
+    """Track a recording until its result is written: the end of the
+    attempt writes off one still open, and a crash drops it. A stream is
+    also written off if the caller drops it unread."""
     http.track(rec)
     rec.finalizer = weakref.finalize(response, rec.settle_quietly)
     rec.finalizer.atexit = False
@@ -495,17 +564,27 @@ def _response(status: int, headers: List[List[str]], stream: Any, request: httpx
     return httpx2.Response(status, headers=[(k, v) for k, v in headers], stream=stream, request=request)
 
 
+_BYPASSED = (
+    "a request bypassed the journaling client's send(), so it could not be journaled: "
+    "this client sends its requests through a transport of its own (such as OpenAI's "
+    "X.509 workload identity). Make its model calls with a client pragmatic can journal, "
+    "or record them with ctx.draw"
+)
+
+
 class _NoTransport(httpx2.BaseTransport):
-    """Never used: ``send()`` is overridden. Avoids building a real
-    transport (and loading TLS roots) for a client that never connects."""
+    """Never used by the SDKs, which call ``send()``. Avoids building a real
+    transport (and loading TLS roots) for a client that never connects, and
+    refuses, inside the carrier so no SDK retries it, any request that
+    reaches a transport without passing through ``send()``."""
 
     def handle_request(self, request: httpx2.Request) -> httpx2.Response:
-        raise RuntimeError("a journaling client sends through the client it wraps")
+        raise JournalFault(Unsupported(_BYPASSED))
 
 
 class _AsyncNoTransport(httpx2.AsyncBaseTransport):
     async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
-        raise RuntimeError("a journaling client sends through the client it wraps")
+        raise JournalFault(Unsupported(_BYPASSED))
 
 
 class JournalingHttpClient(httpx2.Client):
@@ -548,7 +627,9 @@ class JournalingHttpClient(httpx2.Client):
         exchange = _Exchange(http, self._binding.provider, request)
         start = exchange.begin()
         if start[0] == "replayed":
-            replayed = _Replayed(start, request)
+            replayed = _Replayed(start, request, self._binding.provider)
+            if replayed.early:
+                raise replayed.failure()  # type: ignore[misc]
             response = _response(replayed.status, replayed.headers, _ReplayStream(replayed), request)
             if not stream:
                 response.read()
@@ -562,9 +643,9 @@ class JournalingHttpClient(httpx2.Client):
             raise
         rec = exchange.recording(upstream, t0)
         response = _response(rec.status, rec.headers, _TeeStream(rec), request)
-        if stream and rec.status < 400:
-            _watch(http, rec, response)
-        else:
+        _watch(http, rec, response)
+        if not stream or rec.status >= 400:
+            rec.touched = True
             response.read()
         return response
 
@@ -610,23 +691,31 @@ class AsyncJournalingHttpClient(httpx2.AsyncClient):
         exchange = _Exchange(http, self._binding.provider, request)
         start = exchange.begin()
         if start[0] == "replayed":
-            replayed = _Replayed(start, request)
+            replayed = _Replayed(start, request, self._binding.provider)
+            if replayed.early:
+                if replayed.cancelled:
+                    await wait_for_cancellation()
+                raise replayed.failure()  # type: ignore[misc]
             response = _response(replayed.status, replayed.headers, _AsyncReplayStream(replayed), request)
             if not stream:
                 await response.aread()
             return response
-        await _adurable(http, start[2])
         t0 = time.monotonic()
         try:
+            await _adurable(http, start[2])
+            t0 = time.monotonic()
             upstream = await self._inner.send(request, stream=True, **kwargs)
+        except asyncio.CancelledError as e:
+            exchange.cancelled(e, t0)
+            raise
         except Exception as e:
             await _adurable(http, exchange.failed(e, t0))
             raise
         rec = exchange.recording(upstream, t0)
         response = _response(rec.status, rec.headers, _AsyncTeeStream(rec), request)
-        if stream and rec.status < 400:
-            _watch(http, rec, response)
-        else:
+        _watch(http, rec, response)
+        if not stream or rec.status >= 400:
+            rec.touched = True
             await response.aread()
         return response
 

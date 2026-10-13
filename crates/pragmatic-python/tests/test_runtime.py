@@ -9,7 +9,9 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json
+import sys
 import threading
+import time
 import uuid
 import warnings
 
@@ -29,6 +31,20 @@ def notes(rt, run_id, kind):
 
 def program_entries(rt, run_id):
     return [e for e in rt.entries(run_id) if e["branch"] != [0xFFFFFFFF]]
+
+
+def fields(rt, run_id, kind):
+    return [e["fields"] for e in rt.entries(run_id) if e["kind"] == kind]
+
+
+needs_timeout = pytest.mark.skipif(sys.version_info < (3, 11), reason="asyncio.timeout is new in 3.11")
+
+CANCELLED = "asyncio.exceptions.CancelledError"
+
+
+async def never(*_args):
+    await asyncio.sleep(30)
+    return "never"
 
 
 # ---------------------------------------------------------------------------
@@ -119,13 +135,148 @@ def test_cancelling_an_async_run_is_a_crash():
             await task
 
     asyncio.run(main())
-    # Nothing more was journaled after the intent: no attempt.end.
+    # Nothing more was journaled after the intent: no result (the
+    # cancellation's was only appended, and the crash dropped it), no
+    # attempt.end.
     assert notes(rt, "c", "attempt.end") == []
     intents = [e for e in rt.entries("c") if e["kind"] == "EffectIntent"]
     assert len(intents) == 1
+    assert fields(rt, "c", "EffectResult") == []
     # The run was checked in: it resumes, and the policy decides the intent.
     report = rt.resume("c", agent, recover=lambda name, arg: "committed")
     assert report.output == "committed"
+
+
+# ---------------------------------------------------------------------------
+# Steps the agent cancels and carries on past (spec 2.7 rule 7, 2.12)
+# ---------------------------------------------------------------------------
+
+
+@needs_timeout
+def test_a_timed_out_effect_is_a_failure_the_run_carries_on_past():
+    rt = pragmatic.Runtime(pragmatic.MemoryStore())
+    performed = []
+
+    async def slow(arg):
+        performed.append(arg)
+        return await never()
+
+    async def agent(ctx):
+        try:
+            async with asyncio.timeout(0.05):
+                await ctx.aeffect("slow", "x", slow)
+        except TimeoutError:
+            pass
+        return await ctx.atool("fallback", lambda: "fallback")
+
+    assert rt.run("t", agent).output == "fallback"
+    failed, ok = fields(rt, "t", "EffectResult")
+    assert failed["outcome"] == "failed" and failed["error_kind"] == CANCELLED
+    assert ok["outcome"] == "ok"
+    # Replay waits at the step until the agent's own timeout cancels it
+    # again, and performs nothing.
+    started = time.monotonic()
+    assert rt.replay("t", agent).output == "fallback"
+    assert time.monotonic() - started >= 0.05
+    assert performed == ["x"]
+    assert rt.resume("t", agent).output == "fallback" and performed == ["x"]
+
+
+@needs_timeout
+def test_a_timed_out_model_call_is_a_failure_the_run_carries_on_past():
+    rt = pragmatic.Runtime(pragmatic.MemoryStore())
+
+    async def agent(ctx):
+        try:
+            async with asyncio.timeout(0.05):
+                await ctx.adraw("prompt", never)
+        except TimeoutError:
+            return "carried on"
+        return "answered"
+
+    assert rt.run("d", agent).output == "carried on"
+    [result] = fields(rt, "d", "DrawResult")
+    assert result["meta"] == {"error_type": CANCELLED, "outcome": "error"}
+    assert rt.replay("d", agent).output == "carried on"
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12), reason="before 3.12 asyncio.wait_for runs the step in a task of its own"
+)
+def test_wait_for_around_a_step_runs_it_in_the_callers_task():
+    rt = pragmatic.Runtime(pragmatic.MemoryStore())
+
+    async def agent(ctx):
+        try:
+            await asyncio.wait_for(ctx.atool("slow", never), 0.05)
+        except TimeoutError:
+            return "timed out"
+        return "answered"
+
+    assert rt.run("w", agent).output == "timed out"
+    assert rt.replay("w", agent).output == "timed out"
+
+
+@pytest.mark.skipif(sys.version_info >= (3, 12), reason="from 3.12 asyncio.wait_for runs in the caller's task")
+def test_wait_for_before_3_12_runs_the_step_in_a_task_the_attempt_does_not_own():
+    rt = pragmatic.Runtime(pragmatic.MemoryStore())
+
+    async def agent(ctx):
+        with pytest.raises(pragmatic.NotInRun):
+            await asyncio.wait_for(ctx.atool("t", lambda: 1), 5)
+        return "refused"
+
+    assert rt.run("w", agent).output == "refused"
+
+
+@needs_timeout
+def test_a_region_cancelled_by_a_timeout_leaves_the_parent_branch_usable():
+    rt = pragmatic.Runtime(pragmatic.MemoryStore())
+
+    async def slow_child(c):
+        await c.atool("started", lambda: 1)
+        return await never()
+
+    async def agent(ctx):
+        try:
+            async with asyncio.timeout(0.1):
+                await ctx.gather(slow_child, slow_child)
+        except TimeoutError:
+            pass
+        # The region is over: the root branch steps again (spec 2.7, rule 5).
+        return str(ctx.now() > 0)
+
+    assert rt.run("g", agent).output == "True"
+    assert rt.replay("g", agent).output == "True"
+
+
+def test_a_child_cancelled_inside_the_region_is_a_failed_child():
+    rt = pragmatic.Runtime(pragmatic.MemoryStore())
+
+    async def cancelled_child(c):
+        asyncio.current_task().cancel()
+        await asyncio.sleep(0)
+        return "never"
+
+    async def agent(ctx):
+        try:
+            await ctx.gather(lambda c: c.atool("a", lambda: 1), cancelled_child)
+        except asyncio.CancelledError:
+            raise
+        except pragmatic.PragmaticError as e:
+            return f"{type(e.__cause__).__name__}: {e}"
+        return "no failure"
+
+    async def main():
+        # Nothing cancelled this task: it must not see a CancelledError.
+        report = await rt.arun("cc", agent)
+        if sys.version_info >= (3, 11):
+            assert asyncio.current_task().cancelling() == 0
+        return report.output
+
+    out = asyncio.run(main())
+    assert out == "CancelledError: child 1 of the parallel region was cancelled"
+    assert rt.replay("cc", agent).output == out
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +446,29 @@ def test_tasks_the_attempt_does_not_own_are_refused():
     assert rt.run("k", agent).output == "refused"
     # Nothing was recorded for the refused step.
     assert not [e for e in rt.entries("k") if e["kind"] == "EffectIntent"]
+
+
+def test_an_async_agent_passed_through_a_lambda_is_owned_by_its_tasks():
+    rt = pragmatic.Runtime(pragmatic.MemoryStore())
+
+    async def gathered(ctx, tag):
+        async def slow(x):
+            await asyncio.sleep(0.01)
+            return x
+
+        return await asyncio.gather(ctx.atool("a", slow, tag), ctx.atool("b", slow, tag))
+
+    # Binding arguments with a lambda runs the agent on a private loop; its
+    # tasks are owned as in arun, so tasks the agent creates are refused.
+    with pytest.raises(pragmatic.NotInRun):
+        rt.run("direct", lambda c: gathered(c, "x"))
+
+    async def owned(ctx, tag):
+        stamp = await asyncio.to_thread(ctx.now)
+        parts = await ctx.gather(lambda c: c.atool("l", lambda: tag), lambda c: c.atool("r", lambda: tag))
+        return [stamp > 0, parts]
+
+    assert json.loads(rt.run("bound", lambda c: owned(c, "y")).output) == [True, ["y", "y"]]
 
 
 def test_a_synchronous_attempt_belongs_to_its_thread():
@@ -679,6 +853,43 @@ def test_a_persist_failure_is_sticky_and_raises_what_the_store_raised(pystore):
     assert kinds == ["run.start", "attempt.start"], "no attempt.end after a failed persist"
     # The next attempt starts from what was durable.
     assert rt.resume("s", lambda ctx: ctx.now() and "resumed").output == "resumed"
+
+
+@pytest.mark.parametrize(
+    "make",
+    [lambda: OSError("disk full"), lambda: pragmatic.Unavailable("server down")],
+    ids=["oserror", "unavailable"],
+)
+def test_a_region_raises_what_the_store_raised(pystore, make):
+    """Child 0 returns first, with no steps; child 1's persist fails. The
+    region raises the store's own exception, as every step after a failed
+    persist does (spec 6.3), whichever child happened to finish first."""
+    rt = pragmatic.Runtime(pystore)
+    boom = make()
+    seen = {}
+
+    async def ok_child(c):
+        return "fine"
+
+    async def failing_child(c):
+        await asyncio.sleep(0.01)
+        pystore.fail = lambda n, frames: boom
+        try:
+            await c.atool("t", lambda: 1)
+        except BaseException as e:  # noqa: BLE001
+            seen["child"] = e
+            raise
+
+    async def agent(ctx):
+        try:
+            await ctx.gather(ok_child, failing_child)
+        except BaseException as e:  # noqa: BLE001
+            seen["region"] = e
+            raise
+
+    with pytest.raises(type(boom)) as ended:
+        rt.run("sticky-gather", agent)
+    assert seen["child"] is boom and seen["region"] is boom and ended.value is boom
 
 
 def test_store_exceptions_map_to_their_faults(pystore):

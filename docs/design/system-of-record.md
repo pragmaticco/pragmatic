@@ -5,7 +5,8 @@ cryptography, replay correctness, storage and failure handling, compliance,
 developer experience and completeness, amended after the review of the core
 runtime (2.4, 2.6 to 2.8, 2.11, 2.12, 2.14, 3.1 to 3.3, 6.7) and while
 building the Python runtime layer (3.1, 4.4, 4.6, 6.2, 6.3, 6.7) and its
-journaled model clients (2.6, 2.11, 3.0, 3.1, 6.5, 6.6, 6.7). This
+journaled model clients (2.6, 2.11, 3.0, 3.1, 6.5, 6.6, 6.7), and after
+the review of that layer (2.6, 2.7, 2.12, 3.1, 4.6, 6.2 to 6.5). This
 document is the contract
 between the components built for 0.6. Everything marked MUST is
 normative; where code and this document disagree, one of them is a bug.
@@ -230,7 +231,7 @@ Slots are content and are erasable.
 
 **DrawResult meta** (written by the SDK; all keys optional except
 `outcome`): `{"outcome": "ok"|"error"|"partial", "status": n,
-"error_kind": "connect"|"timeout"|"protocol", "error_type": "...",
+"error_kind": "connect"|"timeout"|"protocol"|"cancelled", "error_type": "...",
 "provider": "...",
 "model": "...", "stop_reason": "...", "usage": {"input_tokens": n,
 "output_tokens": n, "cache_read_tokens": n, "cache_write_tokens": n,
@@ -241,7 +242,9 @@ provider's terminal event, such as `data: [DONE]` or `message_stop`, is
 the OpenAI SDK always does). An HTTP response with a status of 400 or
 more is `error` with its `status`; a body that broke while it was read is
 `error` with its `status`, `error_kind` and `error_type`, and the message
-in the head (6.5). `error_type` names what the caller's model
+in the head (6.5). A call the agent cancelled and carried on past (2.12)
+is `error` with `error_kind` `cancelled` and `error_type`
+`asyncio.exceptions.CancelledError`. `error_type` names what the caller's model
 client raised when the call failed outside HTTP (a core `Fault` kind such
 as `Unavailable` for a Rust oracle, or a Python exception's
 `module.QualName`), with the message in the body slot, so replay raises the
@@ -294,7 +297,15 @@ values; otherwise `JournalDesync`. A fork that would produce a child index
    fault.
 7. Cancelling the attempt from outside (task cancellation, interrupt,
    dropping the attempt) is a crash: nothing further is journaled and no
-   `attempt.end` is written.
+   `attempt.end` is written. A cancellation the agent handles is not a
+   crash: a step it cancels and carries on past (a timeout around it)
+   ends in a failure result (2.12). A region whose parent is cancelled
+   while its children run is joined, once they have all finished, with
+   every child failed; a join appends nothing, so a crash still journals
+   nothing, and an agent that carries on can step on the parent's branch
+   again. A child that ends cancelled while its parent was not cancelled
+   (it cancelled itself, or a library did) is a failed child, and the
+   region raises an ordinary error for it, never a cancellation.
 
 **Replay indexing.** On open, the journal is indexed per branch into its
 *start events*, which are everything except `DrawResult`, `EffectResult`
@@ -450,16 +461,32 @@ whole after persistence. A stream's chunks are passed to the caller as
 they arrive, and the `DrawResult` with the full body is persisted when
 the stream ends or is closed. Transport errors and HTTP errors are
 results too (`outcome: error`), so the SDK's own retry loop replays
-identically. On replay, retryable error responses are served with
-`retry-after-ms: 0` so no time is spent sleeping. A call that fails
+identically. On replay, retryable error responses are served with a
+retry hint that makes the SDK decide as it did when the run was
+recorded, at no wait (6.5). A call that fails
 outside HTTP (a Rust oracle's fault, a Python callable's exception) is
 recorded with its `error_type` (2.6) and replays as the same error: Rust
 rebuilds the `Fault` for every kind that carries no more than a message
 and otherwise raises `Fault::OracleErr(message)`, on record and replay
 alike; Python raises `DrawFailed(type_name, message)`, which is also an
 instance of the recorded exception type when the program has it loaded.
-A cancelled or interrupted call is a crash, not a result: its intent
-stays dangling.
+An interrupted call (a crash) is not a result: its intent stays
+dangling. A call or effect the agent cancels itself and carries on past
+(an awaited step under a timeout, a task group cancelling a sibling) is
+a result. Once its intent is appended, the cancellation is appended as
+its failure (`error_type` `asyncio.exceptions.CancelledError`) without
+being persisted, as a stream closed early is (6.5). If the cancellation
+is the attempt's crash, the entry is never persisted and goes with the
+abandoned attempt; if the agent carries on, it becomes durable with the
+next persist, and the attempt can end. Replay waits at such a step until
+the task is cancelled again, so the agent's own timeout takes the path it
+took. Two narrow cases are documented rather than closed: if another task
+of the attempt persists between a crash's cancellation reaching a step
+and the attempt being abandoned, the failure becomes durable and recovery
+treats it as any unobserved failed result (retried by default); and a
+cancellation that arrives after a step completed, while its result is
+being made durable, reaches the agent while the journal keeps the result,
+which replay then returns.
 
 **Effects.** `EffectIntent` is appended and persisted (acknowledged by the
 sink) before `perform` runs. `perform` receives
@@ -750,7 +777,12 @@ the session and reports `mark_persisted` or `persist_failed`, and it
 reattaches the sink (`attach_sink`) before `finish`, so `attempt.end` is
 persisted inline. A receive whose `ChannelRecv` never becomes durable
 (its persist fails, or the attempt is abandoned) goes back to the front of
-its channel. `Session::join_each` returns each child's completeness check,
+its channel. A failed persist does not prove that nothing was written (a
+server can store frames and lose its answer), so a receive put back after
+one is *in doubt*: the next recording checkout takes its message off the
+channel again if the journal it loads holds that `ChannelRecv` at the
+receive's cursor, and a message is never received twice.
+`Session::join_each` returns each child's completeness check,
 so a host that runs region children itself can raise the failure of the
 lowest-index failed child. `RunOptions.normalization` names the
 request-normalization rules a host matches draws under; `attempt.start`
@@ -1149,6 +1181,15 @@ The server checks, in this order:
 - All-or-nothing: write, fsync, then update the index.
 - Clients resend the identical request on connect errors, timeouts, 502,
   503 and 504 until success, a definitive error, or the lease deadline.
+  Before giving up they read the run's `entries` and `head` once, and
+  report success if their frames are the last ones stored (an earlier try
+  whose answer was lost).
+- A duplicate answer whose `entries` exceeds `at + k` means that another
+  holder has appended since (a takeover appends at least its custody
+  note): the frames are durable, but the client treats its lease as lost
+  (`LeaseLost`) and acts on none of them, since the new holder's recovery
+  may already have written off an intent among them and performed it
+  again.
 - **Create:** POST lease. On `not_found`, PUT (which grants the lease).
   On `run_exists`, POST lease again. The client appends `run.start` if and
   only if `entries == 0`.
@@ -1553,7 +1594,8 @@ Runtime(store=None, oracle=None, *, token=None, key=None, timeout=30.0,
 - **Attempt ownership.** An attempt is owned by the thread that runs `run`
   (sync), or by the root task of `arun` plus the child tasks created by
   `ctx.gather`. Any other caller raises `PragmaticError("ctx used outside
-  the attempt that owns it")`, checked before anything is touched.
+  the attempt that owns it")`, checked before anything is touched (the
+  next-step rule of 6.5 runs only after the check).
 - **`arun`, `aresume`, `areplay`.** These run inside the caller's event
   loop: `begin`, then `await agent(ctx)`, then `finish` in a `finally`
   that also runs on `CancelledError`.
@@ -1575,10 +1617,24 @@ Runtime(store=None, oracle=None, *, token=None, key=None, timeout=30.0,
 - **Ownership in practice.** For an async attempt, a thread with no running
   loop that carries the attempt's token (what `asyncio.to_thread` creates)
   is accepted; a synchronous attempt accepts its own thread only.
-  Ownership failures raise `NotInRun`.
+  Ownership failures raise `NotInRun`. A synchronous `run` whose agent
+  returns an awaitable (a lambda that binds an async agent's arguments)
+  drives it on a private loop whose main task becomes the attempt's root
+  task: from then on the attempt is owned as an `arun` attempt is, so the
+  tasks the agent creates itself are refused there too.
+- **Timeouts.** `asyncio.timeout` (Python 3.11 and later) runs in the
+  caller's task and is the way to time a step out; the cancelled step is a
+  result (2.12). `asyncio.wait_for` runs in the caller's task from Python
+  3.12, but before that it wraps the awaitable in a task of its own, and
+  `asyncio.shield` always does, so a step under them is refused there
+  (journaled model clients take the relaxed check of 6.5 and are
+  accepted). On 3.9 and 3.10 a timeout that runs in the caller's task
+  (the `async-timeout` package) serves.
 - **Ending.** An exception that is not an `Exception` (`KeyboardInterrupt`,
   `SystemExit`, `CancelledError`) is a crash: the attempt is abandoned
-  (2.7, rule 7). Any other exception is recorded in `attempt.end` and
+  (2.7, rule 7). A `CancelledError` the agent caught and carried on past
+  never reaches this point; the step it cancelled holds a failure result
+  (2.12). Any other exception is recorded in `attempt.end` and
   propagates unchanged; one the runtime raised carries its fault, which
   `attempt.end` records, and any other is recorded as outcome `fault` with
   kind `ToolErr` (the core writes no `error` outcome yet).
@@ -1626,9 +1682,22 @@ Resolved while building the layer:
   duplicate rule, lease requests by their holder, a `PUT` through the
   create order. A request made under a lease is resent until the earlier
   of the sync deadline and the lease deadline. Appends are split into
-  requests of at most the server's `max_request_bytes`. Checkin stops the
-  renewal thread before it releases the lease, so a renewal can never
-  grant a released lease again.
+  requests of at most the server's `max_request_bytes`; a frame larger
+  than the `max_frame_bytes` or `max_request_bytes` the server announced
+  is `TooLarge` without being sent. An answer the server sent before it
+  read a request's whole body (an early 413 on a connection it then
+  closed) is read, never taken for a connection error.
+- The renewal thread starts as soon as the lease is granted, so the lease
+  is renewed while the journal downloads; the download is resent until
+  the earlier of the sync and lease deadlines. Checkin stops the renewal
+  thread before it releases the lease: the thread resends nothing once
+  asked to stop and gives back at once any grant that still arrives, so a
+  renewal can never grant a released lease again.
+- An append whose resends ran out, and a duplicate answer from a run that
+  has grown past the frames, are handled as 4.6 says: success when the
+  run's `entries` and `head` show the frames, `LeaseLost` when another
+  holder appended. Receives whose persist failed are in doubt until the
+  next checkout (3.1).
 - Definitive answers that 4.4 does not map to a named exception
   (`unauthorized`, `forbidden`, `invalid_frames`, `regressed`,
   `bad_request`) raise `pragmatic.ServerError`, a `PragmaticError` with
@@ -1673,8 +1742,10 @@ Every HTTP exchange is a draw:
 
 - **Request parts.** `[method ‖ path ‖ query ‖ canonical JSON of the body
   without messages and input]` plus one part per element of
-  `messages`/`input`. Transport headers are never recorded. Core dedup
-  stores repeated messages once.
+  `messages`/`input` (in chunks when there are more than a record holds,
+  below). Transport headers are never recorded, and neither are the
+  credentials of tool and MCP server definitions. Core dedup stores
+  repeated messages once.
 - **Response.** The head is `{"status", "headers": allowlist}`
   (content-type, request-id headers, rate-limit headers are dropped). The
   body is the raw bytes, teed while the caller reads them. A stream
@@ -1691,13 +1762,16 @@ Every HTTP exchange is a draw:
   carrier that SDK retry and wrapping logic cannot swallow, and are
   unwrapped to the real exception at the runtime boundary.
 - **Abandoned streams.** A stream that is never iterated or closed is
-  committed as `partial` by `weakref.finalize`, or at the next step on
-  that branch or attempt end, whichever comes first.
+  committed as `partial` by `weakref.finalize`, or at the next step its
+  caller takes on that branch, or at attempt end, whichever comes first.
 - **Outside an attempt.** `pragmatic.wrap(client)` routes to the current
   attempt through the context variable. Outside an attempt it raises
   `NotInRun` unless constructed with `outside="passthrough"`.
-- **Unsupported transports.** Websocket and realtime transports, and
-  `client.post` to non-model hosts, raise `Unsupported`.
+- **Unsupported transports.** Websocket and realtime transports,
+  `client.post` to non-model hosts, and OpenAI clients with X.509 workload
+  identity (which send every request through a transport of their own,
+  never through `send()`) raise `Unsupported`; the last is refused when
+  the client is wrapped.
 - `attempt.end.passthrough_calls` counts calls made under
   `outside="passthrough"`.
 
@@ -1715,37 +1789,80 @@ Resolved while building the clients:
   be rebuilt from its parts for normalization (6.6) and the desync diff.
   The parts are canonical re-encodings of the wire body, the same for the
   same call whatever order the SDK wrote the keys in. A body that is not
-  JSON (a multipart upload) is recorded as a final part as sent, and part
-  0 carries `"raw_body": true`.
+  JSON is recorded as a final part as sent, and part 0 carries
+  `"raw_body": true`; a multipart body (a file upload, a transcription, an
+  image edit) has its boundary, which the HTTP client draws at random for
+  every request, replaced by `pragmatic-multipart-boundary`, which part 0
+  names as `"boundary"`, so the same upload matches on replay.
+- **Long conversations.** A record holds at most 255 slots (2.15). When
+  the elements of `messages` and `input` do not fit one part each beside
+  part 0, they are stored in chunks: JSON arrays of `g` elements, where
+  `g` is the smallest power of two that fits, with the marker
+  `{"$parts": n, "$chunk": g}`. Chunk boundaries depend only on the
+  element index and `g`, so the earlier chunks of a growing conversation
+  stay identical from call to call and are stored once.
+- **Credentials in bodies.** Before a request is recorded or matched, the
+  members of each element of `tools` and `mcp_servers` named
+  `authorization`, `api_key`, `password`, `secret` or `token`, or ending in
+  `_token`, `_secret`, `_key` or `_password`, and every value of a
+  `headers` object there, are replaced by `"<credential>"` (Anthropic
+  `mcp_servers[*].authorization_token`, OpenAI Responses
+  `tools[*].authorization` and `tools[*].headers`). Such bearer tokens
+  expire within the hour: in the journal they would leak, and a replay
+  holding a fresh one would never match. A tool's input schema is never
+  inspected.
 - **The head's header allowlist** is `content-type`, `request-id`,
-  `x-request-id`, `retry-after`, `retry-after-ms` and `x-should-retry`:
-  what the SDKs read to parse, identify and retry a response. On record
-  the caller gets the same headers as replay will, so the two cannot
-  differ. The body is the decoded bytes; `content-encoding` and
-  `content-length` are never served.
-- **Retry hints on replay.** Both SDKs treat `retry-after-ms: 0` as no
-  hint and fall back to exponential backoff (half a second and up), so a
-  replayed error response (status 400 or more) is served with
-  `retry-after-ms: 1`. A recorded hint over 60 seconds is kept as
-  recorded: the OpenAI SDK refuses to retry past two minutes, and a
-  shorter hint would turn that refusal into a retry the recording never
-  made. A transport error has no headers to carry a hint, so its replay
-  waits the SDK's own backoff before the recorded retry.
+  `x-request-id`, `anthropic-workspace-id`, `retry-after`,
+  `retry-after-ms` and `x-should-retry`: what the SDKs read to parse,
+  identify and retry a response. On record the caller gets the headers
+  replay serves, except for the retry hint replay adds to a response the
+  SDK may retry (below). The body is the decoded bytes;
+  `content-encoding` and `content-length` are never served.
+- **Retry hints on replay.** A response the SDKs would not retry (they
+  retry 408, 409, 429 and 5xx, and obey `x-should-retry`) is served as
+  recorded. A retryable one is served with `retry-after-ms: 1`: both SDKs
+  read that header first, and treat a hint of 0 as none at all and fall
+  back to their own exponential backoff (half a second and up). The one
+  exception is a hint the OpenAI SDK refused to wait for (over its
+  two-minute ceiling, so it did not retry): a numeric hint is then served
+  as recorded, and one given as an HTTP date, which lies in the past by
+  the time of a replay, as the `retry-after-ms` it meant when the
+  response arrived, which the head records as `retry_after`; refused, the
+  SDK waits for nothing. The Anthropic SDK retries whatever the hint, so
+  its replays always get the 1 ms hint. A transport error has no headers
+  to carry a hint, so its replay waits the SDK's own backoff before the
+  recorded retry.
 - **Error results.** A response with a status of 400 or more is read
   whole inside `send()` (the SDK may close a retried one unread) and
   recorded with outcome `error` and its `status`. A transport error is
   recorded with `error_kind`, `error_type` (the httpx2 class) and the
-  message in the body slot, and an empty head; replay raises a
+  message in the body slot, and an empty head. The message is journaled
+  without credentials: quoted header names and values are cut out (h11
+  quotes the offending value, so an API key read from a file with its
+  trailing newline would otherwise land in the journal), and so is every
+  value of a request header named like a credential. Replay raises a
   `DrawFailed` that is also an instance of the recorded httpx2 class, so
   the SDK wraps and retries it as it did. A body that breaks while it is
   read keeps the bytes read, with the message as `"error"` in the head;
   replay serves the bytes, then raises the same failure.
+- **Cancelled exchanges.** An async exchange whose task is cancelled
+  (`asyncio.timeout`, `asyncio.wait_for`, a task group, the Agents SDK
+  cancelling the model call when an input guardrail trips) is recorded as
+  2.12 says: an error result with `error_kind` `cancelled`, the bytes read
+  so far, appended without being persisted. Every recording is tracked
+  until its result is written, non-streaming ones included, so the end of
+  the attempt writes off any left open and a crash drops them. Replay
+  serves the recorded bytes and then waits until the task is cancelled
+  again.
 - **When a stream's result is written.** At the end of the body (durable
   before the end reaches the caller); on `close()`; when the response is
-  collected (`weakref.finalize`); at the next journaled step on its
-  branch, for a stream the agent has not started reading (a stream that is
-  being read may stay open while tools run, 2.7); before a parallel region
-  joins, for streams on its children; and before `attempt.end`. Whichever
+  collected (`weakref.finalize`); at the next journaled step its caller
+  (the thread and asyncio task that opened it) takes on its branch, for a
+  stream not yet being read (a stream that is being read may stay open
+  while tools run, 2.7; a step by another caller, such as a parallel
+  LangGraph node on a worker thread, never writes it off); before a
+  parallel region joins, for streams on its children; and before
+  `attempt.end`. Whichever
   comes first writes `partial` with the bytes read so far, and from then
   on the stream reads no further, so what the agent saw on record is what
   replay serves. A close, a finalizer or the end of a region only appends

@@ -8,6 +8,7 @@ The frameworks are optional: a test skips when its package is missing.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, Callable
 
@@ -16,10 +17,10 @@ import pytest
 import pragmatic
 
 pytest.importorskip("anthropic")
-pytest.importorskip("openai")
-pytest.importorskip("httpx2")
+openai = pytest.importorskip("openai")
+httpx2 = pytest.importorskip("httpx2")
 
-from model_api import ANTHROPIC_MODEL, OPENAI_MODEL, TEXT, ModelAPI  # noqa: E402
+from model_api import ANTHROPIC_MODEL, OPENAI_MODEL, TEXT, ModelAPI, responses_obj  # noqa: E402
 
 
 @pytest.fixture
@@ -88,6 +89,41 @@ def test_openai_agents_sdk_run_and_run_streamed(tmp_path, api, agents_sdk):
         any(isinstance(i, dict) and i.get("type") == "function_call_output" for i in body.get("input", []))
         for _, body in api.calls
     )
+
+
+def test_a_tripped_input_guardrail_cancels_the_model_call_cleanly(tmp_path, agents_sdk):
+    """The Agents SDK runs input guardrails alongside the first model call
+    and cancels the call when a guardrail trips. The cancelled call is a
+    result, so the agent that handles the tripwire ends its run normally,
+    and replay takes the same path."""
+    agents = agents_sdk
+
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        body = json.loads(request.content)
+        await asyncio.sleep(0.5)  # the model is slower than the guardrail
+        return httpx2.Response(200, headers={"x-request-id": "r"}, json=responses_obj({**body, "tools": []}, TEXT))
+
+    client = openai.AsyncOpenAI(
+        api_key="sk-test", http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+    )
+    agents.set_default_openai_client(pragmatic.wrap(client), use_for_tracing=False)
+
+    @agents.input_guardrail
+    async def no_pii(ctx, agent, input):
+        await asyncio.sleep(0.05)
+        return agents.GuardrailFunctionOutput(output_info="pii", tripwire_triggered=True)
+
+    agent = agents.Agent(name="a", instructions="Be brief.", model=OPENAI_MODEL, input_guardrails=[no_pii])
+
+    async def run(ctx):
+        try:
+            return (await agents.Runner.run(agent, "my SSN is ...")).final_output
+        except agents.InputGuardrailTripwireTriggered:
+            return "refused"
+
+    rt = pragmatic.Runtime(tmp_path)
+    assert rt.run("g", run).output == "refused"
+    assert rt.replay("g", run).output == "refused"
 
 
 # ---------------------------------------------------------------------------

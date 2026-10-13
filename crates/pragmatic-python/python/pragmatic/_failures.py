@@ -19,13 +19,22 @@ record:
 
 Lookup never imports anything: a journal names the type, and importing
 whatever a journal names would let the journal run code.
+
+A cancelled awaited step is a failure too, of type ``CANCELLED``, when the
+agent catches the cancellation and carries on (``asyncio.timeout``,
+``asyncio.wait_for``, a task group cancelling a sibling). It cannot be
+raised again like the others: what turned it into the agent's exception (a
+``TimeoutError``, say) was whatever cancelled the task. So its replay waits
+until the task is cancelled again (``wait_for_cancellation``), and the
+agent's own timeout takes the path it took when the run was recorded.
 """
 
 from __future__ import annotations
 
+import asyncio
 import builtins
 import sys
-from typing import Dict, Optional, Tuple, Type
+from typing import Dict, NoReturn, Optional, Tuple, Type
 
 from ._errors import PragmaticError
 
@@ -59,6 +68,23 @@ def type_name(exc: BaseException) -> str:
     if cls.__module__ == "builtins":
         return cls.__qualname__
     return f"{cls.__module__}.{cls.__qualname__}"
+
+
+CANCELLED = f"{asyncio.CancelledError.__module__}.{asyncio.CancelledError.__qualname__}"
+"""The recorded type of a cancelled awaited step."""
+
+
+def is_cancellation(name: str) -> bool:
+    """Whether a recorded failure type is a cancellation."""
+    return name == CANCELLED
+
+
+async def wait_for_cancellation() -> NoReturn:
+    """Replay a recorded cancellation: wait until the task is cancelled, as
+    it was when the run was recorded. Never returns; raises
+    ``CancelledError``."""
+    await asyncio.get_running_loop().create_future()
+    raise AssertionError("an unresolved future completed")
 
 
 def _resolve(name: str) -> Optional[Type[Exception]]:
