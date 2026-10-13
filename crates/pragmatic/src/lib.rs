@@ -68,16 +68,20 @@
 
 pub mod async_runtime;
 pub mod ctx;
+pub mod ed25519;
+pub mod encoding;
 pub mod fault;
 pub mod journal;
 pub mod json;
 pub mod memory;
 pub mod merkle;
+pub mod note;
 pub mod oracle;
 pub mod rand;
 pub mod redact;
 pub mod runtime;
 pub mod sha256;
+pub mod sha512;
 mod store;
 pub mod supervisor;
 pub mod tsp;

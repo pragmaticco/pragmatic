@@ -17,7 +17,17 @@
 //!   2^53, where an `f64` would silently round them.
 //!
 //! Objects are an ordered list of pairs, so serialization preserves key
-//! order and output is stable byte for byte.
+//! order and output is stable byte for byte. [`Json::canonical_string`]
+//! instead sorts keys, giving the one serialization that signatures over a
+//! document (such as an evidence bundle's) are computed on.
+//!
+//! These rules are the "strict JSON" of the 0.6 design (section 3.7),
+//! shared by the server, the CLI and the Python SDK: duplicate keys are an
+//! error, input is UTF-8 with no byte-order mark and no lone surrogates,
+//! nesting is at most 64 deep, and where an integer is expected it is
+//! written `0|[1-9][0-9]*` with no sign, fraction or exponent and fits the
+//! target type ([`Json::as_u64_strict`], [`Json::as_u8_strict`]). Hex and base64
+//! fields are checked with [`crate::encoding`].
 //!
 //! RFC 8259 only says object names "SHOULD be unique", and parsers that
 //! accept repeats disagree about them: JavaScript's `JSON.parse`, Python's
@@ -35,8 +45,10 @@ use std::fmt::{self, Write as _};
 
 /// The deepest nesting of arrays and objects the parser accepts. A top-level
 /// array is depth 1. The cap keeps recursion (and so stack use) bounded on
-/// hostile input.
-pub const MAX_DEPTH: usize = 128;
+/// hostile input, and 64 is the limit every strict-JSON reader in the
+/// design shares (section 3.7), so a document one of them accepts is never
+/// too deep for another.
+pub const MAX_DEPTH: usize = 64;
 
 /// A JSON value.
 #[derive(Clone, Debug, PartialEq)]
@@ -128,6 +140,37 @@ impl Number {
             None
         }
     }
+
+    /// The value as a `u64`, if the text is exactly `0|[1-9][0-9]*` and
+    /// fits: the strict-JSON rule for fields that hold an unsigned integer
+    /// (cursors, sizes, indexes, Unix times).
+    ///
+    /// Unlike [`Number::as_u64`], this rejects `-0`. The design's integer
+    /// pattern `-?(0|[1-9][0-9]*)` allows a sign, but no unsigned field is
+    /// ever written with one, and accepting `-0` would give the same value
+    /// two spellings, and so two canonical serializations of one bundle.
+    /// Fractions (`1.0`), exponents (`1e2`) and leading zeros are rejected
+    /// too; the parser already refuses leading zeros, and the check is
+    /// repeated here so the rule does not depend on how the number was
+    /// built.
+    pub fn as_u64_strict(&self) -> Option<u64> {
+        let canonical = match self.0.as_bytes() {
+            [b'0'] => true,
+            [b'1'..=b'9', rest @ ..] => rest.iter().all(u8::is_ascii_digit),
+            _ => false,
+        };
+        if canonical {
+            self.0.parse().ok()
+        } else {
+            None
+        }
+    }
+
+    /// [`Number::as_u64_strict`] for a value that must fit a `u8` (such as
+    /// a slot state).
+    pub fn as_u8_strict(&self) -> Option<u8> {
+        self.as_u64_strict().and_then(|v| u8::try_from(v).ok())
+    }
 }
 
 impl fmt::Display for Number {
@@ -189,6 +232,21 @@ impl Json {
         parse(text)
     }
 
+    /// Parse JSON from bytes, such as a file or a request body. The bytes
+    /// must be UTF-8 without a byte-order mark. UTF-8 that encodes a
+    /// surrogate code point (`ED A0 80` and the like, as CESU-8 writes) is
+    /// invalid UTF-8 and is rejected here, just as escaped lone surrogates
+    /// are rejected by the parser.
+    pub fn parse_bytes(bytes: &[u8]) -> Result<Json, JsonError> {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => parse(text),
+            Err(e) => Err(JsonError {
+                offset: e.valid_up_to(),
+                reason: "invalid UTF-8",
+            }),
+        }
+    }
+
     /// The member named `key`, if this is an object. A parsed object never
     /// repeats a key; for one built in code that does, this is the first.
     pub fn get(&self, key: &str) -> Option<&Json> {
@@ -230,6 +288,17 @@ impl Json {
     /// See [`Number::as_i64`].
     pub fn as_i64(&self) -> Option<i64> {
         self.as_number().and_then(Number::as_i64)
+    }
+
+    /// See [`Number::as_u64_strict`]. Use this, not [`Json::as_u64`], for
+    /// integer fields of evidence and other strict-JSON documents.
+    pub fn as_u64_strict(&self) -> Option<u64> {
+        self.as_number().and_then(Number::as_u64_strict)
+    }
+
+    /// See [`Number::as_u8_strict`].
+    pub fn as_u8_strict(&self) -> Option<u8> {
+        self.as_number().and_then(Number::as_u8_strict)
     }
 
     /// See [`Number::as_f64`].
@@ -277,6 +346,62 @@ impl Json {
             _ => None,
         }
     }
+
+    /// The canonical serialization: no insignificant whitespace, object
+    /// members sorted by the UTF-8 bytes of their keys (recursively), array
+    /// order kept, numbers written as their original text, and strings
+    /// escaped exactly as [`Display`](fmt::Display) escapes them.
+    ///
+    /// This is the form the design (section 3.7) signs and hashes, so two
+    /// documents that parse to the same [`Json`] value have the same
+    /// canonical bytes however they were formatted. It is *not* RFC 8785
+    /// (JCS): JCS sorts keys by UTF-16 code units and rewrites numbers in
+    /// ECMAScript form, while this sorts by UTF-8 bytes (the order every
+    /// language's byte comparison gives) and leaves numbers alone, so
+    /// `1.0` and `1` stay distinct. The two key orders differ only when, at
+    /// the first character where two keys differ, one has a character
+    /// above U+FFFF and the other one in U+E000..U+FFFF.
+    ///
+    /// Keys are sorted stably, so an object built in code with a repeated
+    /// key keeps both members in their original order; parsed documents
+    /// never repeat keys, and [`Json::duplicate_key`] checks built ones.
+    pub fn canonical_string(&self) -> String {
+        let mut out = String::new();
+        // Writing to a String cannot fail.
+        let _ = write_canonical(&mut out, self);
+        out
+    }
+}
+
+fn write_canonical(out: &mut String, value: &Json) -> fmt::Result {
+    match value {
+        Json::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical(out, item)?;
+            }
+            out.push(']');
+        }
+        Json::Object(members) => {
+            let mut sorted: Vec<&(String, Json)> = members.iter().collect();
+            sorted.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+            out.push('{');
+            for (i, (key, item)) in sorted.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_string(out, key)?;
+                out.push(':');
+                write_canonical(out, item)?;
+            }
+            out.push('}');
+        }
+        scalar => write!(out, "{scalar}")?,
+    }
+    Ok(())
 }
 
 /// Compact serialization: no whitespace, keys in stored order, strings
@@ -1035,5 +1160,117 @@ mod tests {
             r#"{"format":"pragmatic-evidence/1","entries":57,"keyed":false,"slots":[[12,0]],"note":null}"#
         );
         assert_eq!(Json::parse(&doc.to_string()).unwrap(), doc);
+    }
+
+    #[test]
+    fn depth_limit_is_sixty_four() {
+        assert_eq!(MAX_DEPTH, 64);
+        let mixed = |n: usize| "[{\"a\":".repeat(n / 2) + "0" + &"}]".repeat(n / 2);
+        assert!(parse(&mixed(64)).is_ok());
+        assert_eq!(parse(&mixed(66)).unwrap_err().reason, "nesting too deep");
+    }
+
+    #[test]
+    fn rejects_byte_order_mark_and_surrogates() {
+        // A leading BOM, as text and as bytes.
+        assert_eq!(parse("\u{feff}{}").unwrap_err().offset, 0);
+        assert!(Json::parse_bytes(b"\xef\xbb\xbf{}").is_err());
+        // A BOM after leading whitespace is no better.
+        assert!(parse(" \u{feff}{}").is_err());
+        // U+FEFF inside a string is just a character.
+        assert_eq!(ok("\"\u{feff}\"").as_str(), Some("\u{feff}"));
+        // Escaped lone surrogates, in strings and in keys.
+        for text in [
+            r#"["\ud800"]"#,
+            r#"["\udfff"]"#,
+            r#"["\udc00\ud800"]"#,
+            r#"{"\ud83d":1}"#,
+            r#"["\ud83d\ud83d"]"#,
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
+        // Surrogates encoded directly in UTF-8 (CESU-8 style) are not UTF-8.
+        let e = Json::parse_bytes(b"[\"\xed\xa0\x80\"]").unwrap_err();
+        assert_eq!((e.offset, e.reason), (2, "invalid UTF-8"));
+        assert!(Json::parse_bytes(b"[\"\xed\xa0\xbd\xed\xb8\x80\"]").is_err());
+        // Valid bytes parse the same as text.
+        assert_eq!(
+            Json::parse_bytes("{\"\u{e9}\":[1]}".as_bytes()).unwrap(),
+            ok("{\"\u{e9}\":[1]}")
+        );
+        assert!(Json::parse_bytes(b"[1]\xff").is_err());
+    }
+
+    #[test]
+    fn strict_integers() {
+        let n = |text: &str| ok(text);
+        assert_eq!(n("0").as_u64_strict(), Some(0));
+        assert_eq!(n("7").as_u64_strict(), Some(7));
+        assert_eq!(n("18446744073709551615").as_u64_strict(), Some(u64::MAX));
+        assert_eq!(n("18446744073709551616").as_u64_strict(), None);
+        for text in [
+            "-0", "-1", "1.0", "1.5", "1e2", "1E2", "0e0", "-0.0", "\"1\"", "null", "[1]",
+        ] {
+            assert_eq!(n(text).as_u64_strict(), None, "{text}");
+            assert_eq!(n(text).as_u8_strict(), None, "{text}");
+        }
+        // The lenient accessor still takes -0, which the strict one refuses.
+        assert_eq!(n("-0").as_u64(), Some(0));
+        assert_eq!(n("255").as_u8_strict(), Some(255));
+        assert_eq!(n("256").as_u8_strict(), None);
+        assert_eq!(n("3").as_u8_strict(), Some(3));
+        // Leading zeros never parse, so the strict check is a second line
+        // of defence; built numbers go through the same check.
+        assert!(parse("01").is_err());
+        assert_eq!(Number::from(42u64).as_u64_strict(), Some(42));
+        assert_eq!(Number::from(-1i64).as_u64_strict(), None);
+        assert_eq!(Number::from_f64(1e21).unwrap().as_u64_strict(), None);
+        assert_eq!(Number::from_f64(0.5).unwrap().as_u64_strict(), None);
+    }
+
+    #[test]
+    fn canonical_serialization() {
+        let doc = ok(
+            r#" { "b" : [ 3 , {"z":1,"a":2} ] , "a" : 1.0 , "c" : { "y" : null , "x" : "\u0041\n" } , "aa": -0 } "#,
+        );
+        assert_eq!(
+            doc.canonical_string(),
+            r#"{"a":1.0,"aa":-0,"b":[3,{"a":2,"z":1}],"c":{"x":"A\n","y":null}}"#
+        );
+        // Formatting and key order do not change the canonical form.
+        let reordered = ok(r#"{"aa":-0,"c":{"x":"A\n","y":null},"a":1.0,"b":[3,{"z":1,"a":2}]}"#);
+        assert_eq!(reordered.canonical_string(), doc.canonical_string());
+        // It is a fixed point and parses back to an equal document (up to
+        // key order).
+        let again = ok(&doc.canonical_string());
+        assert_eq!(again.canonical_string(), doc.canonical_string());
+        // Scalars.
+        for text in ["null", "true", "false", "0", "-1.5e-3", "\"\""] {
+            assert_eq!(ok(text).canonical_string(), text);
+        }
+        assert_eq!(ok("[ ]").canonical_string(), "[]");
+        assert_eq!(ok("{ }").canonical_string(), "{}");
+    }
+
+    #[test]
+    fn canonical_order_is_utf8_bytes() {
+        // Keys compare by UTF-8 bytes: uppercase before lowercase, shorter
+        // prefix first, and U+FF61 (EF BD A1) before U+1F600 (F0 9F 98 80),
+        // although UTF-16 order (RFC 8785) puts U+1F600 (D83D DE00) first.
+        let doc = ok(r#"{"\ud83d\ude00":1,"\uff61":2,"b":3,"B":4,"ab":5,"a":6,"\u00e9":7,"":8}"#);
+        assert_eq!(
+            doc.canonical_string(),
+            "{\"\":8,\"B\":4,\"a\":6,\"ab\":5,\"b\":3,\"\u{e9}\":7,\"\u{ff61}\":2,\"\u{1f600}\":1}"
+        );
+        // Keys that differ only after unescaping are the same key.
+        assert!(parse(r#"{"\u0062":1,"b":2}"#).is_err());
+        // Built documents with a repeated key keep both, stably.
+        let built = Json::Object(vec![
+            ("k".into(), 2u64.into()),
+            ("a".into(), Json::Null),
+            ("k".into(), 1u64.into()),
+        ]);
+        assert_eq!(built.canonical_string(), r#"{"a":null,"k":2,"k":1}"#);
+        assert_eq!(built.duplicate_key(), Some("k"));
     }
 }
