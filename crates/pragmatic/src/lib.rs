@@ -50,17 +50,37 @@
 //! let audit = rt.replay("research-42", research).unwrap();
 //! assert_eq!(audit.trace, report.trace);
 //! ```
+//!
+//! ## Building blocks for the system of record
+//!
+//! Self-contained, zero-dependency modules shared by the journal, Pragmatic
+//! Server and evidence verification:
+//!
+//! - [`merkle`]: RFC 6962 Merkle tree hashes, inclusion and consistency
+//!   proofs, for anchoring many journals under one root.
+//! - [`tsp`]: RFC 3161 time-stamp requests, and parsing of responses and
+//!   tokens (signature verification is left to OpenSSL).
+//! - [`json`]: a strict RFC 8259 parser and compact serializer for notes
+//!   and evidence bundles.
+//! - [`redact`]: detectors for personal data and secrets, and redaction.
+//! - [`rand`]: bytes from the operating system's CSPRNG, for slot salts and
+//!   nonces.
 
 pub mod async_runtime;
 pub mod ctx;
 pub mod fault;
 pub mod journal;
+pub mod json;
 pub mod memory;
+pub mod merkle;
 pub mod oracle;
+pub mod rand;
+pub mod redact;
 pub mod runtime;
 pub mod sha256;
 mod store;
 pub mod supervisor;
+pub mod tsp;
 pub mod value;
 
 pub use async_runtime::{block_on, AsyncCtx, AsyncOracle, AsyncRuntime};
