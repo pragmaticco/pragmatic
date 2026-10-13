@@ -4,7 +4,8 @@
 
 #![cfg(feature = "macros")]
 
-use pragmatic::{Ctx, Event, Fault, Runtime, SeededOracle, Value};
+use pragmatic::journal_v1::Event;
+use pragmatic::{Ctx, Fault, Runtime, SeededOracle, Value};
 
 #[pragmatic::durable]
 fn research(ctx: &mut Ctx) -> Result<Value, Fault> {

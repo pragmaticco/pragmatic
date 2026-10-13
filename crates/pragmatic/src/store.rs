@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use crate::fault::Fault;
-use crate::journal::{Event, Journal};
+use crate::journal_v1::{Event, Journal};
 use crate::value::Value;
 
 /// How a dangling effect intent (a crash inside the write-ahead window) is

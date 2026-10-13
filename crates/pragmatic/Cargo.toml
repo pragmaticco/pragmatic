@@ -5,6 +5,7 @@ keywords = ["agents", "llm", "durable-execution", "replay", "crash-recovery"]
 categories = ["asynchronous", "development-tools"]
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -21,3 +22,5 @@ pragmatic-macros = { version = "0.5.0", path = "../pragmatic-macros", optional =
 [features]
 default = ["macros"]
 macros = ["dep:pragmatic-macros"]
+# Crash-simulation hooks for test suites (`Backend::crash_truncate`).
+testing = []

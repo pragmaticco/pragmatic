@@ -33,7 +33,7 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use crate::ctx::{Ctx, RunOptions};
 use crate::fault::Fault;
-use crate::journal::{Cursor, Journal};
+use crate::journal_v1::{Cursor, Journal};
 use crate::oracle::{Oracle, RefusingOracle};
 use crate::runtime::RunReport;
 use crate::store::{JournalStore, Recover};

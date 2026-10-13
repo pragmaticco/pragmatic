@@ -16,7 +16,7 @@ mod serve;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use pragmatic::journal::{Event, Journal, Loaded};
+use pragmatic::journal_v1::{Event, Journal, Loaded};
 use pragmatic::sha256::hex;
 
 struct Args {

@@ -4,7 +4,7 @@
 
 use std::sync::OnceLock;
 
-use pragmatic::journal::{Event, Journal};
+use pragmatic::journal_v1::{Event, Journal};
 use pragmatic::sha256::hex;
 
 pub fn esc(s: &str) -> String {

@@ -51,7 +51,16 @@
 //! assert_eq!(audit.trace, report.trace);
 //! ```
 //!
-//! ## Building blocks for the system of record
+//! ## The system of record
+//!
+//! - [`journal`]: journal format 2, the hash-chained record of every step:
+//!   salted content commitments, branches, deduplication, erasure that keeps
+//!   the chain verifying, canonical decoding, and torn-tail versus
+//!   corruption classification. Format 1 journals (0.4, 0.5) are read-only.
+//! - [`backend`]: where journals live. [`DirBackend`] keeps one file per run
+//!   with a sidecar lock; [`MemoryBackend`] keeps persisted bytes in memory.
+//!
+//! ## Building blocks
 //!
 //! Self-contained, zero-dependency modules shared by the journal, Pragmatic
 //! Server and evidence verification:
@@ -67,9 +76,12 @@
 //!   nonces.
 
 pub mod async_runtime;
+pub mod backend;
 pub mod ctx;
 pub mod fault;
 pub mod journal;
+#[doc(hidden)]
+pub mod journal_v1;
 pub mod json;
 pub mod memory;
 pub mod merkle;
@@ -80,13 +92,18 @@ pub mod runtime;
 pub mod sha256;
 mod store;
 pub mod supervisor;
+mod sys;
 pub mod tsp;
 pub mod value;
 
 pub use async_runtime::{block_on, AsyncCtx, AsyncOracle, AsyncRuntime};
+pub use backend::{Backend, Checkout, CheckoutGuard, DirBackend, MemoryBackend, Sink, SinkError};
 pub use ctx::{Ctx, RunOptions, TraceLabel};
 pub use fault::Fault;
-pub use journal::{Cursor, Entry, Event, Journal};
+pub use journal::{
+    Branch, Content, Cursor, EffectOutcome, Entry, Event, Journal, SlotMeta, SlotState,
+    VerifyReport,
+};
 pub use memory::{Label, Store};
 pub use oracle::{CountingOracle, Oracle, RefusingOracle, RetryOracle, SeededOracle};
 pub use runtime::{Recover, RunReport, Runtime};

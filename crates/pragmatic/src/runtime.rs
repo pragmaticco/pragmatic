@@ -31,7 +31,7 @@ use std::path::PathBuf;
 
 use crate::ctx::{Ctx, RunOptions, TraceLabel};
 use crate::fault::Fault;
-use crate::journal::{Cursor, Journal};
+use crate::journal_v1::{Cursor, Journal};
 use crate::oracle::{Oracle, RefusingOracle};
 use crate::sha256::Digest;
 use crate::store::JournalStore;

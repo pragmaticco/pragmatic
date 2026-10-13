@@ -16,7 +16,8 @@
 
 use std::time::{Duration, Instant};
 
-use pragmatic::{Ctx, Event, Fault, Journal, Oracle, Runtime, Value};
+use pragmatic::journal_v1::{Event, Journal};
+use pragmatic::{Ctx, Fault, Oracle, Runtime, Value};
 
 fn draw_event(i: u64) -> Event {
     Event::OracleDraw {

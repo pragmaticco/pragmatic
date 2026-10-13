@@ -3,6 +3,7 @@ name = "pragmatic-ffi"
 description = "C ABI for the Pragmatic durable-execution runtime - the foundation for the C++, Java, Go, and Node.js bindings."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true

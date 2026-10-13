@@ -69,7 +69,11 @@ fn fault_code(f: &Fault) -> i32 {
         Fault::Escalated(_) => PRAG_ERR_ESCALATED,
         Fault::JournalDesync { .. } => PRAG_ERR_DESYNC,
         Fault::ReplayExhausted { .. } => PRAG_ERR_REPLAY_EXHAUSTED,
-        Fault::Io(_) => PRAG_ERR_IO,
+        // Storage and journal faults (erased, locked, conflict, unsupported,
+        // too large, dangling, lease lost, deleted, unavailable) share the
+        // I/O code; the message carries the detail. The C header is
+        // unchanged.
+        _ => PRAG_ERR_IO,
     }
 }
 

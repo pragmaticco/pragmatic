@@ -2,9 +2,9 @@
 //! (HMAC) attribution, and supervisor behavior (restart-from-journal,
 //! budgets, capabilities, compensation).
 
+use pragmatic::journal_v1::Event;
 use pragmatic::{
-    CountingOracle, Ctx, Decision, Event, Fault, RunOptions, Runtime, SeededOracle, Supervisor,
-    Value,
+    CountingOracle, Ctx, Decision, Fault, RunOptions, Runtime, SeededOracle, Supervisor, Value,
 };
 use std::cell::Cell;
 use std::rc::Rc;

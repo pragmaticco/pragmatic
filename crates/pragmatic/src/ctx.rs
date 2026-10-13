@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::fault::Fault;
-use crate::journal::{Cursor, Event, Journal};
+use crate::journal_v1::{Cursor, Event, Journal};
 use crate::oracle::Oracle;
 use crate::value::Value;
 

@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 
-use pragmatic::journal::Journal;
+use pragmatic::journal_v1::Journal;
 use pragmatic::sha256::hex;
 
 use crate::export;
@@ -62,7 +62,7 @@ fn index_page(dir: &Path, key: Option<&str>) -> String {
                 let draws = j
                     .entries()
                     .iter()
-                    .filter(|e| matches!(e.event, pragmatic::journal::Event::OracleDraw { .. }))
+                    .filter(|e| matches!(e.event, pragmatic::journal_v1::Event::OracleDraw { .. }))
                     .count();
                 let chain = if chain_ok {
                     "verified".to_string()

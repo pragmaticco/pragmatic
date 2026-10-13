@@ -6,9 +6,8 @@
 //! effects. Also exercises the durable file backend across a simulated
 //! process restart, and dangling-intent recovery both ways.
 
-use pragmatic::{
-    CountingOracle, Ctx, Event, Fault, Recover, Runtime, SeededOracle, TraceLabel, Value,
-};
+use pragmatic::journal_v1::Event;
+use pragmatic::{CountingOracle, Ctx, Fault, Recover, Runtime, SeededOracle, TraceLabel, Value};
 
 fn agent(ctx: &mut Ctx) -> Result<Value, Fault> {
     let plan = ctx.oracle("plan")?;

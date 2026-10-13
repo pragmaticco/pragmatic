@@ -13,6 +13,9 @@ members = [
 [workspace.package]
 version = "0.5.0"
 edition = "2021"
+# `File::try_lock`, which the journal directory backend uses for its
+# sidecar lock files, is stable from 1.89.
+rust-version = "1.89"
 license = "BUSL-1.1"
 repository = "https://github.com/pragmaticco/pragmatic"
 homepage = "https://aniketh.net/pragmatic/"

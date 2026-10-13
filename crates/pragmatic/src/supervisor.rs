@@ -8,7 +8,7 @@
 
 use crate::ctx::{Ctx, RunOptions};
 use crate::fault::Fault;
-use crate::journal::Event;
+use crate::journal_v1::Event;
 use crate::oracle::Oracle;
 use crate::runtime::{Recover, RunReport, Runtime};
 use crate::value::Value;
@@ -27,17 +27,34 @@ pub enum Decision {
 }
 
 /// Default decision policy: transient faults restart, logical faults stop.
+///
+/// Storage faults stop too, except [`Fault::Unavailable`]: a lock held by
+/// someone else, a conflict, a lost lease, erased content or a deleted run
+/// will not go away by trying again immediately, while an unavailable store
+/// may.
 pub fn default_policy(fault: &Fault) -> Decision {
     match fault {
-        Fault::OracleErr(_) | Fault::ToolErr(_) | Fault::Timeout | Fault::Io(_) => {
-            Decision::Restart
-        }
+        Fault::OracleErr(_)
+        | Fault::ToolErr(_)
+        | Fault::Timeout
+        | Fault::Io(_)
+        | Fault::Unavailable(_) => Decision::Restart,
         Fault::BudgetExhausted
         | Fault::ContractViol(_)
         | Fault::CapabilityDenied(_)
         | Fault::JournalDesync { .. }
         | Fault::ReplayExhausted { .. }
-        | Fault::Escalated(_) => Decision::Stop,
+        | Fault::Escalated(_)
+        | Fault::Erased { .. }
+        | Fault::Locked { .. }
+        | Fault::Conflict { .. }
+        | Fault::Unsupported(_)
+        | Fault::TooLarge { .. }
+        | Fault::DanglingIntent { .. }
+        | Fault::DanglingEffect { .. }
+        | Fault::EffectUnrecorded { .. }
+        | Fault::LeaseLost
+        | Fault::Deleted => Decision::Stop,
     }
 }
 

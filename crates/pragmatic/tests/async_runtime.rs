@@ -154,7 +154,7 @@ fn async_durable_macro_works() {
     // First journaled event is the program identity.
     assert!(matches!(
         rt.journal("m").unwrap().entries()[0].event,
-        pragmatic::Event::Program { .. }
+        pragmatic::journal_v1::Event::Program { .. }
     ));
     let replayed = block_on(rt.replay("m", marked)).unwrap();
     assert_eq!(recorded.trace, replayed.trace);
