@@ -27,7 +27,7 @@ import builtins
 import sys
 from typing import Dict, Optional, Tuple, Type
 
-from ._native import PragmaticError
+from ._errors import PragmaticError
 
 
 class EffectFailed(PragmaticError):

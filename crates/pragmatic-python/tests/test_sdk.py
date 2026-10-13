@@ -402,7 +402,10 @@ def test_budget_and_caps(tmp_path):
         rt.run("r2", anthropic_agent(MockAPI(ANTHROPIC_SCRIPT), Tools()), caps=["tool:fetch"])
 
 
-def test_concurrent_steps_are_refused(tmp_path):
+def test_steps_from_tasks_the_attempt_does_not_own_are_refused(tmp_path):
+    # asyncio.gather wraps each coroutine in a task of its own. Those tasks
+    # do not own the attempt (spec 6.2): concurrent work goes through
+    # ctx.gather, which gives each child a branch of its own.
     rt = pragmatic.Runtime(tmp_path)
 
     async def agent(ctx):
@@ -415,7 +418,7 @@ def test_concurrent_steps_are_refused(tmp_path):
             ctx.adraw("b", lambda: slow(2)),
         )
 
-    with pytest.raises(pragmatic.PragmaticError, match="one at a time"):
+    with pytest.raises(pragmatic.NotInRun, match="ctx.gather"):
         rt.run("r1", agent)
 
 

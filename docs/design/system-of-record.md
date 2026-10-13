@@ -3,8 +3,9 @@
 Status: design, revision 3 (2026-10-13), after an adversarial review across
 cryptography, replay correctness, storage and failure handling, compliance,
 developer experience and completeness, amended after the review of the core
-runtime (2.4, 2.6 to 2.8, 2.11, 2.12, 2.14, 3.1 to 3.3, 6.7). This document
-is the contract
+runtime (2.4, 2.6 to 2.8, 2.11, 2.12, 2.14, 3.1 to 3.3, 6.7) and while
+building the Python runtime layer (3.1, 4.4, 4.6, 6.2, 6.3, 6.7). This
+document is the contract
 between the components built for 0.6. Everything marked MUST is
 normative; where code and this document disagree, one of them is a bug.
 
@@ -725,6 +726,20 @@ impl Session {
 }
 ```
 
+Bindings that keep an attempt in an object and step it from several
+threads and tasks use `Attempt::into_owned() -> OwnedAttempt`: `Send`,
+borrowing nothing, with `session()`, `finish(result)` and `abandon()` (a
+crash) but no root `Ctx`. A host that persists on a thread of its own
+takes the sink with `Session::detach_sink()`: the primitives then append
+without persisting, the host persists `unpersisted()` outside any lock on
+the session and reports `mark_persisted` or `persist_failed`, and it
+reattaches the sink (`attach_sink`) before `finish`, so `attempt.end` is
+persisted inline. A receive whose `ChannelRecv` never becomes durable
+(its persist fails, or the attempt is abandoned) goes back to the front of
+its channel. `Session::join_each` returns each child's completeness check,
+so a host that runs region children itself can raise the failure of the
+lowest-index failed child.
+
 `Ctx<'a>` is `{ session: &'a mut Session, branch: Branch }` and keeps
 today's methods (`oracle`, `effect`, `recv`, `now`, `contract`,
 `program_marker`, `is_replaying`) as wrappers. It gains `random`,
@@ -1023,7 +1038,7 @@ All under `/v1`. Bearer auth. Errors are
 | `GET /v1/runs/{id}/entries?from=&limit=` | any | Entry JSON (below); content redacted unless `view_raw`; slots over 64 KiB truncated |
 | `GET /v1/runs/{id}/entries/{cursor}/slots/{k}` | any | one slot's content, redaction rules apply |
 | `GET /v1/runs/{id}/journal` | agent (with its lease), admin, auditor+view_raw | journal bytes, `Pragmatic-Entries`, `Pragmatic-Head` |
-| `PUT /v1/runs/{id}` | agent, admin | body: the 16-byte header (flags 0). Creates the run and grants a lease atomically: 201 `{lease, ttl_secs}`; or `run_exists`, `run_deleted` |
+| `PUT /v1/runs/{id}` | agent, admin | body: the 16-byte header (flags 0); header `Pragmatic-Holder: <client uuid>` names the holder of the lease it grants (a resent PUT that finds `run_exists` then renews that lease with `POST lease`). Creates the run and grants a lease atomically: 201 `{lease, ttl_secs}`; or `run_exists`, `run_deleted` |
 | `POST /v1/runs/{id}/lease` | agent, admin | body `{"holder": client uuid}`. Acquire, or renew if same holder: 200 `{lease, ttl_secs}`; `run_locked` with `Retry-After` and `{holder_expires_in}` |
 | `DELETE /v1/runs/{id}/lease` | agent, admin | header `Pragmatic-Lease`; appends the `custody` note; 204 |
 | `POST /v1/runs/{id}/frames?at=N` | agent, admin | headers `Pragmatic-Lease`, `Pragmatic-Frames: k`, `Pragmatic-Head`; body = k frames. 200 `{entries, head, duplicate}` |
@@ -1049,7 +1064,11 @@ created_by, last_outcome, usage: {...}}`.
 [{state: "sealed"|"erased"|"withheld"|"ref", commitment, text|null,
 base64|null, binary: {media_type, bytes, sha256}|null, truncated: bool,
 len}], hash}`. `text` is used when the bytes are valid UTF-8, otherwise
-`base64`. Salts are never included.
+`base64`. Salts are never included. `fields` uses the field names of the
+table in 2.6; the JSON fields (`DrawResult.meta`, `Note.data`,
+`Random.args`) appear as JSON values, not as strings. `len` is null for an
+erased slot. The entries endpoint answers with a JSON array of entries in
+cursor order; a short (or empty) page is the last.
 
 **Errors and the client action for each:**
 
@@ -1059,8 +1078,8 @@ len}], hash}`. `text` is used when the bytes are valid UTF-8, otherwise
 | `not_found` | 404 | on lease during create: PUT; otherwise fail |
 | `run_exists` | 409 | POST lease |
 | `run_locked` | 409 | raise `Locked(retry_after)` |
-| `lease_lost`, `lease_expired` | 409 | fail the session; raise `Locked` |
-| `conflict` | 409 | reconcile through the duplicate rule, otherwise fail |
+| `lease_lost`, `lease_expired` | 409 | fail the session; raise `LeaseLost` (a subclass of `Locked`) |
+| `conflict` | 409 | reconcile through the duplicate rule, otherwise fail; the error object carries the run's `entries` and `head`, so the client can tell which of its frames the server already holds |
 | `regressed` | 409 | fail; an admin must act |
 | `on_hold`, `retention_locked` | 409 | erasure refused (admin) |
 | `run_deleted` | 410 | raise `Deleted`; never recreate |
@@ -1531,6 +1550,22 @@ Runtime(store=None, oracle=None, *, token=None, key=None, timeout=30.0,
 - **Sync wrappers.** `run`, `resume` and `replay` on an async agent with no
   running loop use a private loop. With a running loop they raise,
   pointing to `arun`.
+- **Synchronous steps in async attempts.** `ctx.now()`, `ctx.uuid4()`,
+  `ctx.recv()`, `ctx.patched()` and the other synchronous steps release
+  their values only once durable in async attempts too: they wait for the
+  attempt's executor, which stalls the loop for one persist. The awaited
+  steps (`adraw`, `aeffect`, `atool`, `arun_tools`, `gather`) never block
+  it. Begin, every persist and finish run on that executor, in order.
+- **Ownership in practice.** For an async attempt, a thread with no running
+  loop that carries the attempt's token (what `asyncio.to_thread` creates)
+  is accepted; a synchronous attempt accepts its own thread only.
+  Ownership failures raise `NotInRun`.
+- **Ending.** An exception that is not an `Exception` (`KeyboardInterrupt`,
+  `SystemExit`, `CancelledError`) is a crash: the attempt is abandoned
+  (2.7, rule 7). Any other exception is recorded in `attempt.end` and
+  propagates unchanged; one the runtime raised carries its fault, which
+  `attempt.end` records, and any other is recorded as outcome `fault` with
+  kind `ToolErr` (the core writes no `error` outcome yet).
 
 ### 6.3 Store protocol (Python object called by the native layer)
 
@@ -1553,6 +1588,35 @@ The store raises `pragmatic.Locked`, `Conflict`, `LeaseLost`, `Deleted`,
   exponential backoff
 - reconciliation through the duplicate rule
 - `Unavailable` after the deadline
+
+Resolved while building the layer:
+
+- A store holds each journal as whole bytes: the 16-byte header, then
+  whole frames. `checkout` and `snapshot` may return `(bytes, entries,
+  head_hex)` instead of bytes when the store can vouch for the length and
+  head (`ServerStore` passes on the `Pragmatic-Entries` and
+  `Pragmatic-Head` headers of the download). The native layer verifies the
+  bytes (canonical decoding, chain, commitments) and that they end there. A
+  new run's journal is the header, `pragmatic.JOURNAL_HEADER`, which the
+  store writes when it creates the run. Runs in Python stores are unkeyed:
+  a `key` with one is a `ValueError`, as with a server.
+- Without `create`, a missing run is `FileNotFoundError`. A store sets
+  `remote = True` when other processes write to it; a resume then needs an
+  explicit recovery policy (2.12).
+- The caller sees the exception the store raised; the mapping to a core
+  fault decides only what the core does with it. `LeaseLost` is a subclass
+  of `Locked`, the client action 4.4 names for `lease_lost`.
+- Every request `ServerStore` makes is safe to resend: appends by the
+  duplicate rule, lease requests by their holder, a `PUT` through the
+  create order. A request made under a lease is resent until the earlier
+  of the sync deadline and the lease deadline. Appends are split into
+  requests of at most the server's `max_request_bytes`. Checkin stops the
+  renewal thread before it releases the lease, so a renewal can never
+  grant a released lease again.
+- Definitive answers that 4.4 does not map to a named exception
+  (`unauthorized`, `forbidden`, `invalid_frames`, `regressed`,
+  `bad_request`) raise `pragmatic.ServerError`, a `PragmaticError` with
+  `status`, `code` and `url`.
 
 ### 6.4 Branches and `ctx.gather`
 
@@ -1645,8 +1709,19 @@ loosened.
   `budget`, `caps`, `labels`, `subjects`, `on_code_change`, and (resume
   only) `recover`. `recover` may take 2 or 4 arguments
   (`name, arg[, branch, intent_cursor]`) and may be async in `aresume`.
-- `rt.verify(id) -> VerifyReport` (`__bool__` = ok).
-- `rt.runs() -> list[RunSummary]` (built locally for DirBackend).
+- Recovery policies return the result (`str` or `bytes`) or
+  `pragmatic.Recover.commit(result)` to commit, `None` or
+  `Recover.COMPENSATE` to compensate, and `Recover.FAIL` to fail. They are
+  consulted for effects left without a result; a failed frontier effect is
+  retried without asking, as Rust `resume_with` does. A policy that raises
+  aborts the resume before anything is recorded (the attempt's opening
+  notes and decisions are never persisted), and its exception propagates.
+- `rt.verify(id) -> VerifyReport` (`__bool__` = ok). On a server the
+  journal is downloaded and verified locally when the token may read it,
+  and the server's cached report is returned otherwise.
+- `rt.runs() -> list[RunSummary]` (built locally for DirBackend: no
+  anchors, holds or leases, so `status` is `dangling` or `idle`, and times
+  are RFC 3339 UTC).
 - `rt.entries(id) -> list[dict]` in the Entry JSON shape.
 - `JournalDesync` for a draw carries a diff of normalized request parts:
   the first differing JSON paths, with values shortened. The message is
@@ -1665,7 +1740,8 @@ loosened.
   one child span per step: GenAI semantic conventions for draws, and
   `pragmatic.effect` for tools. Spans carry `pragmatic.run_id`, `cursor`,
   `branch` and `replayed`. Content never appears in spans, and replayed
-  steps report zero usage. `attempt.start` records `traceparent`.
+  steps report zero usage. `attempt.start` records `traceparent` (once
+  the core takes it in `RunOptions`; until then the field is null).
 - `python -m pragmatic push DIR [RUN | --all]` uploads format 2 unkeyed
   local journals to a server; format 1 and keyed journals are refused,
   with an explanation.

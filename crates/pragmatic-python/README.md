@@ -86,28 +86,65 @@ clients, journal calls yourself with `ctx.draw(prompt, sample)` (or
 
 ## Async agents
 
-Make the agent `async def` and use the async client, `await ctx.adraw`,
-`await ctx.arun_tools` and `await ctx.atool`. `rt.run` drives it on its own
-event loop. Journaled steps run one at a time: `asyncio.gather` over two
-model calls is refused, because the order they land in the journal would
-not be reproducible.
+Make the agent `async def`, use the async client and `await ctx.adraw`,
+`await ctx.arun_tools` and `await ctx.atool`, and run it with
+`await rt.arun(...)` inside your own event loop (or `rt.run(...)` from
+synchronous code, which uses a private loop). Storage work runs on a
+dedicated thread per attempt, so many runs can share one loop.
+
+Run independent work concurrently with `ctx.gather`: each child records on
+a branch of its own, so the run replays exactly however the children
+interleave, and a failing child never cancels its siblings.
+
+```python
+async def research(ctx):
+    a, b = await ctx.gather(lambda c: survey(c, "papers"), lambda c: survey(c, "code"))
+    ...
+```
+
+Blocking work can step through `asyncio.to_thread`. Tasks made with
+`asyncio.create_task` or `asyncio.gather`, and threads from
+`loop.run_in_executor`, do not belong to the run: their steps raise
+`pragmatic.NotInRun`, because the order they would land in the journal
+could not be reproduced.
+
+## Runs on a server
+
+```python
+rt = pragmatic.Runtime("https://pragmatic.example.com", token=TOKEN)
+# or set PRAGMATIC_URL and PRAGMATIC_TOKEN and call pragmatic.Runtime()
+```
+
+The runtime checks the server when it is built, holds a lease on each run
+it writes (renewed in the background, through slow model calls and tools),
+resends appends the server did not acknowledge, and verifies every journal
+it downloads. A resume on a server needs a `recover` policy for tools that
+crashed mid-call. `python -m pragmatic push DIR RUN` uploads journals
+recorded locally.
 
 ## More controls
 
 ```python
 @pragmatic.durable                     # journal the agent's source hash:
 def research(ctx): ...                 # a changed agent refuses to replay
+@pragmatic.durable(version="2")        # or an explicit version
 
-ctx.tool("fetch", fetch_url, url)      # any function as a journaled effect
-ctx.now()                              # journaled clock
+ctx.tool("fetch", fetch_url, url)      # any function as a journaled effect;
+                                       # it gets idempotency_key= if it takes one
+ctx.now(), ctx.datetime()              # journaled clock
+ctx.uuid4(), ctx.random(), ctx.randint(1, 6), ctx.randbytes(16)
 ctx.recv("approval")                   # journaled input from rt.send(...)
+if ctx.patched("validate-input"): ...  # change code under recorded runs
 
 rt.run("r1", agent, budget=50)                  # cap model calls
 rt.run("r1", agent, caps=["tool:search"])       # allowlist tools
+rt.run("r1", agent, labels={"team": "research"}, subjects=["user-17"])
 rt.resume("r1", agent, recover=lambda name, arg: None)   # settle tools
                                                          # that crashed mid-call
+rt.verify("r1")                                 # a VerifyReport, truthy if intact
+rt.runs(), rt.entries("r1")                     # summaries and entries
 
-pragmatic.Runtime("./journals", key=b"...")     # HMAC-sign journals
+pragmatic.Runtime("./journals", key=b"...")     # HMAC-key local journals
 # or set PRAGMATIC_JOURNAL_KEY
 ```
 
