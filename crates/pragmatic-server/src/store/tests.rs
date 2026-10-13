@@ -200,3 +200,107 @@ fn tips_cover_changed_runs_only() {
     s.mark_anchored(&[("a".into(), 2)]);
     assert_eq!(s.get("a").unwrap().lock().meta.anchored_entries, 2);
 }
+
+/// Runs that exist only in memory (no files), for listing tests.
+fn in_memory_runs(s: &Store, ids: impl IntoIterator<Item = String>) {
+    let mut runs = s.runs.write().unwrap();
+    for id in ids {
+        let st = state_from_meta(index::empty_meta(&id), Duration::from_secs(30));
+        let run = Arc::new(Run::new(&id, &layout::stem(&id), st));
+        runs.insert(id, run);
+    }
+}
+
+#[test]
+fn a_list_examines_a_bounded_number_of_runs_per_page() {
+    let d = TestDir::new("store-list");
+    let s = store(&d);
+    let n = read::LIST_SCAN * 2 + 500;
+    in_memory_runs(&s, (0..n).map(|i| format!("a{i:06}")));
+    in_memory_runs(&s, ["b:1".to_string(), "b:2".to_string()]);
+    let holds = crate::holds::Holds::open(&d).unwrap();
+    // A filter that matches nothing: each page examines LIST_SCAN runs and
+    // says where to go on.
+    let mut q = ListQuery {
+        q: Some("nothing-matches".into()),
+        limit: 100,
+        ..ListQuery::default()
+    };
+    let mut pages = 0;
+    loop {
+        let page = s.list(&q, &holds, |_| true);
+        assert!(page.runs.is_empty());
+        pages += 1;
+        match page.next {
+            Some(n) => q.after = Some(n),
+            None => break,
+        }
+    }
+    assert_eq!(pages, 3);
+    // Out of scope, the same bound holds.
+    let page = s.list(
+        &ListQuery {
+            limit: 10,
+            ..ListQuery::default()
+        },
+        &holds,
+        |id| id.starts_with("b:"),
+    );
+    assert!(page.runs.is_empty());
+    assert_eq!(page.next, Some(format!("a{:06}", read::LIST_SCAN - 1)));
+    // A prefix starts where it starts, however many runs come before.
+    let q = ListQuery {
+        prefix: Some("b:".into()),
+        limit: 10,
+        ..ListQuery::default()
+    };
+    let page = s.list(&q, &holds, |_| true);
+    let ids: Vec<&str> = page
+        .runs
+        .iter()
+        .map(|r| r["run_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["b:1", "b:2"]);
+    assert_eq!(page.next, None);
+    // Pages of matches continue after the last run returned.
+    let q = ListQuery {
+        limit: 2,
+        ..ListQuery::default()
+    };
+    let page = s.list(&q, &holds, |_| true);
+    assert_eq!(page.next.as_deref(), Some("a000001"));
+}
+
+#[test]
+fn files_on_disk_are_never_replaced_by_a_new_run() {
+    let d = TestDir::new("store-absent");
+    let s = store(&d);
+    let grant = s.create_run(&agent(), "kept", None).unwrap();
+    let mut j = client("kept", 2);
+    push(&s, "kept", &grant.lease, &mut j).unwrap();
+    s.flush_meta(true);
+    let before = std::fs::read(s.layout.journal(&layout::stem("kept"))).unwrap();
+    // A store that does not know the run (as if indexing had failed).
+    let blind = store(&d);
+    let err = blind.create_run(&agent(), "kept", None).unwrap_err();
+    assert_eq!(err.code, "storage_unavailable");
+    assert_eq!(
+        std::fs::read(s.layout.journal(&layout::stem("kept"))).unwrap(),
+        before
+    );
+    // The run is now loaded on first use, and exists.
+    let run = blind.find("kept").unwrap();
+    assert_eq!(run.lock().meta.entries, 3);
+    assert_eq!(
+        blind.create_run(&agent(), "kept", None).unwrap_err().code,
+        "run_exists"
+    );
+    // A tombstone on disk deletes its id, even one the store never loaded.
+    let stem = layout::stem("gone");
+    std::fs::create_dir_all(blind.layout.run_dir(&stem)).unwrap();
+    std::fs::write(blind.layout.tombstone(&stem), b"{}").unwrap();
+    assert_eq!(
+        blind.create_run(&agent(), "gone", None).unwrap_err().code,
+        "run_deleted"
+    );
+}

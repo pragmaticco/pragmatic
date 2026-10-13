@@ -576,3 +576,36 @@ async fn whoami_and_info() {
     let v: Value = ts.get("/v1/keys", &token).await.json().await.unwrap();
     assert_eq!(v["keys"].as_array().unwrap().len(), 1);
 }
+
+/// Admin tokens cover every run (tokens, holds and the whole access log
+/// cannot be scoped), so one with narrower scopes is refused rather than
+/// shown with scopes it would not honor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_tokens_cannot_be_scoped() {
+    let ts = TestServer::start(|_| {}).await;
+    let resp = ts
+        .post_json(
+            "/v1/tokens",
+            &ts.admin,
+            json!({"name": "team-a admin", "principal": "a@example.test", "role": "admin",
+                   "scopes": ["team-a:"]}),
+        )
+        .await;
+    let (status, c) = code(resp).await;
+    assert_eq!(
+        (status, c.as_str()),
+        (StatusCode::BAD_REQUEST, "bad_request")
+    );
+    let resp = ts
+        .post_json(
+            "/v1/tokens",
+            &ts.admin,
+            json!({"name": "admin", "principal": "a@example.test", "role": "admin",
+                   "scopes": ["*"]}),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["record"]["scopes"], json!(["*"]));
+    assert_eq!(v["record"]["created_by"], "bootstrap");
+}

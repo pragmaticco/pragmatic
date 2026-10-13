@@ -85,7 +85,7 @@ patterns = []
 # [[webhooks]]
 # url = "https://alerts.example/pragmatic"
 # secret_file = "/etc/pragmatic/webhook.secret"
-# events = ["chain_broken", "anchor_failed", "regressed", "erasure", "retention", "dangling_effect", "clock_skew", "record_missing"]
+# events = ["chain_broken", "anchor_failed", "regressed", "erasure", "retention", "dangling_effect", "clock_skew", "record_missing", "hold", "access_log_failed"]
 
 [witness_mode]
 # Cosign checkpoints of other logs (C2SP tlog-witness).

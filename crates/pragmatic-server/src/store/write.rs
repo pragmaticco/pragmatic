@@ -27,6 +27,18 @@
 //! frames are dropped from memory and the client gets 503
 //! `storage_unavailable` (it resends; the duplicate and `at` checks sort
 //! out what landed).
+//!
+//! The duplicate rule compares stored hashes, read from the writer's
+//! journal when it is loaded and otherwise from disk by offset: a request
+//! from a token without the lease never makes the server load a journal.
+//! [`Store::precheck_append`] runs the checks that need no body before the
+//! body is read, so a request that can only be refused is refused before
+//! its body is buffered.
+//!
+//! A run's first entry is its `run.start` note, naming the run's own id,
+//! and no later entry is a `run.start`: a journal that claimed to be
+//! another run would be refused by every reader that checks (the server's
+//! own startup reindex among them).
 
 use std::fs::OpenOptions;
 use std::time::Instant;
@@ -100,6 +112,9 @@ impl Store {
         if self.is_tombstoned(run_id) {
             return Err(ApiError::run_deleted());
         }
+        if self.load_late(run_id)?.is_some() {
+            return Err(ApiError::run_exists());
+        }
         let stem = crate::layout::stem(run_id);
         let now_text = timefmt::now_rfc3339();
         let genesis = Journal::new(None);
@@ -115,18 +130,17 @@ impl Store {
             last_anchor_leaf: None,
             leases: Vec::new(),
             holds: Vec::new(),
-            open_intents: Vec::new(),
             status: "active".into(),
             created_by: Some(who.token_id.clone()),
             regressed: false,
+            unanchored_since: None,
             summary: Summary::default(),
         };
-        let run = std::sync::Arc::new(Run {
-            id: run_id.to_string(),
-            stem: stem.clone(),
-            file: Default::default(),
-            state: std::sync::Mutex::new(super::state_from_meta(meta, self.opts.lease_ttl)),
-        });
+        let run = std::sync::Arc::new(Run::new(
+            run_id,
+            &stem,
+            super::state_from_meta(meta, self.opts.lease_ttl),
+        ));
         let mut guard = run.lock();
         let st: &mut RunState = &mut guard;
         {
@@ -155,9 +169,14 @@ impl Store {
     /// directory fsync). Meta first: a journal without meta and without
     /// entries could not be told apart from debris, while meta without a
     /// journal is recreated at startup.
+    ///
+    /// Files already on disk for this id are never replaced: a run the
+    /// index does not know about (its files could not be read) is not a
+    /// run that does not exist.
     fn create_files(&self, run: &Run, st: &mut RunState) -> Result<(), ApiError> {
         let dir = self.layout.run_dir(&run.stem);
         fsutil::create_dir_durable(&dir)?;
+        self.ensure_absent(&run.stem)?;
         self.write_meta(run, st)?;
         let path = self.layout.journal(&run.stem);
         fsutil::write_atomic(&path, &pragmatic::journal::header(0))?;
@@ -166,6 +185,35 @@ impl Store {
             journal: Journal::new(None),
             file,
         });
+        Ok(())
+    }
+
+    /// Refuse to create a run whose files exist: a tombstone is a deleted
+    /// run (410); a journal or meta is a run the index could not read,
+    /// which becomes unavailable (503) until it loads.
+    fn ensure_absent(&self, stem: &str) -> Result<(), ApiError> {
+        let paths = [
+            (self.layout.tombstone(stem), true),
+            (self.layout.journal(stem), false),
+            (self.layout.meta(stem), false),
+        ];
+        for (path, tombstone) in paths {
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) if tombstone => return Err(ApiError::run_deleted()),
+                Ok(_) => {
+                    self.unavailable
+                        .lock()
+                        .expect("unavailable lock")
+                        .insert(stem.to_string());
+                    return Err(ApiError::storage_unavailable(
+                        "files of this run exist but are not in the index; they are never \
+                         replaced",
+                    ));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(ApiError::from(e)),
+            }
+        }
         Ok(())
     }
 
@@ -398,6 +446,9 @@ impl Store {
         if client {
             st.meta.updated_at = timefmt::now_rfc3339();
         }
+        if st.meta.entries > st.meta.anchored_entries && st.meta.unanchored_since.is_none() {
+            st.meta.unanchored_since = Some(timefmt::now_unix_secs());
+        }
         let mut ended_ok = false;
         for c in first..len {
             let entry = w.journal.get(c).expect("appended entry");
@@ -439,6 +490,8 @@ impl Store {
         if let Some(dup) = self.duplicate(&run, st, &req, frames.as_deref())? {
             return Ok(dup);
         }
+        // The writer's journal is loaded (by `accept`) only past this
+        // check, for the holder of the lease.
         check_lease(st, who, req.lease)?;
         if req.at != st.meta.entries {
             return Err(ApiError::conflict(st.meta.entries, req.at, &st.meta.head));
@@ -487,22 +540,62 @@ impl Store {
             return Ok(None);
         }
         let entries = st.meta.entries;
-        let w = self.writer(run, st)?;
-        let stored = &w.journal.entries()[req.at as usize..(req.at + k) as usize];
-        let same = stored
-            .iter()
-            .zip(frames)
-            .all(|(e, f)| frame_hash(f) == Some(e.hash));
-        if !same {
-            return Ok(None);
+        let mut last = None;
+        for (i, f) in frames.iter().enumerate() {
+            let stored = self.stored_hash(run, st, req.at + i as u64)?;
+            if stored.is_none() || frame_hash(f) != stored {
+                return Ok(None);
+            }
+            last = stored;
         }
         Ok(Some(AppendOk {
             entries,
-            head: hex_encode(&stored.last().expect("k > 0").hash),
+            head: hex_encode(&last.expect("k > 0")),
             duplicate: true,
             from: req.at,
             to: req.at + k,
         }))
+    }
+
+    /// The checks of `POST /frames` that need no body, in the order of
+    /// design 4.6: the run exists and is writable, and unless the request
+    /// may be a resend of frames already stored (its `Pragmatic-Head` is
+    /// the stored hash at `at + count - 1`, which the duplicate rule then
+    /// confirms against the body), the lease and `at`. The HTTP layer
+    /// calls this before reading the body, so a request that can only be
+    /// refused never has its body buffered; [`append`](Self::append)
+    /// checks everything again.
+    pub fn precheck_append(
+        &self,
+        who: &Principal,
+        run_id: &str,
+        at: u64,
+        count: u64,
+        head: &str,
+        lease: &str,
+    ) -> Result<(), ApiError> {
+        let run = self.find(run_id)?;
+        let _file = run.file.read().unwrap_or_else(|p| p.into_inner());
+        let st = run.lock();
+        if st.deleted {
+            return Err(ApiError::run_deleted());
+        }
+        refuse_if_unwritable(&st)?;
+        let resend = count > 0
+            && at
+                .checked_add(count)
+                .is_some_and(|end| end <= st.meta.entries);
+        if resend {
+            let last = self.stored_hash(&run, &st, at + count - 1)?;
+            if last.is_some_and(|h| hex_encode(&h) == head) {
+                return Ok(());
+            }
+        }
+        check_lease(&st, who, lease)?;
+        if at != st.meta.entries {
+            return Err(ApiError::conflict(st.meta.entries, at, &st.meta.head));
+        }
+        Ok(())
     }
 
     /// Step 6: validate the frames into the writer's journal (pending).
@@ -524,6 +617,10 @@ impl Store {
             return Err(ApiError::invalid_frames(
                 "the head after the last frame is not Pragmatic-Head",
             ));
+        }
+        if let Err(e) = check_run_start(&run.id, &w.journal, range.clone()) {
+            w.journal.discard_pending();
+            return Err(e);
         }
         Ok(range)
     }
@@ -556,6 +653,37 @@ impl Store {
             );
         }
     }
+}
+
+/// The first entry of a run is its `run.start` note, naming the run's own
+/// id; no later entry is a `run.start`.
+fn check_run_start(
+    run_id: &str,
+    journal: &Journal,
+    range: std::ops::Range<u64>,
+) -> Result<(), ApiError> {
+    for cursor in range {
+        let Some(entry) = journal.get(cursor) else {
+            continue;
+        };
+        let is_start = entry.event.note_kind() == Some(pragmatic::journal::note::RUN_START);
+        let refuse = |why: &str| {
+            Err(ApiError::invalid_frames(why.to_string())
+                .with("cursor", cursor)
+                .with("reason", why.to_string()))
+        };
+        if cursor == 0 {
+            if !is_start {
+                return refuse("the first entry of a run must be its run.start note");
+            }
+            if journal.run_start_id().as_deref() != Some(run_id) {
+                return refuse("run.start names a different run id");
+            }
+        } else if is_start {
+            return refuse("run.start may only be the first entry");
+        }
+    }
+    Ok(())
 }
 
 /// Refuse writes to runs an admin must look at first.

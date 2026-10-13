@@ -7,17 +7,29 @@
 //! - a journal whose size equals `meta.byte_len` and whose last 32 bytes
 //!   equal `meta.head` is **trusted** without parsing (a million runs must
 //!   index in seconds; full verification runs in the background);
-//! - any other journal is **parsed again** and its meta rebuilt. A torn
-//!   tail (a crash during an append) is moved aside to
+//! - any other journal is **parsed again** and its meta rebuilt, provided
+//!   it still holds the history its meta recorded: at least `meta.entries`
+//!   entries (meta is written only after the journal's fsync, so that many
+//!   were acknowledged), with entry `meta.entries - 1` hashing to
+//!   `meta.head`. A journal that lost acknowledged entries, or whose
+//!   history was rewritten, is **damaged** (`chain_broken`), and its meta
+//!   is kept as evidence;
+//! - a torn tail (a crash during an append) is moved aside to
 //!   `<64hex>.torn-<unix_ms>` and truncated, and a `torn_tail` note records
-//!   it, unless that would cut below `anchored_entries`, which marks the
-//!   run damaged instead (the server never truncates anchored history);
+//!   it, unless the valid prefix is shorter than what meta recorded or than
+//!   `anchored_entries`, which marks the run damaged instead: the server
+//!   never truncates acknowledged or anchored history;
 //! - **corruption** marks the run damaged (`chain_broken`): readable up to
 //!   the damage, never written, never truncated;
 //! - meta without a journal is a run created by PUT whose journal was not
 //!   yet renamed into place (recreated, when nothing was anchored), or a
 //!   **missing** run (`record_missing`);
-//! - a run with fewer entries than were anchored is **regressed**.
+//! - a run with fewer entries than were anchored is **regressed**;
+//! - files that cannot be **read** (permissions, I/O errors) make the run
+//!   *unavailable*, never absent: its id answers 503 `storage_unavailable`
+//!   (and is loaded on first use once it reads again), so a client that
+//!   would create a missing run never replaces its files. A tombstone that
+//!   cannot be read still deletes its id (410).
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -31,6 +43,7 @@ use pragmatic::sha256::sha256;
 use pragmatic::Journal;
 
 use super::{state_from_meta, Meta, Run, RunState, Store, Tombstone};
+use crate::error::ApiError;
 use crate::fsutil;
 use crate::layout::{self, DATA_FORMAT};
 use crate::summary::Summary;
@@ -49,6 +62,10 @@ pub struct IndexReport {
     pub missing: Vec<String>,
     /// Files that belong to no run (no meta and no `run.start`).
     pub orphans: Vec<PathBuf>,
+    /// Stems (or `runs/<hh>` shards) whose files could not be read.
+    pub unavailable: Vec<String>,
+    /// Stems whose tombstone could not be read: deleted all the same.
+    pub deleted_stems: Vec<String>,
     pub errors: Vec<String>,
 }
 
@@ -63,6 +80,8 @@ impl IndexReport {
         self.regressed.extend(o.regressed);
         self.missing.extend(o.missing);
         self.orphans.extend(o.orphans);
+        self.unavailable.extend(o.unavailable);
+        self.deleted_stems.extend(o.deleted_stems);
         self.errors.extend(o.errors);
     }
 }
@@ -126,6 +145,14 @@ impl Store {
                 t.insert(tomb.run_id.clone(), tomb);
             }
         }
+        self.unavailable
+            .lock()
+            .expect("unavailable lock")
+            .extend(report.unavailable.iter().cloned());
+        self.deleted_stems
+            .write()
+            .expect("deleted stems lock")
+            .extend(report.deleted_stems.iter().cloned());
         self.signals.metrics.set_runs(report.runs);
         for id in &report.broken {
             self.signals.metrics.chain_broken();
@@ -150,12 +177,7 @@ impl Store {
         meta.anchored_entries = anchored_entries;
         let mut st = state_from_meta(meta, self.opts.lease_ttl);
         st.missing = true;
-        let run = Arc::new(Run {
-            id: run_id.to_string(),
-            stem: layout::stem(run_id),
-            file: Default::default(),
-            state: Mutex::new(st),
-        });
+        let run = Arc::new(Run::new(run_id, &layout::stem(run_id), st));
         self.runs
             .write()
             .expect("runs lock")
@@ -175,32 +197,43 @@ impl Store {
         let found = match scan_shard(dir) {
             Ok(f) => f,
             Err(e) => {
+                // Every run of the shard is unknown: none may look absent.
                 report.errors.push(format!("{}: {e}", dir.display()));
+                let shard = dir.file_name().map(|n| n.to_string_lossy().into_owned());
+                report.unavailable.extend(shard);
                 return (runs, tombs, report);
             }
         };
         for (stem, f) in found {
             if f.tombstone {
-                match self.load_tombstone(&stem) {
+                match self.load_tombstone(&stem, &mut report) {
                     Ok(t) => {
                         report.tombstones += 1;
                         tombs.push(t);
                     }
-                    Err(e) => report.errors.push(e),
+                    Err(e) => {
+                        report.errors.push(e);
+                        report.deleted_stems.push(stem);
+                    }
                 }
                 continue;
             }
             match self.load_run(&stem, &f, &mut report) {
                 Ok(Some(l)) => runs.push(l),
                 Ok(None) => {}
-                Err(e) => report.errors.push(e),
+                Err(e) => {
+                    report.errors.push(e);
+                    report.unavailable.push(stem);
+                }
             }
         }
         (runs, tombs, report)
     }
 
-    /// Read a tombstone and finish the deletion it records.
-    fn load_tombstone(&self, stem: &str) -> Result<Tombstone, String> {
+    /// Read a tombstone and finish the deletion it records. Files that
+    /// cannot be removed now are left for the next start; the run is
+    /// deleted either way.
+    fn load_tombstone(&self, stem: &str, report: &mut IndexReport) -> Result<Tombstone, String> {
         let path = self.layout.tombstone(stem);
         let t: Tombstone = fsutil::read_json(&path)
             .map_err(|e| e.to_string())?
@@ -213,11 +246,79 @@ impl Store {
         }
         for p in [self.layout.journal(stem), self.layout.meta(stem)] {
             match fs::remove_file(&p) {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.to_string()),
+                Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                    report.errors.push(format!("{}: {e}", p.display()))
+                }
                 _ => {}
             }
         }
         Ok(t)
+    }
+
+    /// Load a run the index could not read at startup, now that it is
+    /// asked for: `Ok(None)` when there is nothing there after all, 503
+    /// while its files still cannot be read, 410 for a tombstone.
+    pub(super) fn load_late(&self, run_id: &str) -> Result<Option<Arc<Run>>, ApiError> {
+        let stem = layout::stem(run_id);
+        if !self.is_unavailable(&stem) {
+            return Ok(None);
+        }
+        let _one = self.late.lock().expect("late lock");
+        if let Some(run) = self.get(run_id) {
+            return Ok(Some(run));
+        }
+        let unreadable = |e: String| {
+            ApiError::storage_unavailable(format!(
+                "the run's files could not be read ({e}); they are never replaced while they \
+                 cannot be read"
+            ))
+        };
+        let exists = |p: PathBuf| match fs::symlink_metadata(&p) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(unreadable(format!("{}: {e}", p.display()))),
+        };
+        let f = Found {
+            meta: exists(self.layout.meta(&stem))?,
+            journal: exists(self.layout.journal(&stem))?,
+            tombstone: exists(self.layout.tombstone(&stem))?,
+        };
+        let mut report = IndexReport::default();
+        if f.tombstone {
+            let t = self
+                .load_tombstone(&stem, &mut report)
+                .map_err(unreadable)?;
+            self.tombstones
+                .write()
+                .expect("tombstones lock")
+                .insert(t.run_id.clone(), t);
+            self.available(&stem);
+            return Err(ApiError::run_deleted());
+        }
+        match self.load_run(&stem, &f, &mut report) {
+            Ok(Some(l)) => {
+                let run = self
+                    .runs
+                    .write()
+                    .expect("runs lock")
+                    .entry(l.run.id.clone())
+                    .or_insert(l.run)
+                    .clone();
+                self.available(&stem);
+                self.signals.metrics.add_runs(1);
+                for id in &report.broken {
+                    self.signals.metrics.chain_broken();
+                    self.webhook("chain_broken", id, serde_json::json!({}));
+                }
+                Ok((run.id == run_id).then_some(run))
+            }
+            Ok(None) if !f.journal && !f.meta => {
+                self.available(&stem);
+                Ok(None)
+            }
+            Ok(None) => Err(unreadable("files exist that belong to no run".into())),
+            Err(e) => Err(unreadable(e)),
+        }
     }
 
     fn load_run(
@@ -230,13 +331,15 @@ impl Store {
         let meta: Option<Meta> = if f.meta {
             match fsutil::read_json::<Meta>(&meta_path) {
                 Ok(m) => m,
-                Err(e) if f.journal => {
+                // A meta that reads but does not parse is rebuilt from the
+                // journal; one that cannot be read at all is not touched.
+                Err(e) if f.journal && e.kind() == io::ErrorKind::InvalidData => {
                     report
                         .errors
                         .push(format!("{e}; rebuilding from the journal"));
                     None
                 }
-                Err(e) => return Err(e.to_string()),
+                Err(e) => return Err(format!("{}: {e}", meta_path.display())),
             }
         } else {
             None
@@ -269,12 +372,7 @@ impl Store {
             report.regressed.push(id.clone());
             rewrite = true;
         }
-        let run = Arc::new(Run {
-            id: id.clone(),
-            stem: stem.to_string(),
-            file: Default::default(),
-            state: Mutex::new(st),
-        });
+        let run = Arc::new(Run::new(&id, stem, st));
         if rewrite && run.lock().broken.is_none() {
             let mut guard = run.lock();
             let st: &mut RunState = &mut guard;
@@ -316,7 +414,7 @@ impl Store {
         report: &mut IndexReport,
     ) -> Result<Option<(RunState, Option<String>)>, String> {
         if let Some(m) = &meta {
-            if trusted(jpath, m).map_err(|e| e.to_string())? {
+            if trusted(jpath, m).map_err(|e| format!("{}: {e}", jpath.display()))? {
                 report.trusted += 1;
                 return Ok(Some((
                     state_from_meta(m.clone(), self.opts.lease_ttl),
@@ -353,24 +451,26 @@ impl Store {
                 return Ok(None);
             }
         };
+        let recorded = meta.as_ref().map(|m| (m.entries, m.head.clone()));
         let mut meta = meta.unwrap_or_else(|| empty_meta(&run_id));
         let mut journal = parsed.journal;
-        let mut broken = None;
-        if parsed.tail_len > 0 {
+        let mut broken = lost_history(&journal, recorded.as_ref());
+        if broken.is_none() && parsed.tail_len > 0 {
             if journal.len() < meta.anchored_entries {
                 broken = Some(format!(
                     "a torn tail at cursor {} would cut below the {} anchored entries",
                     journal.len(),
                     meta.anchored_entries
                 ));
-                report.broken.push(run_id.clone());
             } else {
                 self.truncate_torn(stem, jpath, &bytes, parsed.valid_len, &mut journal)
                     .map_err(|e| format!("{}: {e}", jpath.display()))?;
                 report.torn += 1;
             }
         }
-        if broken.is_none() {
+        if broken.is_some() {
+            report.broken.push(run_id.clone());
+        } else {
             meta.entries = journal.len();
             meta.byte_len = journal.byte_len();
             meta.head = hex_encode(&journal.head());
@@ -424,8 +524,30 @@ impl Store {
     }
 }
 
+/// Why a reparsed journal no longer holds the history its meta recorded
+/// (`(entries, head)`), if it does not: fewer entries than were
+/// acknowledged, or a different hash where the last acknowledged entry
+/// was.
+fn lost_history(journal: &Journal, recorded: Option<&(u64, String)>) -> Option<String> {
+    let (entries, head) = recorded?;
+    if journal.len() < *entries {
+        return Some(format!(
+            "the journal holds {} entries that verify, but {entries} were acknowledged",
+            journal.len()
+        ));
+    }
+    let last = entries.checked_sub(1)?;
+    let hash = journal.get(last).map(|e| hex_encode(&e.hash));
+    if hash.as_deref() != Some(head.as_str()) {
+        return Some(format!(
+            "entry {last} no longer has the hash the index recorded: the history was rewritten"
+        ));
+    }
+    None
+}
+
 /// A meta for a run known only by its id.
-fn empty_meta(run_id: &str) -> Meta {
+pub(super) fn empty_meta(run_id: &str) -> Meta {
     let now = timefmt::now_rfc3339();
     Meta {
         format: DATA_FORMAT,
@@ -439,10 +561,10 @@ fn empty_meta(run_id: &str) -> Meta {
         last_anchor_leaf: None,
         leases: Vec::new(),
         holds: Vec::new(),
-        open_intents: Vec::new(),
         status: "idle".into(),
         created_by: None,
         regressed: false,
+        unanchored_since: None,
         summary: Summary::default(),
     }
 }

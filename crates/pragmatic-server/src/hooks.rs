@@ -19,7 +19,10 @@
 //! anchors nothing, [`EvidenceStub`] answers 501, and [`ConsoleStub`]
 //! answers 501. The server is complete without them in every other
 //! respect: access control, redaction and the access log all happen before
-//! a hook is called, so an integration never has to repeat them.
+//! a hook is called, so an integration never has to repeat them. A stub
+//! never claims what it does not do: [`NoAnchoring`] reports no
+//! independent witness whatever the configuration names, and `/v1/info`
+//! says which components are not integrated.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -141,8 +144,13 @@ pub trait AnchorHost: Send + Sync {
 /// The anchoring library, as the server calls it. Every method may block:
 /// the server calls them from blocking tasks.
 pub trait Anchoring: Send + Sync + 'static {
-    /// True when at least one independent witness is configured. Bundles
-    /// say `"independent": false` otherwise.
+    /// False for a stand-in that anchors nothing ([`NoAnchoring`]).
+    fn integrated(&self) -> bool {
+        true
+    }
+
+    /// True when at least one independent witness is configured and in
+    /// use. Bundles say `"independent": false` otherwise.
     fn independent(&self) -> bool;
 
     /// Append leaves for `input` (in order of type and raw id bytes), end
@@ -178,21 +186,31 @@ pub trait Anchoring: Send + Sync + 'static {
     /// regression detection).
     fn anchored_lengths(&self) -> Result<HashMap<String, u64>, AnchorError>;
 
-    /// Age of the oldest append not yet in a batch, for the metric.
-    fn lag_seconds(&self) -> f64;
+    /// The last leaf of every object in the log: each run's (by id) and
+    /// the access log's (`run_id: None`). At startup the server raises each
+    /// run's last leaf to this: the log is durable before `meta.json`
+    /// records a leaf, and a run whose meta lost its last leaf would be
+    /// anchored again with a `prev_leaf` that skips it, a fork in its leaf
+    /// chain.
+    fn last_leaves(&self) -> Result<Vec<LeafPlaced>, AnchorError>;
 }
 
 /// INTEGRATION STUB: anchors nothing. Runs never become anchored, so
-/// `anchored_entries` stays 0 and nothing can regress. Replace with the
+/// `anchored_entries` stays 0, nothing can regress, and nothing is
+/// independently witnessed, whatever the configuration names: `/v1/info`
+/// reports `independent_witness: false` and `anchoring: "not_integrated"`,
+/// and the anchoring lag grows from the first append. Replace with the
 /// `pragmatic-anchor` library.
 #[derive(Debug, Clone, Default)]
-pub struct NoAnchoring {
-    pub independent: bool,
-}
+pub struct NoAnchoring;
 
 impl Anchoring for NoAnchoring {
+    fn integrated(&self) -> bool {
+        false
+    }
+
     fn independent(&self) -> bool {
-        self.independent
+        false
     }
 
     fn anchor(
@@ -233,8 +251,8 @@ impl Anchoring for NoAnchoring {
         Ok(HashMap::new())
     }
 
-    fn lag_seconds(&self) -> f64 {
-        0.0
+    fn last_leaves(&self) -> Result<Vec<LeafPlaced>, AnchorError> {
+        Ok(Vec::new())
     }
 }
 
@@ -283,6 +301,12 @@ pub enum EvidenceError {
 
 /// Builds evidence bundles (design 5).
 pub trait EvidenceBuilder: Send + Sync + 'static {
+    /// False for a stand-in that builds nothing ([`EvidenceStub`]): the
+    /// server then answers 501 before reading the journal.
+    fn integrated(&self) -> bool {
+        true
+    }
+
     fn build(&self, req: EvidenceRequest<'_>) -> Result<EvidenceBundle, EvidenceError>;
 }
 
@@ -291,6 +315,10 @@ pub trait EvidenceBuilder: Send + Sync + 'static {
 pub struct EvidenceStub;
 
 impl EvidenceBuilder for EvidenceStub {
+    fn integrated(&self) -> bool {
+        false
+    }
+
     fn build(&self, _req: EvidenceRequest<'_>) -> Result<EvidenceBundle, EvidenceError> {
         Err(EvidenceError::NotImplemented)
     }
@@ -359,6 +387,11 @@ pub enum ConsoleError {
 
 /// Renders console pages to HTML (design 4.14).
 pub trait ConsoleRenderer: Send + Sync + 'static {
+    /// False for a stand-in that renders nothing ([`ConsoleStub`]).
+    fn integrated(&self) -> bool {
+        true
+    }
+
     fn render(&self, page: &ConsolePage<'_>) -> Result<String, ConsoleError>;
 }
 
@@ -367,6 +400,10 @@ pub trait ConsoleRenderer: Send + Sync + 'static {
 pub struct ConsoleStub;
 
 impl ConsoleRenderer for ConsoleStub {
+    fn integrated(&self) -> bool {
+        false
+    }
+
     fn render(&self, _page: &ConsolePage<'_>) -> Result<String, ConsoleError> {
         Err(ConsoleError::NotImplemented)
     }
@@ -480,8 +517,20 @@ impl Anchoring for InstantAnchoring {
         Ok(self.state.lock().expect("anchoring state").anchored.clone())
     }
 
-    fn lag_seconds(&self) -> f64 {
-        0.0
+    fn last_leaves(&self) -> Result<Vec<LeafPlaced>, AnchorError> {
+        let s = self.state.lock().expect("anchoring state");
+        let mut last: HashMap<Option<String>, LeafPlaced> = HashMap::new();
+        for (i, (run_id, entries)) in s.leaves.iter().enumerate() {
+            last.insert(
+                run_id.clone(),
+                LeafPlaced {
+                    run_id: run_id.clone(),
+                    entries: *entries,
+                    leaf_index: i as u64,
+                },
+            );
+        }
+        Ok(last.into_values().collect())
     }
 }
 

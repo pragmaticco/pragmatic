@@ -32,7 +32,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
-use http_body_util::{BodyExt, LengthLimitError, Limited};
+use http_body_util::BodyExt;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value as JsonValue};
 
@@ -152,24 +152,105 @@ pub async fn blocking<T: Send + 'static>(
         .map_err(|e| ApiError::storage_unavailable(format!("internal task failed: {e}")))?
 }
 
-/// Read a request body of at most `limit` bytes (413 beyond).
-pub async fn read_body(headers: &HeaderMap, body: Body, limit: u64) -> Result<Bytes, ApiError> {
-    let declared = headers
+/// The request's declared `Content-Length`, if any.
+fn declared_len(headers: &HeaderMap) -> Option<u64> {
+    headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-    if declared.is_some_and(|n| n > limit) {
+        .and_then(|v| v.parse::<u64>().ok())
+}
+
+/// 413 for a body declared larger than `limit`, before anything is read.
+pub fn check_declared(headers: &HeaderMap, limit: u64) -> Result<(), ApiError> {
+    if declared_len(headers).is_some_and(|n| n > limit) {
         return Err(ApiError::payload_too_large(limit));
     }
-    match Limited::new(body, limit as usize).collect().await {
-        Ok(collected) => Ok(collected.to_bytes()),
-        Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => {
-            Err(ApiError::payload_too_large(limit))
+    Ok(())
+}
+
+/// Read a request body of at most `limit` bytes (413 beyond).
+///
+/// The bytes being received count against the server's body budget
+/// (`Limits::body_budget_bytes`, the declared length or else `limit`), so
+/// however many large requests arrive at once, their bodies together stay
+/// within it; a request waits for room. The body must arrive within the
+/// grace period plus its length at the minimum rate, or the request is
+/// refused with `400 bad_request`: a client that drips its body holds its
+/// share of the budget for a bounded time. The bytes are read straight
+/// into one buffer of the declared size, never collected and copied.
+pub async fn read_body(
+    app: &App,
+    headers: &HeaderMap,
+    body: Body,
+    limit: u64,
+) -> Result<Bytes, ApiError> {
+    check_declared(headers, limit)?;
+    let declared = declared_len(headers);
+    let expect = declared.unwrap_or(limit).min(limit);
+    let units = crate::server::body_units(expect).min(crate::server::body_units(
+        app.limits
+            .body_budget_bytes
+            .max(app.config.max_request_bytes),
+    ));
+    let _room = app
+        .body_budget
+        .acquire_many(units as u32)
+        .await
+        .map_err(|_| ApiError::storage_unavailable("the server is shutting down"))?;
+    let allowed = app.limits.body_grace
+        + std::time::Duration::from_secs(expect / app.limits.min_body_rate.max(1));
+    let deadline = tokio::time::Instant::now() + allowed;
+    let mut buf = Vec::with_capacity(declared.unwrap_or(0).min(limit) as usize);
+    let mut body = body;
+    loop {
+        let frame = match tokio::time::timeout_at(deadline, body.frame()).await {
+            Err(_) => {
+                return Err(ApiError::bad_request(format!(
+                    "the request body did not arrive within {} s",
+                    allowed.as_secs()
+                )))
+            }
+            Ok(None) => break,
+            Ok(Some(Err(e))) => {
+                return Err(ApiError::bad_request(format!(
+                    "could not read the request body: {e}"
+                )))
+            }
+            Ok(Some(Ok(frame))) => frame,
+        };
+        if let Ok(data) = frame.into_data() {
+            if buf.len() as u64 + data.len() as u64 > limit {
+                return Err(ApiError::payload_too_large(limit));
+            }
+            buf.extend_from_slice(&data);
         }
-        Err(e) => Err(ApiError::bad_request(format!(
-            "could not read the request body: {e}"
-        ))),
     }
+    Ok(Bytes::from(buf))
+}
+
+/// Refuse a request without buffering its body: the error is answered at
+/// once, and the body is read and dropped in the background (at most
+/// `limit` bytes, within the usual time), so the client receives the answer
+/// instead of a connection reset while it is still sending.
+pub fn refuse_unread(app: &App, body: Body, limit: u64, err: ApiError) -> Response {
+    let allowed = app.limits.body_grace
+        + std::time::Duration::from_secs(limit / app.limits.min_body_rate.max(1));
+    tokio::spawn(async move {
+        let mut body = body;
+        let mut seen = 0u64;
+        let _ = tokio::time::timeout(allowed, async {
+            while let Some(Ok(frame)) = body.frame().await {
+                if let Ok(data) = frame.into_data() {
+                    seen += data.len() as u64;
+                    if seen > limit {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+    });
+    err.into_response()
 }
 
 /// Parse a strict JSON request body (design 3.7: no duplicate keys,

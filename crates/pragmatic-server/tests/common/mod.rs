@@ -10,10 +10,17 @@ use std::sync::Arc;
 use pragmatic::encoding::hex_encode;
 use pragmatic::journal::{self, META, ROOT};
 use pragmatic::{Content, Event, Journal};
-use pragmatic_server::config::Config;
-use pragmatic_server::hooks::InstantAnchoring;
+use std::sync::Mutex;
+
+use axum::body::Bytes;
+use axum::http::HeaderMap;
+use pragmatic_server::config::{Config, WebhookConfig};
+use pragmatic_server::hooks::{
+    AnchorError, AnchorHost, Anchoring, BatchInput, BatchReason, BatchReceipt, CheckpointView,
+    InstantAnchoring, LeafPlaced, LeafView,
+};
 use pragmatic_server::keys::ServerKey;
-use pragmatic_server::server::{self, Hooks, ServerHandle};
+use pragmatic_server::server::{self, Hooks, Limits, ServerHandle};
 use pragmatic_server::tokens;
 use reqwest::{Method, Response, StatusCode};
 use serde_json::{json, Value};
@@ -138,13 +145,37 @@ impl TestServer {
         TestServer::boot_hooks(dir, config, Some(anchoring), h).await
     }
 
+    /// Start with chosen [`Limits`].
+    pub async fn start_limited(customize: impl FnOnce(&mut Config), limits: Limits) -> TestServer {
+        let dir = Arc::new(TempDir::new("srv"));
+        let mut config = test_config(dir.path());
+        config.bootstrap.admin_token_sha256 = tokens::token_sha256(&admin_token());
+        customize(&mut config);
+        ServerKey::generate()
+            .unwrap()
+            .write_new(&config.keys.signing_key_file)
+            .unwrap();
+        let hooks = Hooks::stubs(&config);
+        TestServer::boot_full(dir, config, None, hooks, limits).await
+    }
+
     async fn boot_hooks(
         dir: Arc<TempDir>,
         config: Config,
         anchoring: Option<Arc<InstantAnchoring>>,
         hooks: Hooks,
     ) -> TestServer {
-        let handle = server::start(config.clone(), [0u8; 32], hooks)
+        TestServer::boot_full(dir, config, anchoring, hooks, Limits::default()).await
+    }
+
+    async fn boot_full(
+        dir: Arc<TempDir>,
+        config: Config,
+        anchoring: Option<Arc<InstantAnchoring>>,
+        hooks: Hooks,
+        limits: Limits,
+    ) -> TestServer {
+        let handle = server::start_with(config.clone(), [0u8; 32], hooks, limits)
             .await
             .expect("server starts");
         handle.wait_ready().await;
@@ -433,4 +464,161 @@ pub fn stored(ts: &TestServer, run: &str) -> Journal {
     Journal::parse(&std::fs::read(path).unwrap(), None)
         .unwrap()
         .journal
+}
+
+/// The text of `/metrics`.
+pub async fn metrics(ts: &TestServer) -> String {
+    reqwest::get(format!("{}/metrics", ts.url))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+}
+
+/// The value of one metric line (`name value`), if present.
+pub fn metric(page: &str, name: &str) -> Option<f64> {
+    page.lines()
+        .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+}
+
+/// Webhook deliveries a test receiver got: headers and body.
+#[derive(Clone, Default)]
+pub struct Received(pub Arc<Mutex<Vec<(HeaderMap, Bytes)>>>);
+
+impl Received {
+    /// The bodies received so far, as JSON.
+    pub fn events(&self) -> Vec<Value> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, b)| serde_json::from_slice(b).unwrap())
+            .collect()
+    }
+
+    /// Wait (up to two seconds) for an event named `event`.
+    pub async fn wait_for(&self, event: &str) -> Option<Value> {
+        for _ in 0..100 {
+            if let Some(e) = self.events().into_iter().find(|e| e["event"] == event) {
+                return Some(e);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        None
+    }
+}
+
+/// A webhook receiver on a random port: its URL and what it received.
+pub async fn webhook_receiver() -> (String, Received) {
+    let got = Received::default();
+    let g = got.clone();
+    let app = axum::Router::new().route(
+        "/hook",
+        axum::routing::post(move |headers: HeaderMap, body: Bytes| {
+            let g = g.clone();
+            async move {
+                g.0.lock().unwrap().push((headers, body));
+                "ok"
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/hook", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, got)
+}
+
+/// A webhook configuration for `url` and `events`, with its secret file in
+/// `dir` (`secret` is the secret).
+pub fn webhook(dir: &TempDir, url: &str, events: &[&str]) -> WebhookConfig {
+    let secret_file = dir.path().join(format!("secret-{}", events.join("-")));
+    std::fs::write(&secret_file, "secret\n").unwrap();
+    WebhookConfig {
+        url: url.to_string(),
+        secret_file,
+        events: events.iter().map(|e| e.to_string()).collect(),
+    }
+}
+
+/// An anchoring that records every batch it is offered, then anchors with
+/// [`InstantAnchoring`].
+#[derive(Default)]
+pub struct Recording {
+    pub inner: InstantAnchoring,
+    pub inputs: Mutex<Vec<BatchInput>>,
+    pub receipts: Mutex<Vec<BatchReceipt>>,
+}
+
+impl Anchoring for Recording {
+    fn independent(&self) -> bool {
+        true
+    }
+    fn anchor(
+        &self,
+        host: &dyn AnchorHost,
+        input: BatchInput,
+        reason: BatchReason,
+    ) -> Result<Option<BatchReceipt>, AnchorError> {
+        self.inputs.lock().unwrap().push(input.clone());
+        let r = self.inner.anchor(host, input, reason)?;
+        if let Some(r) = &r {
+            self.receipts.lock().unwrap().push(r.clone());
+        }
+        Ok(r)
+    }
+    fn checkpoints(&self, a: Option<u64>, l: usize) -> Result<Vec<CheckpointView>, AnchorError> {
+        self.inner.checkpoints(a, l)
+    }
+    fn checkpoint(&self, s: u64) -> Result<Option<CheckpointView>, AnchorError> {
+        self.inner.checkpoint(s)
+    }
+    fn leaves(&self, f: u64, t: u64, p: bool) -> Result<Vec<LeafView>, AnchorError> {
+        self.inner.leaves(f, t, p)
+    }
+    fn verify(&self) -> Result<Value, AnchorError> {
+        self.inner.verify()
+    }
+    fn anchored_lengths(&self) -> Result<std::collections::HashMap<String, u64>, AnchorError> {
+        self.inner.anchored_lengths()
+    }
+    fn last_leaves(&self) -> Result<Vec<LeafPlaced>, AnchorError> {
+        self.inner.last_leaves()
+    }
+}
+
+/// The path of a run's file in a data directory (`suffix` `.journal`,
+/// `.meta.json`, `.tombstone.json`).
+pub fn run_file_in(data_dir: &Path, run: &str, suffix: &str) -> PathBuf {
+    let stem = pragmatic_server::layout::stem(run);
+    data_dir
+        .join("runs")
+        .join(&stem[..2])
+        .join(format!("{stem}{suffix}"))
+}
+
+/// The note kinds of a journal, in order.
+pub fn note_kinds(j: &Journal) -> Vec<String> {
+    j.entries()
+        .iter()
+        .filter_map(|e| e.event.note_kind().map(str::to_string))
+        .collect()
+}
+
+/// PUT, append an attempt (attempt.start, receives, attempt.end ok) and
+/// release the lease.
+pub async fn finished(ts: &TestServer, token: &str, run: &str, messages: &[&str]) -> Writer {
+    let mut w = Writer::create(ts, token, run).await;
+    w.add(note("attempt.start", json!({"attempt": 1}), vec![]));
+    for m in messages {
+        w.add(recv(m));
+    }
+    w.add(note(
+        "attempt.end",
+        json!({"attempt": 1, "outcome": "ok"}),
+        vec![],
+    ));
+    assert_eq!(w.push(ts).await.status(), StatusCode::OK);
+    assert_eq!(w.release(ts).await.status(), StatusCode::NO_CONTENT);
+    w
 }

@@ -34,7 +34,7 @@ pub async fn add_checkpoint(
         .first()
         .cloned()
         .ok_or_else(|| ApiError::forbidden("this token is not bound to an origin"))?;
-    let body = read_body(&headers, body, BODY_LIMIT).await?;
+    let body = read_body(&app, &headers, body, BODY_LIMIT).await?;
     let result = blocking(move || Ok(witness.add_checkpoint(&app.store, &origin, &body))).await?;
     let (status, content_type, text) = match result {
         Ok(line) => (StatusCode::OK, "text/plain; charset=utf-8", line),
@@ -81,6 +81,8 @@ pub async fn log(
         return Err(ApiError::not_found());
     };
     let o = origin.clone();
-    let records = blocking(move || witness.log(&app.store, &o, after)).await?;
-    Ok(ok(json!({ "origin": origin, "cosigned": records })))
+    let (records, next) = blocking(move || witness.log(&app.store, &o, after)).await?;
+    Ok(ok(
+        json!({ "origin": origin, "cosigned": records, "next": next }),
+    ))
 }

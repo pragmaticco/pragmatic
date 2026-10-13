@@ -5,7 +5,7 @@
 //! customers or people. Every metric is a process-wide number.
 
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Upper bounds of the append latency histogram, in seconds.
@@ -27,12 +27,16 @@ pub struct Metrics {
     tokens_issued: AtomicU64,
     tokens_revoked: AtomicU64,
     tokens_rejected: AtomicU64,
+    /// Unix seconds of the oldest append not yet independently anchored
+    /// (0: none), as the sweeper last found it.
+    oldest_unanchored: AtomicI64,
 }
 
 /// Numbers that live elsewhere, read when the page is rendered.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Gauges {
     pub access_log_lag_seconds: f64,
+    pub access_log_failed: bool,
     pub anchor_lag_seconds: f64,
     pub tokens_active: u64,
 }
@@ -78,6 +82,24 @@ impl Metrics {
 
     pub fn set_dangling_effects(&self, n: u64) {
         self.dangling_effects.store(n, Ordering::Relaxed);
+    }
+
+    /// The oldest append not yet independently anchored, in Unix seconds
+    /// (`None`: everything is anchored).
+    pub fn set_oldest_unanchored(&self, unix_secs: Option<i64>) {
+        self.oldest_unanchored
+            .store(unix_secs.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// The anchoring lag (design 4.7): the age of the oldest append not yet
+    /// independently anchored, measured by the server from its own runs,
+    /// so it grows whenever anchoring does not happen, whatever the reason
+    /// (a failing witness, or no anchoring at all in this build).
+    pub fn anchor_lag_seconds(&self) -> f64 {
+        match self.oldest_unanchored.load(Ordering::Relaxed) {
+            0 => 0.0,
+            t => (crate::timefmt::now_unix_secs() - t).max(0) as f64,
+        }
     }
 
     pub fn token_issued(&self) {
@@ -190,8 +212,14 @@ impl Metrics {
         );
         gauge(
             &mut out,
+            "pragmatic_access_log_failed",
+            "1 once the access log could not be written: every authenticated request is refused until a restart.",
+            if g.access_log_failed { 1.0 } else { 0.0 },
+        );
+        gauge(
+            &mut out,
             "pragmatic_anchor_lag_seconds",
-            "Age of the oldest append not yet in an anchoring batch.",
+            "Age of the oldest append not yet independently anchored.",
             g.anchor_lag_seconds,
         );
         out
@@ -228,6 +256,21 @@ mod tests {
     }
 
     #[test]
+    fn the_anchor_lag_counts_from_the_oldest_unanchored_append() {
+        let m = Metrics::default();
+        assert_eq!(m.anchor_lag_seconds(), 0.0);
+        m.set_oldest_unanchored(Some(crate::timefmt::now_unix_secs() - 90));
+        assert!(m.anchor_lag_seconds() >= 90.0);
+        m.set_oldest_unanchored(None);
+        assert_eq!(m.anchor_lag_seconds(), 0.0);
+        let page = m.render(Gauges {
+            access_log_failed: true,
+            ..Gauges::default()
+        });
+        assert!(page.contains("pragmatic_access_log_failed 1"));
+    }
+
+    #[test]
     fn every_design_metric_is_present() {
         let m = Metrics::default();
         m.add_runs(3);
@@ -243,6 +286,8 @@ mod tests {
             "pragmatic_dangling_effects",
             "pragmatic_tokens_total{kind=\"rejected\"} 1",
             "pragmatic_access_log_lag_seconds",
+            "pragmatic_access_log_failed 0",
+            "pragmatic_anchor_lag_seconds 0",
         ] {
             assert!(page.contains(name), "{name}");
         }

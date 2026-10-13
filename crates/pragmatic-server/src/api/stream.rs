@@ -1,7 +1,13 @@
-//! Streaming a file prefix as a response body, so a 1 GiB journal is never
-//! held in memory to be served.
+//! Streaming a journal's durable prefix as a response body, so a 1 GiB
+//! journal is never held in memory to be served.
+//!
+//! Each chunk is read through [`DurableFile::read_at`], which takes the
+//! run's file lock shared for that read and refuses once an erasure or a
+//! deletion has replaced or removed the file: the response is then aborted
+//! (a short body with an error, never a short file passed off as whole),
+//! and nothing read after the erasure committed reaches the client. An
+//! erasure therefore never waits for a slow download either.
 
-use std::fs::File;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -9,10 +15,13 @@ use std::task::{Context, Poll};
 use axum::body::{Body, Bytes};
 use tokio::sync::mpsc;
 
-use crate::fsutil;
+use crate::store::DurableFile;
 
 /// Bytes read per chunk.
 const CHUNK: u64 = 1 << 20;
+
+/// Chunks read ahead of the client.
+const AHEAD: usize = 2;
 
 /// The receiving end of a chunk channel, as a stream.
 struct Chunks(mpsc::Receiver<io::Result<Bytes>>);
@@ -25,17 +34,18 @@ impl futures_core::Stream for Chunks {
     }
 }
 
-/// A body of the first `len` bytes of `file`, read on a blocking thread in
-/// 1 MiB chunks. A read error ends the body with that error, which aborts
-/// the response rather than sending a short file as if it were whole.
-pub fn file_body(file: File, len: u64) -> Body {
-    let (tx, rx) = mpsc::channel(4);
+/// A body of the journal's durable prefix, read on a blocking thread in
+/// 1 MiB chunks. A read error (or an erasure in between) ends the body with
+/// that error, which aborts the response.
+pub fn file_body(durable: DurableFile) -> Body {
+    let (tx, rx) = mpsc::channel(AHEAD);
     tokio::task::spawn_blocking(move || {
+        let len = durable.byte_len;
         let mut offset = 0u64;
         while offset < len {
             let n = CHUNK.min(len - offset);
             let mut buf = vec![0u8; n as usize];
-            let chunk = fsutil::read_exact_at(&file, &mut buf, offset).map(|_| Bytes::from(buf));
+            let chunk = durable.read_at(&mut buf, offset).map(|_| Bytes::from(buf));
             let failed = chunk.is_err();
             if tx.blocking_send(chunk).is_err() || failed {
                 return;

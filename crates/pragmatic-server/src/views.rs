@@ -19,6 +19,7 @@ use pragmatic::{Content, Entry, Event, SlotState};
 use serde_json::{json, Map, Value as JsonValue};
 
 use crate::redaction::{Redacted, Redactor};
+use crate::store::ReadEntry;
 
 /// Slot content longer than this is truncated in entry listings; the slot
 /// endpoint serves it whole.
@@ -152,7 +153,16 @@ fn truncate_bytes(b: &[u8], limit: Option<usize>) -> (&[u8], bool) {
 
 /// One entry's JSON.
 pub fn entry_json(entry: &Entry, opts: ViewOptions<'_>) -> JsonValue {
-    let contents = entry.event.slot_contents();
+    entry_json_with(entry, &entry.event.slot_contents(), opts)
+}
+
+/// One entry read from disk: its ref slots show their targets' content.
+pub fn read_entry_json(e: &ReadEntry, opts: ViewOptions<'_>) -> JsonValue {
+    entry_json_with(&e.entry, &e.contents(), opts)
+}
+
+/// One entry's JSON, with each slot's content given (refs resolved).
+fn entry_json_with(entry: &Entry, contents: &[&Content], opts: ViewOptions<'_>) -> JsonValue {
     let slots: Vec<JsonValue> = entry
         .slots
         .iter()

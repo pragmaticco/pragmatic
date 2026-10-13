@@ -1,7 +1,10 @@
 //! Anchor endpoints (design 4.4 and 4.7). The anchoring library supplies
 //! checkpoints and leaves; this layer filters them by scope: an auditor
-//! sees only the leaves of runs in its scopes, and never the access log's
-//! leaves.
+//! sees the leaves of runs in its scopes, and the access log's leaves. An
+//! access-log leaf holds a record count and a chain head, nothing about any
+//! run or person, and it is what lets an auditor check that the records
+//! it reads (each served with its chain hash) belong to an anchored log
+//! that was not cut back or rewritten.
 
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Extension, Path, RawQuery, State};
@@ -21,7 +24,7 @@ const MAX_LEAVES: u64 = 10_000;
 fn visible(p: &Principal, leaf: &LeafView) -> bool {
     match &leaf.run_id {
         Some(id) => p.in_scope(id),
-        None => p.role == Role::Admin,
+        None => true,
     }
 }
 

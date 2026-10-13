@@ -5,7 +5,7 @@
 //! pragmatic-server keygen [--rotate]
 //! pragmatic-server token new|revoke|list|bootstrap
 //! pragmatic-server backup --to DIR
-//! pragmatic-server restore --from DIR [--erasure-ledger FILE]
+//! pragmatic-server restore --from DIR [--erasure-ledger FILE] [--trust-key HEX]
 //! pragmatic-server verify-data [--offline]
 //! pragmatic-server verify-evidence FILE
 //! pragmatic-server migrate
@@ -75,6 +75,11 @@ enum Command {
         /// backup are applied again.
         #[arg(long)]
         erasure_ledger: Option<PathBuf>,
+        /// A public key (64 hex digits) to trust as the backup's signer,
+        /// besides the configured signing key and the keys it replaced
+        /// (repeatable).
+        #[arg(long = "trust-key")]
+        trust_keys: Vec<String>,
     },
     /// Verify every chain, commitment and anchor proof now.
     VerifyData {
@@ -186,14 +191,16 @@ fn run(cli: Cli) -> Result<String, String> {
         Command::Restore {
             from,
             erasure_ledger,
+            trust_keys,
         } => {
             let config = load(&cli.config)?.0;
             let hooks = Hooks::stubs(&config);
-            let report = ops::restore(
+            let report = ops::restore_trusting(
                 &config,
                 &from,
                 erasure_ledger.as_deref(),
                 hooks.anchoring.as_ref(),
+                &trust_keys,
             )?;
             Ok(pretty(&report))
         }

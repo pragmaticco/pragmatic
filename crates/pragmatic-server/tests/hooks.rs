@@ -3,11 +3,9 @@
 
 mod common;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Bytes;
-use axum::http::HeaderMap;
 use common::*;
 use pragmatic_server::hooks::{
     ConsoleError, ConsolePage, ConsoleRenderer, EvidenceBuilder, EvidenceBundle, EvidenceError,
@@ -140,8 +138,12 @@ async fn anchors_are_filtered_by_scope() {
     let (auditor, _) = ts.issue("auditor", &["a:"], false).await;
     let v: Value = ts.get("/v1/anchors", &auditor).await.json().await.unwrap();
     let leaves = v["checkpoints"][0]["leaves"].as_array().unwrap();
-    assert_eq!(leaves.len(), 1, "{v}");
-    assert_eq!(leaves[0]["run_id"], "a:1");
+    // The in-scope run's leaf, and the access log's (a count and a head,
+    // which lets the auditor check the log it reads), never b:1's.
+    assert_eq!(leaves.len(), 2, "{v}");
+    assert!(leaves.iter().any(|l| l["run_id"] == "a:1"));
+    assert!(leaves.iter().any(|l| l["run_id"].is_null()));
+    assert!(!v.to_string().contains("b:1"));
     let v: Value = ts.get("/v1/anchors", &ts.admin).await.json().await.unwrap();
     assert_eq!(
         v["checkpoints"][0]["leaves"].as_array().unwrap().len(),
@@ -154,7 +156,7 @@ async fn anchors_are_filtered_by_scope() {
         .json()
         .await
         .unwrap();
-    assert_eq!(v["leaves"].as_array().unwrap().len(), 1);
+    assert_eq!(v["leaves"].as_array().unwrap().len(), 2);
     let v: Value = ts
         .get("/v1/anchors/0", &auditor)
         .await
@@ -353,31 +355,9 @@ async fn console_sessions_sign_in_expire_and_end_with_their_token() {
         .any(|r| r["action"] == "sign_out" && r["token_id"] == "bootstrap"));
 }
 
-#[derive(Clone, Default)]
-struct Received(Arc<Mutex<Vec<(HeaderMap, Bytes)>>>);
-
-async fn receiver() -> (String, Received) {
-    let got = Received::default();
-    let g = got.clone();
-    let app = axum::Router::new().route(
-        "/hook",
-        axum::routing::post(move |headers: HeaderMap, body: Bytes| {
-            let g = g.clone();
-            async move {
-                g.0.lock().unwrap().push((headers, body));
-                "ok"
-            }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/hook", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (url, got)
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn webhooks_are_signed_and_carry_no_content() {
-    let (url, got) = receiver().await;
+    let (url, got) = webhook_receiver().await;
     let secret_dir = TempDir::new("hook-secret");
     let secret_file = secret_dir.path().join("secret");
     std::fs::write(&secret_file, "s3cret\n").unwrap();

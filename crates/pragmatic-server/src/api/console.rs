@@ -12,7 +12,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value as JsonValue};
 
-use super::admin::redact_personal;
+use super::admin::{audit_filter, withhold_personal};
 use super::middleware::{durable_intent, intent};
 use super::{
     blocking, need, noted, query_pairs, query_u64, read_body, AccessNote, AppState, Caller, READERS,
@@ -81,7 +81,7 @@ pub async fn sign_in(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
-    let body = read_body(&headers, body, 4096).await?;
+    let body = read_body(&app, &headers, body, 4096).await?;
     let token = form_urlencoded::parse(&body)
         .find(|(k, _)| k == "token")
         .map(|(_, v)| v.into_owned())
@@ -239,23 +239,24 @@ pub async fn run(
         .await?;
     }
     let (a, run_id) = (app.clone(), id.clone());
-    let (summary, journal) = blocking(move || {
+    let (summary, page) = blocking(move || {
         let s = a.store.summary(&run_id, &a.holds)?;
-        let j = a.store.snapshot(&run_id)?;
-        Ok((s, j))
+        let page = a.store.entries_page(&run_id, from, 200)?;
+        Ok((s, page))
     })
     .await?;
-    let end = from.saturating_add(200).min(journal.len());
     let opts = ViewOptions {
         raw: p.view_raw,
         redactor: &app.redactor,
         limit: Some(LIST_SLOT_LIMIT),
     };
-    let entries: Vec<JsonValue> = (from.min(end)..end)
-        .filter_map(|cur| journal.get(cur))
-        .map(|e| views::entry_json(e, opts))
+    let entries: Vec<JsonValue> = page
+        .entries
+        .iter()
+        .map(|e| views::read_entry_json(e, opts))
         .collect();
-    let next = (end < journal.len()).then_some(end);
+    let end = from + entries.len() as u64;
+    let next = page.next;
     let v = viewer(&app, &p);
     let data = ConsolePage::Run {
         viewer: &v,
@@ -310,23 +311,16 @@ pub async fn access(
             after = Some(query_u64("after", &v)?);
         }
     }
-    let (a, who) = (app.clone(), p.clone());
-    let (records, next) = blocking(move || {
-        a.access
-            .read(after, 200, |r| match r {
-                _ if who.role == Role::Admin => true,
-                Some(id) => who.in_scope(id),
-                None => false,
-            })
-            .map_err(ApiError::from)
-    })
-    .await?;
+    let filter = audit_filter(&p, None);
+    let a = app.clone();
+    let (records, next) =
+        blocking(move || a.access.read(after, 200, &filter).map_err(ApiError::from)).await?;
     let records: Vec<JsonValue> = records
         .into_iter()
         .map(|(cursor, _, entry)| {
             let mut view = record_view(cursor, &entry);
             if !p.view_raw {
-                redact_personal(&app, &mut view);
+                withhold_personal(&mut view);
             }
             JsonValue::Object(view)
         })

@@ -44,6 +44,9 @@ use crate::timefmt;
 /// The note kind of a cosigned checkpoint in the witness record.
 pub const COSIGN_KIND: &str = "witness.cosign";
 
+/// The most record entries one `GET /v1/witness/log/{origin}` reads.
+pub const LOG_PAGE: u64 = 1000;
+
 /// The run that records what the witness cosigned for an origin.
 pub fn record_run_id(origin: &str) -> String {
     format!("pragmatic:witness:{origin}")
@@ -279,26 +282,27 @@ impl Witness {
         Ok((line, ts))
     }
 
-    /// The cosigned history of an origin after cursor `after`.
+    /// The cosigned history of an origin after cursor `after`: at most
+    /// [`LOG_PAGE`] entries of the record, read from disk, and the cursor
+    /// to continue after when more follow.
     pub fn log(
         &self,
         store: &Store,
         origin: &str,
         after: Option<u64>,
-    ) -> Result<Vec<JsonValue>, ApiError> {
+    ) -> Result<(Vec<JsonValue>, Option<u64>), ApiError> {
         if !self.origins.contains_key(origin) {
             return Err(ApiError::not_found());
         }
-        let journal = match store.snapshot(&record_run_id(origin)) {
-            Ok(j) => j,
-            Err(e) if e.code == "not_found" => return Ok(Vec::new()),
+        let from = after.map_or(0, |a| a.saturating_add(1));
+        let page = match store.entries_page(&record_run_id(origin), from, LOG_PAGE) {
+            Ok(p) => p,
+            Err(e) if e.code == "not_found" => return Ok((Vec::new(), None)),
             Err(e) => return Err(e),
         };
         let mut out = Vec::new();
-        for e in journal.entries() {
-            if after.is_some_and(|a| e.cursor <= a) {
-                continue;
-            }
+        for read in &page.entries {
+            let e = &read.entry;
             let Event::Note {
                 kind,
                 data,
@@ -319,7 +323,8 @@ impl Witness {
                 .map_or(JsonValue::Null, |v| v.as_str().into_owned().into());
             out.push(doc);
         }
-        Ok(out)
+        let next = page.next.map(|n| n - 1);
+        Ok((out, next))
     }
 }
 

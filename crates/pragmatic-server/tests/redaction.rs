@@ -82,6 +82,20 @@ async fn seeded_run(ts: &TestServer, token: &str, run: &str) {
         args: "[4]".into(),
         value: Content::from(vec![0xff, 0x00, 0xfe, 0x01]),
     });
+    // Personal data as object keys: a map keyed by customer.
+    let mut by_customer = serde_json::Map::new();
+    for seed in SEEDS {
+        by_customer.insert(seed.to_string(), json!({"orders": 1}));
+    }
+    by_customer.insert("4111111111111111".into(), json!("visa"));
+    w.add(recv(&json!({ "customers": by_customer }).to_string()));
+    // JSON that is not strict (a repeated key) still has its image
+    // withheld, and its text redacted.
+    w.add(recv(&format!(
+        r#"{{"role":"user","role":"user","content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{}"}}}},{{"type":"text","text":"{}"}}]}}"#,
+        image(),
+        SEEDS.join(" / ")
+    )));
     w.add(note(
         "attempt.end",
         json!({"attempt": 1, "outcome": "ok"}),

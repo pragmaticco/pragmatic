@@ -137,18 +137,28 @@ impl Holds {
             .cloned()
     }
 
-    /// Place a hold; it is durable when this returns.
-    pub fn add(&self, new: NewHold, created_by: &str) -> io::Result<Hold> {
+    /// A new hold with a fresh id, not yet placed: the server records it in
+    /// the erasure ledger before placing it ([`Holds::insert`]).
+    pub fn prepare(new: NewHold, created_by: &str) -> io::Result<Hold> {
         let mut id = [0u8; 8];
         pragmatic::rand::fill(&mut id)?;
-        let hold = Hold {
+        Ok(Hold {
             id: format!("hold_{}", hex_encode(&id)),
             matter: new.matter,
             scope: new.scope,
             created_at: timefmt::now_rfc3339(),
             created_by: created_by.to_string(),
-        };
+        })
+    }
+
+    /// Place a prepared hold; it is durable when this returns. Placing a
+    /// hold that is already in place (a restore re-applying the ledger)
+    /// changes nothing.
+    pub fn insert(&self, hold: Hold) -> io::Result<Hold> {
         let mut holds = self.holds.write().expect("holds lock");
+        if holds.iter().any(|h| h.id == hold.id) {
+            return Ok(hold);
+        }
         let mut next = holds.clone();
         next.push(hold.clone());
         fsutil::write_json_atomic(
@@ -159,6 +169,11 @@ impl Holds {
         )?;
         *holds = next;
         Ok(hold)
+    }
+
+    /// Place a hold; it is durable when this returns.
+    pub fn add(&self, new: NewHold, created_by: &str) -> io::Result<Hold> {
+        self.insert(Holds::prepare(new, created_by)?)
     }
 
     /// Remove a hold. `Ok(None)` if there is no such hold.

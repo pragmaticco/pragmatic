@@ -145,6 +145,8 @@ async fn keygen_rotation_backup_verify_data_and_migrate() {
     Writer::create(&ts, &agent, "r").await.attempt(&ts, 1).await;
     let old_key = ts.app().key.key_id();
     ts.stop().await;
+    let old_backup = dir.path().join("old-backup");
+    pragmatic_server::ops::backup(&config, &old_backup).unwrap();
 
     // Rotation: both keys in the ring, a signed record in the access log.
     let (ok, out, err) = run(bin().args(["--config", &c, "keygen", "--rotate"]));
@@ -201,7 +203,12 @@ async fn keygen_rotation_backup_verify_data_and_migrate() {
     })
     .await
     .unwrap();
-    assert!(pragmatic_server::ops::verify_backup(&backup).is_ok());
+    let trusted = pragmatic_server::ops::trusted_keys(&config, &[]).unwrap();
+    assert!(pragmatic_server::ops::verify_backup(&backup, &trusted).is_ok());
+    // A backup signed before the rotation is still trusted: the retired key
+    // is kept next to the new one.
+    assert_eq!(trusted.len(), 2);
+    assert!(pragmatic_server::ops::verify_backup(&old_backup, &trusted).is_ok());
 }
 
 #[test]

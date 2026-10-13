@@ -15,13 +15,24 @@
 //!   finding "personal data" inside base64 would be noise.
 //! - **Text** (every other string, and numbers, which can hold a card
 //!   number) goes through the core detectors and the configured patterns.
+//! - **Object keys** go through them too: a map keyed by email address,
+//!   phone number or card number is as common as a list of them. When two
+//!   keys redact alike (`[email]` twice), later ones get a suffix
+//!   (`[email] (2)`), so the view stays strict JSON with every member.
 //!
-//! Slots that are not JSON are redacted as text, with any embedded
-//! `data:...;base64,...` URL replaced first. Slots that are not UTF-8 are
-//! binary and never served without `view_raw`.
+//! A slot that is JSON but not *strict* JSON (a repeated key, nesting past
+//! 64) is parsed leniently (a repeated key keeps its last value) and the
+//! same rules apply, so its binary fields are still withheld. Slots that
+//! are not JSON at all are redacted as text, with any embedded
+//! `data:...;base64,...` URL replaced first and, since their structure is
+//! unknown, any run of 256 or more base64 characters withheld as binary.
+//! Slots that are not UTF-8 are binary and never served without
+//! `view_raw`.
 //!
 //! Redaction does not look inside images, PDFs or audio, and regex
 //! redaction is not de-identification: the documentation says so.
+
+use std::collections::HashSet;
 
 use pragmatic::encoding::{base64_decode, hex_encode};
 use pragmatic::json::{self, Json};
@@ -35,12 +46,17 @@ use crate::config::{ConfigError, RedactionConfig};
 /// What a configured pattern's matches are replaced with.
 pub const PATTERN_PLACEHOLDER: &str = "[redacted]";
 
+/// The shortest run of base64 characters withheld as binary from text
+/// whose structure is unknown.
+pub const BASE64_RUN: usize = 256;
+
 /// The redaction rules of one server.
 #[derive(Debug, Clone)]
 pub struct Redactor {
     kinds: Vec<Kind>,
     patterns: Vec<Regex>,
     data_url: Regex,
+    base64_run: Regex,
 }
 
 /// A binary value that was withheld from a view.
@@ -94,6 +110,8 @@ impl Redactor {
                 r"data:([A-Za-z0-9.+/-]*)(?:;[A-Za-z0-9=._-]+)*;base64,([A-Za-z0-9+/]*=*)",
             )
             .expect("static pattern"),
+            base64_run: Regex::new(&format!(r"[A-Za-z0-9+/_-]{{{BASE64_RUN},}}={{0,2}}"))
+                .expect("static pattern"),
         })
     }
 
@@ -136,12 +154,33 @@ impl Redactor {
         let Ok(text) = std::str::from_utf8(bytes) else {
             return Redacted::Binary(BinaryInfo::of("application/octet-stream", bytes));
         };
-        match json::parse(text) {
-            Ok(doc) if is_container(&doc) => {
+        let doc = match json::parse(text) {
+            Ok(doc) => Some(doc),
+            Err(_) => lenient(text),
+        };
+        match doc {
+            Some(doc) if is_container(&doc) => {
                 Redacted::Text(self.redact_json(doc, None).to_string())
             }
-            _ => Redacted::Text(self.redact_text(text)),
+            Some(_) => Redacted::Text(self.redact_text(text)),
+            None => Redacted::Text(self.redact_loose_text(text)),
         }
+    }
+
+    /// Redact text whose structure is unknown: long base64 runs are
+    /// withheld as binary first (they may be an image or a document), then
+    /// the text rules apply.
+    fn redact_loose_text(&self, text: &str) -> String {
+        let text = self
+            .base64_run
+            .replace_all(text, |c: &regex::Captures<'_>| {
+                binary_of_base64(
+                    "application/octet-stream",
+                    c.get(0).map_or("", |m| m.as_str()),
+                )
+                .placeholder()
+            });
+        self.redact_text(&text)
     }
 
     /// Redact a JSON value in place of its binary fields and text.
@@ -178,22 +217,25 @@ impl Redactor {
         }
     }
 
+    /// Redact an object's members, keys included (see the module
+    /// documentation). Binary shapes are recognized by the original keys.
     fn redact_object(
         &self,
         members: Vec<(String, Json)>,
         key: Option<&str>,
     ) -> Vec<(String, Json)> {
         let binary_data = binary_member(&members, key);
+        let mut names = HashSet::with_capacity(members.len());
         members
             .into_iter()
             .map(|(k, v)| {
-                if let (Some((field, media)), Json::String(s)) = (&binary_data, &v) {
-                    if k == *field {
-                        return (k, Json::String(binary_of_base64(media, s).placeholder()));
+                let value = match (&binary_data, &v) {
+                    (Some((field, media)), Json::String(s)) if k == *field => {
+                        Json::String(binary_of_base64(media, s).placeholder())
                     }
-                }
-                let v = self.redact_json(v, Some(&k));
-                (k, v)
+                    _ => self.redact_json(v, Some(&k)),
+                };
+                (unique_name(self.redact_text(&k), &mut names), value)
             })
             .collect()
     }
@@ -219,6 +261,41 @@ impl Redactor {
 
 fn is_container(doc: &Json) -> bool {
     matches!(doc, Json::Object(_) | Json::Array(_) | Json::String(_))
+}
+
+/// A member name not yet used in its object: `name`, or `name (2)`,
+/// `name (3)`, ... after it.
+fn unique_name(name: String, used: &mut HashSet<String>) -> String {
+    if used.insert(name.clone()) {
+        return name;
+    }
+    (2u64..)
+        .map(|n| format!("{name} ({n})"))
+        .find(|candidate| used.insert(candidate.clone()))
+        .expect("an unused name")
+}
+
+/// JSON that the strict parser refuses but a common one reads (a repeated
+/// key keeps its last value, nesting up to 128): what most consumers of
+/// the slot would see, so its binary fields can still be found.
+fn lenient(text: &str) -> Option<Json> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .map(from_serde)
+}
+
+fn from_serde(v: serde_json::Value) -> Json {
+    use serde_json::Value as V;
+    match v {
+        V::Null => Json::Null,
+        V::Bool(b) => Json::Bool(b),
+        V::Number(n) => {
+            json::Number::parse(&n.to_string()).map_or(Json::String(n.to_string()), Json::Number)
+        }
+        V::String(s) => Json::String(s),
+        V::Array(items) => Json::Array(items.into_iter().map(from_serde).collect()),
+        V::Object(map) => Json::Object(map.into_iter().map(|(k, v)| (k, from_serde(v))).collect()),
+    }
 }
 
 /// If this object is one of the known binary shapes, the member that holds
@@ -363,15 +440,58 @@ mod tests {
             Redacted::Binary(b) => assert_eq!(b.bytes, 3),
             other => panic!("{other:?}"),
         }
-        // Duplicate keys: not strict JSON, so the whole text is redacted.
+        // Duplicate keys: not strict JSON, read leniently and redacted.
         let out = text(redactor().redact_slot(br#"{"a":"x@y.example","a":"z@w.example"}"#));
         assert!(
             !out.contains("x@y.example") && !out.contains("z@w.example"),
             "{out}"
         );
+        // Not JSON at all: text rules, and long base64 runs withheld.
+        let blob = base64_encode(&[7u8; 300]);
+        let out =
+            text(redactor().redact_slot(format!("{{oops {blob} mail a@b.example").as_bytes()));
+        assert!(!out.contains(&blob), "{out}");
+        assert!(
+            out.contains("[binary media_type=application/octet-stream bytes=300"),
+            "{out}"
+        );
+        assert!(out.contains("[email]"), "{out}");
         // A JSON string slot is redacted inside.
         let out = text(redactor().redact_slot(br#""write to bob@example.org""#));
         assert!(out.contains("[email]"), "{out}");
+    }
+
+    #[test]
+    fn object_keys_are_redacted_and_stay_unique() {
+        let slot = br#"{"contacts":{"jane.doe@example.com":{"orders":3},"bob@example.org":1,"[email]":2},"cards":{"4111111111111111":"visa"},"plain":true}"#;
+        let out = text(redactor().redact_slot(slot));
+        for seed in ["jane.doe", "bob@example.org", "4111111111111111"] {
+            assert!(!out.contains(seed), "{out}");
+        }
+        let doc = pragmatic::json::parse(&out).expect("the view is strict JSON");
+        let contacts = doc.get("contacts").unwrap().as_object().unwrap();
+        let names: Vec<&str> = contacts.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, ["[email]", "[email] (2)", "[email] (3)"]);
+        assert!(out.contains(r#""plain":true"#));
+    }
+
+    #[test]
+    fn binary_fields_are_withheld_from_json_that_is_not_strict() {
+        let b64 = base64_encode(b"\x89PNG\r\n\x1a\n a photo of a passport");
+        let repeated = format!(
+            r#"{{"role":"user","role":"user","content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{b64}"}}}}]}}"#
+        );
+        let deep = format!(
+            "{}{{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"{b64}\"}}{}",
+            "[".repeat(70),
+            "]".repeat(70)
+        );
+        for slot in [repeated, deep] {
+            assert!(pragmatic::json::parse(&slot).is_err());
+            let out = text(redactor().redact_slot(slot.as_bytes()));
+            assert!(!out.contains(&b64), "{out}");
+            assert!(out.contains("[binary media_type=image/png"), "{out}");
+        }
     }
 
     #[test]

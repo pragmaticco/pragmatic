@@ -286,7 +286,7 @@ impl RedactionConfig {
 }
 
 /// Webhook event types (design 4.12).
-pub const WEBHOOK_EVENTS: [&str; 8] = [
+pub const WEBHOOK_EVENTS: [&str; 10] = [
     "chain_broken",
     "anchor_failed",
     "regressed",
@@ -295,6 +295,8 @@ pub const WEBHOOK_EVENTS: [&str; 8] = [
     "dangling_effect",
     "clock_skew",
     "record_missing",
+    "hold",
+    "access_log_failed",
 ];
 
 /// `[[webhooks]]`.

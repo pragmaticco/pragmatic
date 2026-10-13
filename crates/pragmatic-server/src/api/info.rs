@@ -48,8 +48,14 @@ pub async fn healthz() -> Response {
     json_response(StatusCode::OK, &json!({"status": "ok"}))
 }
 
-/// `GET /readyz`: the index is built.
+/// `GET /readyz`: the index is built and the access log can be written.
+/// A server whose access log failed refuses every authenticated request
+/// until a restart, so it is not ready: an orchestrator stops sending it
+/// traffic (and, with a liveness rule on readiness, restarts it).
 pub async fn readyz(State(app): State<AppState>) -> Response {
+    if app.access.is_failed() {
+        return ApiError::storage_unavailable("the access log cannot be written").into_response();
+    }
     if app.is_ready() {
         json_response(StatusCode::OK, &json!({"status": "ready"}))
     } else {

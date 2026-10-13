@@ -202,10 +202,10 @@ fn write_run(l: &layout::Layout, run: &str, index_key: &[u8]) {
         last_anchor_leaf: None,
         leases: vec![],
         holds: vec![],
-        open_intents: vec![],
         status: "idle".into(),
         created_by: None,
         regressed: false,
+        unanchored_since: None,
         summary: pragmatic_server::summary::Summary::rebuild(&j, index_key),
     };
     std::fs::write(l.meta(&stem), serde_json::to_vec(&meta).unwrap()).unwrap();

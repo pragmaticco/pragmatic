@@ -12,8 +12,9 @@ use serde_json::{json, Value as JsonValue};
 
 use super::middleware::{durable_intent, intent};
 use super::{
-    blocking, header_str, in_scope, json_response, need, noted, ok, parse_json, query_pairs,
-    query_u64, read_body, AccessNote, AppState, Caller, JSON_LIMIT, READERS,
+    blocking, check_declared, header_str, in_scope, json_response, need, noted, ok, parse_json,
+    query_pairs, query_u64, read_body, refuse_unread, AccessNote, AppState, Caller, JSON_LIMIT,
+    READERS,
 };
 use crate::error::ApiError;
 use crate::hooks::{BatchReason, EvidenceError, EvidenceRequest};
@@ -129,20 +130,19 @@ pub async fn entries(
         raw_read(&app, p, &id, "entries").await?;
     }
     let (a, run) = (app.clone(), id.clone());
-    let journal = blocking(move || a.store.snapshot(&run)).await?;
-    let len = journal.len();
-    let end = from.saturating_add(limit).min(len);
+    let page = blocking(move || a.store.entries_page(&run, from, limit)).await?;
     let opts = ViewOptions {
         raw: p.view_raw,
         redactor: &app.redactor,
         limit: Some(LIST_SLOT_LIMIT),
     };
-    let list: Vec<JsonValue> = (from.min(len)..end)
-        .filter_map(|cur| journal.get(cur))
-        .map(|e| views::entry_json(e, opts))
+    let list: Vec<JsonValue> = page
+        .entries
+        .iter()
+        .map(|e| views::read_entry_json(e, opts))
         .collect();
-    let next = (end < len).then_some(end);
-    let resp = ok(json!({ "entries": list, "next": next, "total": len }));
+    let end = from + list.len() as u64;
+    let resp = ok(json!({ "entries": list, "next": page.next, "total": page.total }));
     Ok(noted(
         resp,
         AccessNote {
@@ -168,13 +168,15 @@ pub async fn slot(
         raw_read(&app, p, &id, "slot").await?;
     }
     let (a, run) = (app.clone(), id.clone());
-    let journal = blocking(move || a.store.snapshot(&run)).await?;
-    let entry = journal.get(cursor).ok_or_else(ApiError::not_found)?;
+    let entry = blocking(move || a.store.entry(&run, cursor))
+        .await?
+        .ok_or_else(ApiError::not_found)?;
     let meta = entry
+        .entry
         .slots
         .get(k as usize)
         .ok_or_else(ApiError::not_found)?;
-    let content = entry.event.slot_contents()[k as usize];
+    let content = entry.contents()[k as usize];
     let opts = ViewOptions {
         raw: p.view_raw,
         redactor: &app.redactor,
@@ -224,15 +226,15 @@ pub async fn journal(
     raw_read(&app, &p, &id, "journal").await?;
     let (a, run) = (app.clone(), id.clone());
     let durable = blocking(move || a.store.open_durable(&run)).await?;
-    let (entries, head) = (durable.entries, durable.head.clone());
-    let mut resp = Response::new(super::stream::file_body(durable.file, durable.byte_len));
+    let (entries, head, byte_len) = (durable.entries, durable.head.clone(), durable.byte_len);
+    let mut resp = Response::new(super::stream::file_body(durable));
     let h = resp.headers_mut();
     h.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
     );
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    h.insert(header::CONTENT_LENGTH, HeaderValue::from(durable.byte_len));
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from(byte_len));
     h.insert("pragmatic-entries", HeaderValue::from(entries));
     if let Ok(v) = HeaderValue::from_str(&head) {
         h.insert("pragmatic-head", v);
@@ -280,7 +282,7 @@ pub async fn create(
             "the run id is outside this token's scopes",
         ));
     }
-    let bytes = read_body(&headers, body, 64).await?;
+    let bytes = read_body(&app, &headers, body, 64).await?;
     if bytes.as_ref() != journal::header(0).as_slice() {
         return Err(ApiError::bad_request(
             "the body must be the 16-byte journal header: PRAGJRNL, version 2, flags 0",
@@ -317,7 +319,7 @@ pub async fn lease(
     writable_id(&id)?;
     in_scope(&p, &id)?;
     let presented = header_str(&headers, "pragmatic-lease").map(str::to_string);
-    let req: LeaseBody = parse_json(&read_body(&headers, body, JSON_LIMIT).await?)?;
+    let req: LeaseBody = parse_json(&read_body(&app, &headers, body, JSON_LIMIT).await?)?;
     check_holder(&req.holder)?;
     let grant = blocking(move || {
         app.store
@@ -385,7 +387,21 @@ pub async fn frames(
         .filter(|h| crate::config::is_sha256_hex(h))
         .ok_or_else(|| ApiError::bad_request("Pragmatic-Head must be 64 lowercase hex digits"))?
         .to_string();
-    let body = read_body(&headers, body, app.config.max_request_bytes).await?;
+    let limit = app.config.max_request_bytes;
+    check_declared(&headers, limit)?;
+    // Everything that can refuse the request without its body does so
+    // before the body is read (design 4.6 order; append checks again).
+    let (a, run, who, l, h) = (
+        app.clone(),
+        id.clone(),
+        p.clone(),
+        lease.clone(),
+        head.clone(),
+    );
+    if let Err(e) = blocking(move || a.store.precheck_append(&who, &run, at, count, &h, &l)).await {
+        return Ok(refuse_unread(&app, body, limit, e));
+    }
+    let body = read_body(&app, &headers, body, limit).await?;
     let done = blocking(move || {
         app.store.append(
             &p,
@@ -461,6 +477,12 @@ pub async fn build_evidence(
     let a = app.clone();
     let run = id.clone();
     blocking(move || a.store.find(&run).map(|_| ())).await?;
+    if !app.hooks.evidence.integrated() {
+        // Answer before anchoring or reading the journal for nothing.
+        return Err(ApiError::not_implemented(
+            "evidence bundles are built by the evidence module, which is not part of this build",
+        ));
+    }
     if anchor_now {
         let a = app.clone();
         blocking(move || {
@@ -574,7 +596,7 @@ pub async fn erase(
     let id = path(id)?;
     let p = c.principal.clone();
     need(&p, &[Role::Admin])?;
-    let body: EraseBody = parse_json(&read_body(&headers, body, JSON_LIMIT).await?)?;
+    let body: EraseBody = parse_json(&read_body(&app, &headers, body, JSON_LIMIT).await?)?;
     let sel = selector(&body)?;
     check_reason_code(&body.reason_code)?;
     if body.reason.len() > 4096 {

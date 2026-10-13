@@ -8,20 +8,39 @@
 //! interleaves. Before changing anything it checks, in order: holds
 //! (`on_hold`), the retention minimum under `deny_during_min`
 //! (`retention_locked`), whether the last attempt ended ok (otherwise
-//! `allow_unfinished` is needed), and the lease (a live lease is
-//! `run_locked` unless `force`, which revokes it so the holder's next call
-//! gets `lease_lost`). Then:
+//! `allow_unfinished` is needed), the lease (a live lease is `run_locked`
+//! unless `force`, which revokes it so the holder's next call gets
+//! `lease_lost`), and, when a lease is to end, the selector itself (the
+//! core builds the erasure once and drops it): a refused erasure changes
+//! nothing, the lease included. Then:
 //!
 //! 1. the access-log record is made durable, and its cursor goes into the
 //!    erasure note (`access_log_cursor`);
-//! 2. the core builds and validates the erased file (design 2.13);
-//! 3. moved-aside torn tails of the run are removed (they may hold the
+//! 2. a lease still recorded is ended with its custody note, and
+//!    `meta.json` is written at once, so a crash cannot bring the lease
+//!    back after its custody note says it ended;
+//! 3. the core builds and validates the erased file (design 2.13);
+//! 4. the erasure ledger gets its record (fsynced) *before* anything is
+//!    committed: a restore re-applies the ledger, so an erasure must never
+//!    be committed without its record (a record whose erasure then fails to
+//!    commit is harmless: re-applying it erases what was asked);
+//! 5. moved-aside torn tails of the run are removed (they may hold the
 //!    same content);
-//! 4. the file is committed: temp file, fsync, rename, directory fsync;
-//! 5. the index and `meta.json` are updated at once, and the subjects
-//!    index entries go if `run.start`'s payload was erased;
-//! 6. the erasure ledger gets its record (fsynced), and the `erasure`
-//!    webhook fires.
+//! 6. the file is committed: temp file, fsync, rename, directory fsync,
+//!    and the file generation advances, so a download in flight stops;
+//! 7. the index and `meta.json` are updated (a `meta.json` that cannot be
+//!    written is left to the flusher: the journal is the record), and the
+//!    subjects index entries go if `run.start`'s payload was erased;
+//! 8. the `erasure` webhook fires.
+//!
+//! # Deletion
+//!
+//! A retention delete writes its ledger record, then the tombstone. Once
+//! the tombstone is durable the deletion has happened: the run leaves the
+//! run map (its tombstone joins the tombstones first, so a `PUT` in
+//! between cannot recreate it), and its files are removed. A file that
+//! cannot be removed is removed at the next start, which finishes every
+//! deletion a tombstone records; the run never takes another write.
 
 use std::fs::OpenOptions;
 
@@ -101,10 +120,11 @@ impl Store {
         let mut guard = run.lock();
         let st: &mut RunState = &mut guard;
         self.check_erasable(run_id, st, p, &cx)?;
-        let intent = cx
-            .access
-            .durable_blocking(cx.intent)
-            .map_err(|e| ApiError::storage_unavailable(e.0))?;
+        let selector = match &p.selector {
+            Selector::Slots(s) => EraseSelector::Slots(s.clone()),
+            Selector::Match(t) => EraseSelector::Match(t.as_bytes().to_vec()),
+            Selector::All => EraseSelector::All,
+        };
         let now = std::time::Instant::now();
         let ending = st.lease.as_ref().map(|l| {
             if l.expires > now {
@@ -113,51 +133,63 @@ impl Store {
                 EndReason::Expired
             }
         });
-        if let Some(reason) = ending {
-            self.end_lease(&run, st, reason)?;
-        }
-        let entries_before = st.meta.entries;
-        let journal = &self.writer(&run, st)?.journal;
-        let selector = match &p.selector {
-            Selector::Slots(s) => EraseSelector::Slots(s.clone()),
-            Selector::Match(t) => EraseSelector::Match(t.as_bytes().to_vec()),
-            Selector::All => EraseSelector::All,
-        };
-        let note = ErasureNote {
+        let mut note = ErasureNote {
             by: p.by.clone(),
             authenticated: true,
             reason_code: p.reason_code.clone(),
-            access_log_cursor: Some(intent),
+            access_log_cursor: None,
             reason: p.reason.clone(),
         };
-        let erasure = journal
+        if ending.is_some() {
+            // Ending the lease cannot be undone, so the selector is checked
+            // first: a refused erasure must leave the holder its lease.
+            self.writer(&run, st)?
+                .journal
+                .erase(&selector, &note, timefmt::now_unix_ns())
+                .map_err(|f| ApiError::bad_request(f.to_string()))?;
+        }
+        let intent = cx
+            .access
+            .durable_blocking(cx.intent)
+            .map_err(|e| ApiError::storage_unavailable(e.0))?;
+        if let Some(reason) = ending {
+            self.end_lease(&run, st, reason)?;
+            self.write_meta(&run, st)?;
+        }
+        let entries_before = st.meta.entries;
+        note.access_log_cursor = Some(intent);
+        let erasure = self
+            .writer(&run, st)?
+            .journal
             .erase(&selector, &note, timefmt::now_unix_ns())
             .map_err(|f| ApiError::bad_request(f.to_string()))?;
+        let record = cx
+            .ledger
+            .append(LedgerRecord {
+                seq: 0,
+                at: timefmt::now_rfc3339(),
+                kind: p.kind,
+                run_id: run_id.to_string(),
+                slots: erasure.slots.clone(),
+                reason_code: p.reason_code.clone(),
+                by: p.by.clone(),
+                access_log_cursor: Some(intent),
+                note_cursor: Some(erasure.note_cursor),
+                entries_before,
+                entries_after: erasure.journal.len(),
+                head_after: hex_encode(&erasure.journal.head()),
+                anchored_entries: st.meta.anchored_entries,
+                hold: None,
+            })
+            .map_err(|e| {
+                ApiError::storage_unavailable(format!(
+                    "the erasure ledger could not be written, so nothing was erased: {e}"
+                ))
+            })?;
         for torn in self.layout.torn_files(&run.stem)? {
             std::fs::remove_file(torn)?;
         }
         self.commit_rewrite(&run, st, &erasure.file, erasure.journal)?;
-        let record = cx.ledger.append(LedgerRecord {
-            seq: 0,
-            at: timefmt::now_rfc3339(),
-            kind: p.kind,
-            run_id: run_id.to_string(),
-            slots: erasure.slots.clone(),
-            reason_code: p.reason_code.clone(),
-            by: p.by.clone(),
-            access_log_cursor: Some(intent),
-            note_cursor: Some(erasure.note_cursor),
-            entries_before,
-            entries_after: st.meta.entries,
-            head_after: st.meta.head.clone(),
-            anchored_entries: st.meta.anchored_entries,
-        });
-        let record = record.map_err(|e| {
-            ApiError::storage_unavailable(format!(
-                "the slots were erased, but the erasure ledger could not be written: {e}"
-            ))
-            .with("erased", true)
-        })?;
         let event = if p.kind == LedgerKind::Shred {
             "retention"
         } else {
@@ -192,7 +224,9 @@ impl Store {
             return Err(ApiError::run_deleted());
         }
         if let Some(why) = &st.broken {
-            return Err(ApiError::chain_broken(why));
+            if !st.repairable {
+                return Err(ApiError::chain_broken(why));
+            }
         }
         if st.missing {
             return Err(ApiError::chain_broken("the journal is missing"));
@@ -229,8 +263,11 @@ impl Store {
     }
 
     /// Replace the journal file with `file` (which parses to `journal`):
-    /// temp, fsync, rename, directory fsync, reopen. Then update the index
-    /// and `meta.json` at once.
+    /// temp, fsync, rename, directory fsync, then advance the file
+    /// generation. Then update the index and `meta.json`. Once the rename
+    /// is durable the erasure has happened, so nothing after it fails the
+    /// call: a `meta.json` that cannot be written is left to the flusher,
+    /// and a journal that cannot be reopened is reopened on next use.
     fn commit_rewrite(
         &self,
         run: &super::Run,
@@ -241,25 +278,34 @@ impl Store {
         let path = self.layout.journal(&run.stem);
         st.writer = None;
         fsutil::write_atomic(&path, file)?;
-        let handle = OpenOptions::new().read(true).write(true).open(&path)?;
+        run.replaced();
+        self.forget_cached(&run.id);
         st.meta.entries = journal.len();
         st.meta.byte_len = journal.byte_len();
         st.meta.head = hex_encode(&journal.head());
         st.meta.summary = Summary::rebuild(&journal, &self.opts.index_key);
+        let report = journal.audit();
+        self.judge(&run.id, st, &report);
         st.verify = Some(VerifyCache {
-            report: journal.audit(),
+            report,
             entries: journal.len(),
             checked_at: timefmt::now_rfc3339(),
         });
-        st.writer = Some(Writer {
-            journal,
-            file: handle,
-        });
-        self.forget_cached(&run.id);
-        self.write_meta(run, st)
+        if let Ok(handle) = OpenOptions::new().read(true).write(true).open(&path) {
+            st.writer = Some(Writer {
+                journal,
+                file: handle,
+            });
+        }
+        if self.write_meta(run, st).is_err() {
+            self.mark_dirty(&run.id);
+        }
+        Ok(())
     }
 
-    /// Delete a run for retention: tombstone first, then the files.
+    /// Delete a run for retention (see the module documentation). Returns
+    /// the ledger record and, if some of the run's files could not be
+    /// removed yet, why (the next start removes them).
     pub fn delete_run(
         &self,
         run_id: &str,
@@ -268,7 +314,7 @@ impl Store {
         access: &AccessLog,
         ledger: &Ledger,
         intent: AccessRecord,
-    ) -> Result<LedgerRecord, ApiError> {
+    ) -> Result<(LedgerRecord, Option<String>), ApiError> {
         let run = self.find(run_id)?;
         let _file = run.file.write().unwrap_or_else(|e| e.into_inner());
         let mut guard = run.lock();
@@ -297,24 +343,6 @@ impl Store {
             head: st.meta.head.clone(),
             policy: policy_json,
         };
-        fsutil::write_json_atomic(&self.layout.tombstone(&run.stem), &tomb)?;
-        st.writer = None;
-        remove_if_exists(&self.layout.journal(&run.stem))?;
-        remove_if_exists(&self.layout.meta(&run.stem))?;
-        for torn in self.layout.torn_files(&run.stem)? {
-            remove_if_exists(&torn)?;
-        }
-        fsutil::fsync_dir(&self.layout.run_dir(&run.stem))?;
-        st.deleted = true;
-        st.lease = None;
-        self.runs.write().expect("runs lock").remove(run_id);
-        self.tombstones
-            .write()
-            .expect("tombstones lock")
-            .insert(run_id.to_string(), tomb.clone());
-        self.dirty.lock().expect("dirty lock").remove(run_id);
-        self.forget_cached(run_id);
-        self.signals.metrics.add_runs(-1);
         let record = ledger.append(LedgerRecord {
             seq: 0,
             at: tomb.deleted_at.clone(),
@@ -329,13 +357,46 @@ impl Store {
             entries_after: 0,
             head_after: tomb.head.clone(),
             anchored_entries: st.meta.anchored_entries,
+            hold: None,
         })?;
+        fsutil::write_json_atomic(&self.layout.tombstone(&run.stem), &tomb)?;
+        let leftover = self.forget_deleted(&run, st, tomb.clone()).err();
         self.webhook(
             "retention",
             run_id,
             json!({"action": "delete", "entries": tomb.entries, "ledger_seq": record.seq}),
         );
-        Ok(record)
+        Ok((record, leftover.map(|e| e.to_string())))
+    }
+
+    /// A run's tombstone is durable: the run is deleted. Take it out of
+    /// memory (its tombstone in first, so no `PUT` can slip in between)
+    /// and remove its files; any that cannot be removed now are removed at
+    /// the next start.
+    fn forget_deleted(
+        &self,
+        run: &super::Run,
+        st: &mut RunState,
+        tomb: Tombstone,
+    ) -> std::io::Result<()> {
+        st.writer = None;
+        st.deleted = true;
+        st.lease = None;
+        run.replaced();
+        self.tombstones
+            .write()
+            .expect("tombstones lock")
+            .insert(run.id.clone(), tomb);
+        self.runs.write().expect("runs lock").remove(&run.id);
+        self.dirty.lock().expect("dirty lock").remove(&run.id);
+        self.forget_cached(&run.id);
+        self.signals.metrics.add_runs(-1);
+        remove_if_exists(&self.layout.journal(&run.stem))?;
+        remove_if_exists(&self.layout.meta(&run.stem))?;
+        for torn in self.layout.torn_files(&run.stem)? {
+            remove_if_exists(&torn)?;
+        }
+        fsutil::fsync_dir(&self.layout.run_dir(&run.stem))
     }
 
     /// `accept-regression`: clear the flag, accepting the stored journal as
@@ -350,6 +411,7 @@ impl Store {
         let before = st.meta.anchored_entries;
         st.meta.regressed = false;
         st.meta.anchored_entries = st.meta.entries;
+        st.meta.unanchored_since = None;
         self.write_meta(&run, st)?;
         Ok((st.meta.entries, before))
     }
@@ -384,19 +446,38 @@ impl Store {
         tips
     }
 
-    /// Record where a batch put each run's leaf.
+    /// Record where a batch put each run's leaf. `meta.json` is written at
+    /// once: the leaf is already durable in the anchor log, and a meta that
+    /// forgot it would make the next batch anchor the run again with a
+    /// `prev_leaf` that skips it, a fork in the run's leaf chain. (The
+    /// flusher would write these within a second anyway; startup also
+    /// recovers last leaves from the anchor log, see
+    /// [`Store::apply_last_leaves`].)
     pub fn record_leaves(&self, leaves: &[LeafPlaced]) {
         for leaf in leaves {
             let Some(id) = &leaf.run_id else { continue };
             let Some(run) = self.get(id) else { continue };
             let mut guard = run.lock();
             let st: &mut RunState = &mut guard;
-            st.meta.last_anchor_leaf = Some(LeafRef {
-                index: leaf.leaf_index,
-                entries: leaf.entries,
-            });
-            let _ = self.save_meta(&run, st, false);
+            let newer = st
+                .meta
+                .last_anchor_leaf
+                .is_none_or(|l| l.index < leaf.leaf_index);
+            if newer {
+                st.meta.last_anchor_leaf = Some(LeafRef {
+                    index: leaf.leaf_index,
+                    entries: leaf.entries,
+                });
+                let _ = self.save_meta(&run, st, true);
+            }
         }
+    }
+
+    /// Raise each run's last leaf to what the anchor log holds (at
+    /// startup): the log is the durable record, and `meta.json` may lag it
+    /// by a crash.
+    pub fn apply_last_leaves(&self, leaves: &[LeafPlaced]) {
+        self.record_leaves(leaves);
     }
 
     /// Runs became independently anchored up to these lengths.
@@ -415,7 +496,10 @@ impl Store {
                         json!({"entries": st.meta.entries, "anchored_entries": entries}),
                     );
                 }
-                let _ = self.save_meta(&run, st, false);
+                if st.meta.anchored_entries >= st.meta.entries {
+                    st.meta.unanchored_since = None;
+                }
+                let _ = self.save_meta(&run, st, true);
             }
         }
     }
@@ -614,33 +698,35 @@ impl Store {
             policy: json!({"reapplied_from": "erasure-ledger"}),
         };
         fsutil::write_json_atomic(&self.layout.tombstone(&run.stem), &tomb)?;
-        st.writer = None;
-        remove_if_exists(&self.layout.journal(&run.stem))?;
-        remove_if_exists(&self.layout.meta(&run.stem))?;
-        for torn in self.layout.torn_files(&run.stem)? {
-            remove_if_exists(&torn)?;
-        }
-        fsutil::fsync_dir(&self.layout.run_dir(&run.stem))?;
-        st.deleted = true;
-        self.runs.write().expect("runs lock").remove(run_id);
-        self.tombstones
-            .write()
-            .expect("tombstones lock")
-            .insert(run_id.to_string(), tomb);
-        self.dirty.lock().expect("dirty lock").remove(run_id);
+        self.forget_deleted(&run, st, tomb)?;
         Ok(())
     }
 
-    /// Drop every lease (after a restore, leases from the backup mean
-    /// nothing).
-    pub fn clear_leases(&self) {
+    /// End every lease restored from a backup (they mean nothing now),
+    /// each with its custody note (design 4.5), so the entries written
+    /// under it stay attributed in the run. Returns how many ended and the
+    /// runs whose note could not be written (their lease is dropped all the
+    /// same).
+    pub fn end_restored_leases(&self) -> (usize, Vec<(String, String)>) {
+        let mut ended = 0;
+        let mut failed = Vec::new();
         for run in self.all() {
             let mut guard = run.lock();
             let st: &mut RunState = &mut guard;
-            if st.lease.take().is_some() {
-                let _ = self.write_meta(&run, st);
+            if st.lease.is_none() {
+                continue;
+            }
+            ended += 1;
+            if let Err(e) = self.end_lease(&run, st, EndReason::Restored) {
+                failed.push((run.id.clone(), e.message));
+                st.lease = None;
+            }
+            st.writer = None;
+            if let Err(e) = self.write_meta(&run, st) {
+                failed.push((run.id.clone(), e.message));
             }
         }
+        (ended, failed)
     }
 }
 

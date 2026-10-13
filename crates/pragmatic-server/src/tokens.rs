@@ -18,7 +18,16 @@
 //!
 //! Every token names a `principal` (who or what uses it). Every role except
 //! `admin` needs explicit `scopes`, a list of run-id prefixes; `["*"]` is
-//! all runs, and must be written out.
+//! all runs, and must be written out. An admin token covers every run (it
+//! manages tokens, holds and the whole access log, which no scope can
+//! narrow), so its scopes are `["*"]`: issuing one with narrower scopes is
+//! refused, and a stored admin record with narrower scopes (written by
+//! hand, or by an earlier build) never authenticates. Showing scopes that
+//! are not enforced would be worse than refusing them.
+//!
+//! Each issued token records the token id that issued it (`created_by`),
+//! and the issue's access-log intent, durable before the token exists,
+//! names the new token's id.
 
 use std::fmt;
 use std::io;
@@ -131,6 +140,17 @@ pub struct TokenRecord {
     pub expires_at: Option<String>,
     pub revoked_at: Option<String>,
     pub sha256: String,
+    /// The token id that issued this token.
+    #[serde(default)]
+    pub created_by: Option<String>,
+}
+
+impl TokenRecord {
+    /// An admin record whose scopes are not `["*"]` (see the module
+    /// documentation): never accepted.
+    fn narrowed_admin(&self) -> bool {
+        self.role == Role::Admin && self.scopes != ["*"]
+    }
 }
 
 /// The record as the API shows it: everything except the hash.
@@ -145,6 +165,7 @@ pub struct TokenView {
     pub created_at: String,
     pub expires_at: Option<String>,
     pub revoked_at: Option<String>,
+    pub created_by: Option<String>,
 }
 
 impl From<&TokenRecord> for TokenView {
@@ -159,6 +180,7 @@ impl From<&TokenRecord> for TokenView {
             created_at: r.created_at.clone(),
             expires_at: r.expires_at.clone(),
             revoked_at: r.revoked_at.clone(),
+            created_by: r.created_by.clone(),
         }
     }
 }
@@ -330,6 +352,11 @@ impl TokenStore {
         if r.revoked_at.is_some() {
             return Err(fail("token revoked"));
         }
+        if r.narrowed_admin() {
+            return Err(fail(
+                "admin tokens cover every run; this one names narrower scopes",
+            ));
+        }
         if let Some(exp) = &r.expires_at {
             if timefmt::parse_rfc3339(exp).is_none_or(|t| t <= now) {
                 return Err(fail("token expired"));
@@ -353,7 +380,7 @@ impl TokenStore {
         }
         let issued = self.issued.read().expect("token lock");
         let r = issued.iter().find(|r| r.id == id)?;
-        if r.revoked_at.is_some() {
+        if r.revoked_at.is_some() || r.narrowed_admin() {
             return None;
         }
         if let Some(exp) = &r.expires_at {
@@ -390,7 +417,14 @@ impl TokenStore {
             return invalid("scopes: \"*\" stands alone");
         }
         match req.role {
-            Role::Admin => {}
+            Role::Admin if req.scopes.is_empty() || req.scopes == ["*"] => {}
+            Role::Admin => {
+                return invalid(
+                    "admin tokens cover every run (tokens, holds and the whole access log \
+                     cannot be scoped); give no scopes, or [\"*\"], or issue an auditor or \
+                     agent token for narrower access",
+                )
+            }
             Role::WitnessClient => {
                 if req.scopes.len() != 1 || !self.witness_origins.contains(&req.scopes[0]) {
                     return invalid(
@@ -416,11 +450,19 @@ impl TokenStore {
         Ok(())
     }
 
-    /// Issue a token. Returns the token value (shown once) and its record.
-    pub fn issue(&self, req: IssueRequest, now: i64) -> Result<(String, TokenView), TokenError> {
+    /// Check an issue request and make the token: its value (shown once)
+    /// and its record, not yet stored. The server makes the record of the
+    /// issue durable, naming the new id, before [`add`](Self::add) stores
+    /// it.
+    pub fn prepare(
+        &self,
+        req: IssueRequest,
+        created_by: &str,
+        now: i64,
+    ) -> Result<(String, TokenRecord), TokenError> {
         self.check_issue(&req, now)?;
         let value = new_token_value().map_err(TokenError::Io)?;
-        let scopes = if req.role == Role::Admin && req.scopes.is_empty() {
+        let scopes = if req.role == Role::Admin {
             vec!["*".to_string()]
         } else {
             req.scopes
@@ -439,14 +481,32 @@ impl TokenStore {
                 .map(timefmt::rfc3339),
             revoked_at: None,
             sha256: token_sha256(&value),
+            created_by: Some(created_by.to_string()),
         };
+        Ok((value, record))
+    }
+
+    /// Store a prepared token; it authenticates once this returns.
+    pub fn add(&self, record: TokenRecord) -> Result<TokenView, TokenError> {
         let view = TokenView::from(&record);
         let mut issued = self.issued.write().expect("token lock");
         let mut next = issued.clone();
         next.push(record);
         self.save(&next).map_err(TokenError::Io)?;
         *issued = next;
-        Ok((value, view))
+        Ok(view)
+    }
+
+    /// Issue a token at once ([`prepare`](Self::prepare), then
+    /// [`add`](Self::add)). Returns the token value and its record.
+    pub fn issue(
+        &self,
+        req: IssueRequest,
+        created_by: &str,
+        now: i64,
+    ) -> Result<(String, TokenView), TokenError> {
+        let (value, record) = self.prepare(req, created_by, now)?;
+        Ok((value, self.add(record)?))
     }
 
     /// Revoke a token by id. Revoking twice is harmless.
@@ -492,7 +552,7 @@ impl TokenStore {
                 .read()
                 .expect("token lock")
                 .iter()
-                .filter(|r| r.revoked_at.is_none())
+                .filter(|r| r.revoked_at.is_none() && !r.narrowed_admin())
                 .map(|r| r.id.clone()),
         );
         ids
@@ -554,7 +614,9 @@ mod tests {
     fn issued_tokens_are_stored_by_hash_and_survive_reopen() {
         let d = TestDir::new("tok-issue");
         let s = store(&d, "a");
-        let (value, view) = s.issue(req(Role::Agent, &["team-a/"]), 100).unwrap();
+        let (value, view) = s
+            .issue(req(Role::Agent, &["team-a/"]), "tok_a", 100)
+            .unwrap();
         assert!(value.starts_with("prag_") && value.len() == 69);
         let text = std::fs::read_to_string(TokenStore::path(&d)).unwrap();
         assert!(!text.contains(&value));
@@ -570,18 +632,26 @@ mod tests {
     fn scopes_principals_and_roles_are_required() {
         let d = TestDir::new("tok-rules");
         let s = store(&d, "a");
-        assert!(s.issue(req(Role::Agent, &[]), 0).is_err());
-        assert!(s.issue(req(Role::Auditor, &[""]), 0).is_err());
-        assert!(s.issue(req(Role::Auditor, &["*", "x"]), 0).is_err());
-        assert!(s.issue(req(Role::WitnessClient, &["acme"]), 0).is_err());
+        assert!(s.issue(req(Role::Agent, &[]), "tok_a", 0).is_err());
+        assert!(s.issue(req(Role::Auditor, &[""]), "tok_a", 0).is_err());
+        assert!(s
+            .issue(req(Role::Auditor, &["*", "x"]), "tok_a", 0)
+            .is_err());
+        assert!(s
+            .issue(req(Role::WitnessClient, &["acme"]), "tok_a", 0)
+            .is_err());
         let mut r = req(Role::Agent, &["*"]);
         r.principal = String::new();
-        assert!(s.issue(r, 0).is_err());
-        let (_, admin) = s.issue(req(Role::Admin, &[]), 0).unwrap();
+        assert!(s.issue(r, "tok_a", 0).is_err());
+        let (_, admin) = s.issue(req(Role::Admin, &[]), "tok_a", 0).unwrap();
         assert_eq!(admin.scopes, vec!["*"]);
+        assert_eq!(admin.created_by.as_deref(), Some("tok_a"));
+        // An admin token covers every run: narrower scopes are refused.
+        assert!(s.issue(req(Role::Admin, &["team-a:"]), "tok_a", 0).is_err());
+        assert!(s.issue(req(Role::Admin, &["*"]), "tok_a", 0).is_ok());
         let mut r = req(Role::Agent, &["*"]);
         r.expires_at = Some("1970-01-01T00:00:00Z".into());
-        assert!(s.issue(r, 10).is_err());
+        assert!(s.issue(r, "tok_a", 10).is_err());
     }
 
     #[test]
@@ -590,13 +660,13 @@ mod tests {
         let s = store(&d, "a");
         let mut r = req(Role::Auditor, &["*"]);
         r.expires_at = Some(timefmt::rfc3339(1000));
-        let (v1, t1) = s.issue(r, 0).unwrap();
+        let (v1, t1) = s.issue(r, "tok_a", 0).unwrap();
         assert!(s.authenticate(&v1, 999).is_ok());
         assert_eq!(
             s.authenticate(&v1, 1000).unwrap_err().reason,
             "token expired"
         );
-        let (v2, t2) = s.issue(req(Role::Agent, &["x"]), 0).unwrap();
+        let (v2, t2) = s.issue(req(Role::Agent, &["x"]), "tok_a", 0).unwrap();
         s.revoke(&t2.id, 5).unwrap();
         assert_eq!(s.authenticate(&v2, 6).unwrap_err().reason, "token revoked");
         assert!(matches!(s.revoke("tok_nope", 0), Err(TokenError::NotFound)));
@@ -624,9 +694,32 @@ mod tests {
         assert_eq!(p.role, Role::WitnessClient);
         assert_eq!(p.scopes, vec!["example.com/log"]);
         let (_, t) = s
-            .issue(req(Role::WitnessClient, &["example.com/log"]), 0)
+            .issue(req(Role::WitnessClient, &["example.com/log"]), "tok_a", 0)
             .unwrap();
         assert_eq!(t.role, Role::WitnessClient);
+    }
+
+    #[test]
+    fn stored_admin_records_with_narrow_scopes_never_authenticate() {
+        let d = TestDir::new("tok-narrow");
+        let s = store(&d, "a");
+        let (value, view) = s.issue(req(Role::Admin, &[]), "tok_a", 0).unwrap();
+        assert!(s.authenticate(&value, 1).is_ok());
+        // A record written by hand (or by an earlier build) with narrower
+        // scopes: shown, but never accepted.
+        let path = TokenStore::path(&d);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace("\"*\"", "\"team-a:\"")).unwrap();
+        let s = store(&d, "a");
+        let f = s.authenticate(&value, 1).unwrap_err();
+        assert!(
+            f.reason.contains("admin tokens cover every run"),
+            "{}",
+            f.reason
+        );
+        assert!(s.principal_by_id(&view.id, 1).is_none());
+        assert!(!s.ids().contains(&view.id));
+        assert_eq!(s.list()[0].scopes, vec!["team-a:"]);
     }
 
     #[test]

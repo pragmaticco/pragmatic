@@ -16,15 +16,6 @@ use pragmatic::{Content, Entry, Event, Journal, SlotState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-/// An intent that has no result yet.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OpenIntent {
-    pub cursor: u64,
-    /// `draw` or `effect`.
-    pub kind: String,
-}
-
 /// The program that last drove the run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -50,7 +41,13 @@ pub struct Summary {
     /// Slots that still hold their own content (refs not counted): zero
     /// once a run is shredded.
     pub sealed_slots: u64,
-    pub open_intents: Vec<OpenIntent>,
+    /// Intents that have no result yet, by cursor: `draw` or `effect`. A
+    /// map, so closing one costs a lookup however many are open (a run can
+    /// hold millions, and results are folded under the run's lock on the
+    /// append path).
+    pub open_intents: BTreeMap<u64, String>,
+    /// How many of `open_intents` are effects (design 4.5: dangling).
+    pub open_effects: u64,
     /// HMAC-SHA-256 (hex) of each subject in `run.start`'s payload, under
     /// the server's index key.
     pub subjects: Vec<String>,
@@ -111,19 +108,20 @@ impl Summary {
     }
 
     fn open(&mut self, cursor: u64, kind: &str) {
-        self.open_intents.push(OpenIntent {
-            cursor,
-            kind: kind.into(),
-        });
+        if self.open_intents.insert(cursor, kind.into()).is_none() && kind == "effect" {
+            self.open_effects += 1;
+        }
     }
 
     fn close(&mut self, intent: u64) {
-        self.open_intents.retain(|o| o.cursor != intent);
+        if self.open_intents.remove(&intent).as_deref() == Some("effect") {
+            self.open_effects -= 1;
+        }
     }
 
     /// True if an effect has no result.
     pub fn has_open_effect(&self) -> bool {
-        self.open_intents.iter().any(|o| o.kind == "effect")
+        self.open_effects > 0
     }
 
     /// True if the last attempt ended ok and none has started since.
@@ -323,6 +321,55 @@ mod tests {
         assert_eq!(incremental, Summary::rebuild(&j, key));
         assert!(incremental.finished_ok());
         assert!(incremental.open_intents.is_empty());
+        assert!(!incremental.has_open_effect());
+        // The map serializes once, keyed by cursor.
+        let text = serde_json::to_string(&s).unwrap();
+        assert!(text.contains(r#""open_intents":{"4":"effect"}"#), "{text}");
+        assert_eq!(serde_json::from_str::<Summary>(&text).unwrap(), s);
+    }
+
+    /// Closing intents costs a lookup, not a scan of every open intent:
+    /// folding n intents and then their n results grows linearly.
+    #[test]
+    fn closing_open_intents_is_linear() {
+        fn fold(n: u64) -> std::time::Duration {
+            let mut j = Journal::new(None);
+            j.append(META, note("run.start", r#"{"run_id":"q"}"#, vec![]))
+                .unwrap();
+            let intents: Vec<u64> = (0..n)
+                .map(|i| {
+                    j.append(
+                        ROOT,
+                        Event::DrawIntent {
+                            provenance: "p".into(),
+                            parts: vec![Content::from(format!("{i}"))],
+                        },
+                    )
+                    .unwrap()
+                })
+                .collect();
+            for c in intents {
+                j.append(
+                    ROOT,
+                    Event::DrawResult {
+                        intent: c,
+                        meta: "{}".into(),
+                        head: Content::from("h"),
+                        body: Content::from("b"),
+                    },
+                )
+                .unwrap();
+            }
+            let t = std::time::Instant::now();
+            let s = Summary::rebuild(&j, b"k");
+            let took = t.elapsed();
+            assert!(s.open_intents.is_empty());
+            took
+        }
+        let small = fold(4_000);
+        let large = fold(16_000);
+        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-9);
+        assert!(ratio < 8.0, "4x the intents took {ratio:.1}x as long");
     }
 
     #[test]

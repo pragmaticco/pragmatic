@@ -38,12 +38,32 @@ use crate::tokens::Principal;
 /// The longest user agent kept.
 const MAX_USER_AGENT: usize = 256;
 
+/// The most query parameter names a record keeps (each cut to 64
+/// characters); the rest are counted.
+const MAX_QUERY_NAMES: usize = 32;
+
+/// The longest method kept (HTTP allows extension methods of any length).
+const MAX_METHOD: usize = 32;
+
+/// The run id a request names, as its record holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathRun {
+    /// A well-formed run id (design 2.15), or the id of a run the server
+    /// holds (its own records may use longer ids).
+    Valid(String),
+    /// Anything else, which can be as long as the URI: kept as its length
+    /// and SHA-256 only, so a request cannot put arbitrary bytes into the
+    /// log.
+    Invalid { bytes: usize, sha256: String },
+}
+
 /// What the middleware knows about a request before the handler runs.
 struct Context {
     method: String,
     route: String,
-    run_id: Option<String>,
+    run: Option<PathRun>,
     query: Vec<String>,
+    query_dropped: usize,
     source_ip: String,
     user_agent: String,
 }
@@ -54,7 +74,7 @@ impl Context {
             .extensions()
             .get::<ConnectInfo<SocketAddr>>()
             .map(|c| c.0);
-        let query = req
+        let mut query: Vec<String> = req
             .uri()
             .query()
             .map(|q| {
@@ -63,11 +83,16 @@ impl Context {
                     .collect()
             })
             .unwrap_or_default();
+        let query_dropped = query.len().saturating_sub(MAX_QUERY_NAMES);
+        query.truncate(MAX_QUERY_NAMES);
+        let run = run_id_from_path(&route, req.uri().path())
+            .map(|id| checked_run_id(id, |id| app.store.get(id).is_some()));
         Context {
-            method: req.method().as_str().to_string(),
-            run_id: run_id_from_path(&route, req.uri().path()),
+            method: req.method().as_str().chars().take(MAX_METHOD).collect(),
+            run,
             route,
             query,
+            query_dropped,
             source_ip: source_ip(app, req.headers(), peer),
             user_agent: req
                 .headers()
@@ -96,6 +121,24 @@ fn source_ip(app: &App, headers: &HeaderMap, peer: Option<SocketAddr>) -> String
         }
     }
     peer.map(|p| p.ip().to_string()).unwrap_or_default()
+}
+
+/// Keep a run id from a path only when it is well formed or names a run
+/// the server holds; otherwise only its length and hash.
+fn checked_run_id(id: String, exists: impl Fn(&str) -> bool) -> PathRun {
+    let well_formed = !id.is_empty()
+        && id.len() <= pragmatic::journal::MAX_RUN_ID_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'));
+    if well_formed || exists(&id) {
+        PathRun::Valid(id)
+    } else {
+        PathRun::Invalid {
+            bytes: id.len(),
+            sha256: pragmatic::encoding::hex_encode(&pragmatic::sha256::sha256(id.as_bytes())),
+        }
+    }
 }
 
 /// The run id in a run route's path, percent-decoded.
@@ -277,19 +320,29 @@ fn record(
         .unwrap_or_default();
     let who = note.principal.as_ref().or(principal);
     let error = resp.extensions().get::<ErrorNote>();
+    let run_id = match &cx.run {
+        Some(PathRun::Valid(id)) => Some(id.clone()),
+        _ => None,
+    };
     let mut data = json!({
         "token_id": who.map(|p| p.token_id.clone()),
         "token_fp": fp,
         "role": who.map(|p| p.role.as_str()),
         "method": cx.method,
         "route": cx.route,
-        "run_id": cx.run_id,
+        "run_id": run_id,
         "status": resp.status().as_u16(),
         "raw": note.raw,
         "cursor_from": note.cursor_from,
         "cursor_to": note.cursor_to,
         "query": cx.query,
     });
+    if let Some(PathRun::Invalid { bytes, sha256 }) = &cx.run {
+        data["invalid_run_id"] = json!({ "bytes": bytes, "sha256": sha256 });
+    }
+    if cx.query_dropped > 0 {
+        data["query_dropped"] = cx.query_dropped.into();
+    }
     if let Some(e) = error {
         data["error"] = e.code.into();
         if let Some(r) = &e.reason {
@@ -393,6 +446,33 @@ mod tests {
         assert_eq!(
             run_id_from_path("/console/runs/{id}", "/console/runs/r1").as_deref(),
             Some("r1")
+        );
+    }
+
+    #[test]
+    fn only_well_formed_or_existing_run_ids_are_kept() {
+        let none = |_: &str| false;
+        assert_eq!(
+            checked_run_id("team-a:run.1_x".into(), none),
+            PathRun::Valid("team-a:run.1_x".into())
+        );
+        let long = "a".repeat(60_000);
+        match checked_run_id(long.clone(), none) {
+            PathRun::Invalid { bytes, sha256 } => {
+                assert_eq!(bytes, 60_000);
+                assert_eq!(sha256.len(), 64);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            checked_run_id("a/b".into(), none),
+            PathRun::Invalid { .. }
+        ));
+        // The server's own records may use ids outside the client rules.
+        assert_eq!(
+            checked_run_id("pragmatic:witness:example.com/log".into(), |id| id
+                .starts_with("pragmatic:witness:")),
+            PathRun::Valid("pragmatic:witness:example.com/log".into())
         );
     }
 

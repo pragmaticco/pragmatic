@@ -18,23 +18,6 @@ async fn erase(ts: &TestServer, run: &str, body: Value) -> (StatusCode, Value) {
     (status, resp.json().await.unwrap_or(Value::Null))
 }
 
-/// A finished run with its lease released.
-async fn finished(ts: &TestServer, token: &str, run: &str, messages: &[&str]) -> Writer {
-    let mut w = Writer::create(ts, token, run).await;
-    w.add(note("attempt.start", json!({"attempt": 1}), vec![]));
-    for m in messages {
-        w.add(recv(m));
-    }
-    w.add(note(
-        "attempt.end",
-        json!({"attempt": 1, "outcome": "ok"}),
-        vec![],
-    ));
-    assert_eq!(w.push(ts).await.status(), StatusCode::OK);
-    assert_eq!(w.release(ts).await.status(), StatusCode::NO_CONTENT);
-    w
-}
-
 fn erasure_notes(ts: &TestServer, run: &str) -> Vec<Value> {
     stored(ts, run)
         .entries()
@@ -393,7 +376,9 @@ async fn retention_shreds_deletes_and_skips_held_and_leased_runs() {
     let ledger =
         pragmatic_server::ledger::read(&ts.data_dir().join("erasure-ledger.jsonl")).unwrap();
     let kinds: Vec<String> = ledger.iter().map(|r| format!("{:?}", r.kind)).collect();
-    assert_eq!(kinds, ["Delete", "Shred"], "runs are visited in id order");
+    // The hold placed earlier is a ledger record too (a restore places it
+    // again); retention visits runs in id order.
+    assert_eq!(kinds, ["HoldAdd", "Delete", "Shred"]);
     drop(busy);
 }
 
@@ -471,4 +456,326 @@ async fn the_subjects_index_finds_runs_until_the_subjects_are_erased() {
         .unwrap();
     assert_eq!(v["run_ids"], json!([]));
     let _ = ROOT;
+}
+
+/// A forced erasure that is refused (here: a cursor that does not exist)
+/// changes nothing: the holder keeps its lease and no custody note is
+/// written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_forced_erasure_leaves_the_lease_alone() {
+    let ts = TestServer::start(|c| c.lease_ttl_secs = 60).await;
+    let (agent, _) = ts.issue("agent", &["*"], false).await;
+    let mut w = Writer::create(&ts, &agent, "r").await;
+    w.attempt(&ts, 2).await;
+    let before = note_kinds(&stored(&ts, "r"));
+    let (status, v) = erase(
+        &ts,
+        "r",
+        json!({"slots": [[999, 0]], "reason_code": "dsar", "force": true}),
+    )
+    .await;
+    assert_eq!(
+        (status, v["error"]["code"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("bad_request"))
+    );
+    assert_eq!(note_kinds(&stored(&ts, "r")), before);
+    w.add(recv("the agent carries on"));
+    assert_eq!(w.push(&ts).await.status(), StatusCode::OK);
+    // A forced erasure that can proceed revokes the lease, and meta.json
+    // says so at once.
+    let (status, _) = erase(
+        &ts,
+        "r",
+        json!({"slots": [[2, 0]], "reason_code": "dsar", "force": true, "allow_unfinished": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let meta: Value = serde_json::from_slice(
+        &std::fs::read(run_file_in(&ts.data_dir(), "r", ".meta.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta["leases"], json!([]));
+}
+
+/// An erasure never waits for a download, and a download in flight never
+/// serves bytes read after an erasure committed: it is aborted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_erasure_aborts_a_download_in_flight() {
+    let ts = TestServer::start(|c| c.lease_ttl_secs = 60).await;
+    let (agent, _) = ts.issue("agent", &["*"], false).await;
+    let mut w = Writer::create(&ts, &agent, "big").await;
+    w.add(note("attempt.start", json!({"attempt": 1}), vec![]));
+    for i in 0..24 {
+        w.add(recv(&format!("{i:04}{}", "x".repeat(1 << 20))));
+    }
+    w.add(recv("SECRET-PERSONAL-DATA-0123456789"));
+    w.add(note(
+        "attempt.end",
+        json!({"attempt": 1, "outcome": "ok"}),
+        vec![],
+    ));
+    assert_eq!(w.push(&ts).await.status(), StatusCode::OK);
+    assert_eq!(w.release(&ts).await.status(), StatusCode::NO_CONTENT);
+    let mut download = ts.get(&run_path("big", "/journal"), &ts.admin).await;
+    assert_eq!(download.status(), StatusCode::OK);
+    let total = download.content_length().unwrap();
+    let mut got = download.chunk().await.unwrap().unwrap().to_vec();
+    let erased = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        erase(
+            &ts,
+            "big",
+            json!({"match": "SECRET-PERSONAL-DATA", "reason_code": "dsar"}),
+        ),
+    )
+    .await
+    .expect("the erasure does not wait for the download");
+    assert_eq!(erased.0, StatusCode::OK);
+    let mut aborted = false;
+    loop {
+        match download.chunk().await {
+            Ok(Some(c)) => got.extend_from_slice(&c),
+            Ok(None) => break,
+            Err(_) => {
+                aborted = true;
+                break;
+            }
+        }
+    }
+    let served_secret = got
+        .windows(b"SECRET-PERSONAL-DATA".len())
+        .any(|x| x == b"SECRET-PERSONAL-DATA");
+    assert!(!served_secret, "the download served erased content");
+    assert!(
+        aborted && (got.len() as u64) < total,
+        "the download was not aborted"
+    );
+    // A download that starts afterwards serves the erased journal whole.
+    let after = ts
+        .get(&run_path("big", "/journal"), &ts.admin)
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    assert!(pragmatic::Journal::parse(&after, None).is_ok());
+}
+
+/// Content erased without an erasure note (someone with disk access) is
+/// the tampering erasure accounting exists to catch: the run is damaged
+/// (writes refused, `chain_broken` webhook and metric), and verify-data
+/// names it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn content_erased_without_a_note_is_damage_that_is_reported_and_named() {
+    let (url, got) = webhook_receiver().await;
+    let secrets = TempDir::new("erasure-hook");
+    let hook = webhook(&secrets, &url, &["chain_broken"]);
+    let mut ts = TestServer::start(move |c| c.webhooks.push(hook)).await;
+    let (agent, _) = ts.issue("agent", &["*"], false).await;
+    finished(&ts, &agent, "quiet", &["message 0", "message 1"]).await;
+    ts.stop().await;
+    let path = run_file_in(&ts.data_dir(), "quiet", ".journal");
+    let j = pragmatic::Journal::parse(&std::fs::read(&path).unwrap(), None)
+        .unwrap()
+        .journal;
+    let e = j
+        .erase(
+            &pragmatic::journal::EraseSelector::Slots(vec![(2, 0)]),
+            &pragmatic::journal::ErasureNote::local("x", ""),
+            1,
+        )
+        .unwrap();
+    let frames =
+        pragmatic::journal::split_frames(&e.file[pragmatic::journal::HEADER_LEN..]).unwrap();
+    let keep: usize = pragmatic::journal::HEADER_LEN
+        + frames[..frames.len() - 1]
+            .iter()
+            .map(|f| f.len())
+            .sum::<usize>();
+    std::fs::write(&path, &e.file[..keep]).unwrap();
+    let ts = ts.restart().await;
+    let report: Value = ts
+        .post_json("/v1/verify-data", &ts.admin, json!({}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(report["failing_run_ids"], json!(["quiet"]), "{report}");
+    let summary: Value = ts
+        .get(&run_path("quiet", ""), &ts.admin)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(summary["verify"]["unaccounted_erasures"], json!([[2, 0]]));
+    assert_eq!(
+        metric(&metrics(&ts).await, "pragmatic_chain_broken_total"),
+        Some(1.0)
+    );
+    let event = got.wait_for("chain_broken").await.expect("a webhook");
+    assert_eq!(event["run_id"], "quiet");
+    let resp = ts
+        .post_json(&run_path("quiet", "/lease"), &agent, json!({"holder": "h"}))
+        .await;
+    assert_eq!(
+        code(resp).await,
+        (StatusCode::CONFLICT, "chain_broken".into())
+    );
+}
+
+/// Slots an erasure note lists that hold content again (a file restored
+/// from somewhere else) are damage too, but erasing again repairs it, so
+/// erasure stays allowed and clears the damage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_incomplete_erasure_is_reported_and_repaired_by_erasing_again() {
+    let mut ts = TestServer::start(|_| {}).await;
+    let (agent, _) = ts.issue("agent", &["*"], false).await;
+    finished(&ts, &agent, "r", &["message 0", "message 1"]).await;
+    let original = std::fs::read(run_file_in(&ts.data_dir(), "r", ".journal")).unwrap();
+    let (status, _) = erase(&ts, "r", json!({"slots": [[2, 0]], "reason_code": "dsar"})).await;
+    assert_eq!(status, StatusCode::OK);
+    ts.stop().await;
+    // Put the sealed frame of cursor 2 back: same chain hash, content back.
+    let path = run_file_in(&ts.data_dir(), "r", ".journal");
+    let erased = std::fs::read(&path).unwrap();
+    let h = pragmatic::journal::HEADER_LEN;
+    let old = pragmatic::journal::split_frames(&original[h..]).unwrap();
+    let new = pragmatic::journal::split_frames(&erased[h..]).unwrap();
+    let mut file = erased[..h].to_vec();
+    for (i, f) in new.iter().enumerate() {
+        file.extend_from_slice(if i == 2 { old[2] } else { f });
+    }
+    std::fs::write(&path, &file).unwrap();
+    let ts = ts.restart().await;
+    let report: Value = ts
+        .post_json("/v1/verify-data", &ts.admin, json!({}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(report["failing_run_ids"], json!(["r"]), "{report}");
+    let resp = ts
+        .post_json(&run_path("r", "/lease"), &agent, json!({"holder": "h"}))
+        .await;
+    assert_eq!(code(resp).await.1, "chain_broken");
+    let (status, _) = erase(
+        &ts,
+        "r",
+        json!({"slots": [[2, 0]], "reason_code": "repair"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let summary: Value = ts
+        .get(&run_path("r", ""), &ts.admin)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(summary["verify"]["ok"], true, "{summary}");
+    let resp = ts
+        .post_json(&run_path("r", "/lease"), &agent, json!({"holder": "h"}))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// A retention delete whose files cannot be removed is still a deletion:
+/// once the tombstone is durable the run takes no more writes, and the
+/// next start removes what is left. (macOS: the user-immutable flag makes
+/// the unlink fail.)
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_whose_files_cannot_be_removed_still_deletes_the_run() {
+    let ts = TestServer::start(|c| {
+        c.lease_ttl_secs = 60;
+        c.retention.push(policy("old", 0, 0, 1, false));
+    })
+    .await;
+    let (agent, _) = ts.issue("agent", &["*"], false).await;
+    let w = finished(&ts, &agent, "old", &["kept"]).await;
+    age(&ts, "old", 2.0);
+    let path = run_file_in(&ts.data_dir(), "old", ".journal");
+    let flag = |f: &str| {
+        assert!(std::process::Command::new("chflags")
+            .arg(f)
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success())
+    };
+    flag("uchg");
+    let rep: Value = ts
+        .post_json("/v1/retention/run", &ts.admin, json!({}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    flag("nouchg");
+    assert_eq!(rep["deleted"], json!(["old"]), "{rep}");
+    assert_eq!(rep["errors"][0]["run_id"], "old");
+    // Deleted: no lease, no append.
+    let resp = ts
+        .post_json(&run_path("old", "/lease"), &agent, json!({"holder": "h2"}))
+        .await;
+    assert_eq!(code(resp).await, (StatusCode::GONE, "run_deleted".into()));
+    let resp = send_frames(
+        &ts,
+        &agent,
+        "old",
+        &w.lease,
+        7,
+        1,
+        &"0".repeat(64),
+        vec![0; 40],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::GONE);
+    assert!(path.exists(), "the journal could not be removed yet");
+    let ts = ts.restart().await;
+    assert!(!path.exists(), "the next start removed it");
+    assert_eq!(
+        ts.get(&run_path("old", ""), &ts.admin).await.status(),
+        StatusCode::GONE
+    );
+}
+
+/// The ledger record is written before the erasure commits, so no
+/// committed erasure lacks one: here the commit fails (the run's directory
+/// refuses new files) after the record is durable, nothing is erased, and
+/// the record only asks again for what the admin asked.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_ledger_record_is_written_before_the_erasure_commits() {
+    use std::os::unix::fs::PermissionsExt;
+    let ts = TestServer::start(|_| {}).await;
+    let (agent, _) = ts.issue("agent", &["*"], false).await;
+    finished(&ts, &agent, "r", &["message 0"]).await;
+    let journal = run_file_in(&ts.data_dir(), "r", ".journal");
+    let dir = journal.parent().unwrap().to_path_buf();
+    let before = std::fs::read(&journal).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let probe = dir.join("probe");
+    if std::fs::write(&probe, b"x").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipped: permissions do not bind for this user");
+        return;
+    }
+    let (status, _) = erase(&ts, "r", json!({"slots": [[2, 0]], "reason_code": "dsar"})).await;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        std::fs::read(&journal).unwrap(),
+        before,
+        "nothing was erased"
+    );
+    let ledger =
+        pragmatic_server::ledger::read(&ts.data_dir().join("erasure-ledger.jsonl")).unwrap();
+    assert_eq!(ledger.len(), 1);
+    assert_eq!(ledger[0].slots, vec![(2, 0)]);
+    // The admin's retry erases.
+    let (status, _) = erase(&ts, "r", json!({"slots": [[2, 0]], "reason_code": "dsar"})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        stored(&ts, "r").get(2).unwrap().slots[0].state,
+        SlotState::Erased
+    );
 }

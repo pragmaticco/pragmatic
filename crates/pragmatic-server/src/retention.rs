@@ -24,10 +24,9 @@
 //! The result is an access-log record.
 
 use pragmatic::journal::RESERVED_RUN_ID_PREFIX;
-use pragmatic::Journal;
 use serde_json::{json, Value as JsonValue};
 
-use crate::access_log::{self, AccessRecord};
+use crate::access_log::AccessRecord;
 use crate::error::ApiError;
 use crate::ledger::LedgerKind;
 use crate::policy::{self, Action};
@@ -94,6 +93,14 @@ pub fn run(app: &App) -> JsonValue {
         match result {
             Ok(()) if action == Action::Shred => report.shredded.push(run_id),
             Ok(()) => report.deleted.push(run_id),
+            // Deleted (its tombstone is durable), but some files are left
+            // for the next start to remove.
+            Err(e) if e.code == "deleted_files_left" => {
+                report.errors.push(
+                    json!({"run_id": run_id, "code": "storage_unavailable", "message": e.message}),
+                );
+                report.deleted.push(run_id);
+            }
             Err(e) if e.code == "on_hold" => report.skipped_held.push(run_id),
             Err(e) if e.code == "run_locked" => report.skipped_leased.push(run_id),
             Err(e) => report
@@ -144,30 +151,42 @@ fn shred(app: &App, run_id: &str) -> Result<(), ApiError> {
 }
 
 fn delete(app: &App, run_id: &str, policy_json: JsonValue) -> Result<(), ApiError> {
-    app.store
-        .delete_run(
-            run_id,
-            policy_json,
-            &app.holds,
-            &app.access,
-            &app.ledger,
-            intent("delete", run_id),
-        )
-        .map(|_| ())
+    let (_, leftover) = app.store.delete_run(
+        run_id,
+        policy_json,
+        &app.holds,
+        &app.access,
+        &app.ledger,
+        intent("delete", run_id),
+    )?;
+    match leftover {
+        None => Ok(()),
+        Some(why) => Err(ApiError::new(
+            503,
+            "deleted_files_left",
+            format!("the run is deleted; its files are removed at the next start: {why}"),
+        )),
+    }
 }
 
 /// Verify every run, the access log and the anchor proofs, and record the
-/// result in the access log. Returns the result.
+/// result in the access log. Returns the result. Every run whose report is
+/// not ok (a broken chain, or erasure accounting that does not add up) is
+/// named in `failing_run_ids` (the record holds at most
+/// [`RECORD_LIST_LIMIT`](crate::ops::RECORD_LIST_LIMIT) and counts the
+/// rest).
 pub fn verify_data(app: &App) -> JsonValue {
     let (checked, failing) = app.store.verify_all();
-    let failing_runs: Vec<String> = app
-        .store
-        .all()
-        .iter()
-        .filter(|r| r.lock().broken.is_some())
-        .map(|r| r.id.clone())
-        .collect();
-    let access_log = verify_access_log(app);
+    let (failing_runs, dropped) = crate::ops::capped(app.store.failing_run_ids());
+    let mut access_log = verify_access_log(app);
+    access_log["anchored"] = match app.access_log_matches_leaf() {
+        None => JsonValue::Null,
+        Some(Ok(())) => json!({"ok": true}),
+        Some(Err(why)) => {
+            access_log["ok"] = false.into();
+            json!({"ok": false, "error": why})
+        }
+    };
     let anchors = app
         .hooks
         .anchoring
@@ -177,6 +196,7 @@ pub fn verify_data(app: &App) -> JsonValue {
         "runs_checked": checked,
         "runs_failing": failing,
         "failing_run_ids": failing_runs,
+        "failing_run_ids_dropped": dropped,
         "access_log": access_log,
         "anchors": anchors,
         "at": timefmt::now_rfc3339(),
@@ -187,16 +207,7 @@ pub fn verify_data(app: &App) -> JsonValue {
     result
 }
 
-/// The access log's chain, read from disk.
+/// The access log's chain, read from disk frame by frame (never whole).
 fn verify_access_log(app: &App) -> JsonValue {
-    let path = access_log::path(&app.config.data_dir);
-    match std::fs::read(&path) {
-        Ok(bytes) => match Journal::audit_bytes(&bytes, None) {
-            Ok((j, report)) => {
-                json!({"ok": report.is_ok(), "entries": j.len(), "first_bad": report.first_bad})
-            }
-            Err(e) => json!({"ok": false, "error": e.to_string()}),
-        },
-        Err(e) => json!({"ok": false, "error": e.to_string()}),
-    }
+    serde_json::to_value(app.access.verify()).unwrap_or(JsonValue::Null)
 }

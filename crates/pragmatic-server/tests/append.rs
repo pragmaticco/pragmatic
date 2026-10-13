@@ -336,3 +336,144 @@ async fn appends_to_unknown_runs_are_404() {
         (StatusCode::CONFLICT, "run_exists".into())
     );
 }
+
+/// A run's first entry is its own `run.start`, and no later entry is one:
+/// a journal claiming to be another run (another tenant's, say) is never
+/// stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_start_comes_first_and_names_the_run() {
+    let ts = TestServer::start(|c| c.lease_ttl_secs = 60).await;
+    let (agent, _) = ts.issue("agent", &["team-a:"], false).await;
+    let resp = ts
+        .req(Method::PUT, &run_path("team-a:1", ""), &agent)
+        .body(pragmatic::journal::header(0).to_vec())
+        .send()
+        .await
+        .unwrap();
+    let v: Value = resp.json().await.unwrap();
+    let lease = v["lease"].as_str().unwrap().to_string();
+    let fresh = |data: Value| {
+        let mut w = Writer {
+            run: "team-a:1".into(),
+            token: agent.clone(),
+            lease: lease.clone(),
+            journal: Journal::new(None),
+        };
+        w.add(note("run.start", data, vec![]));
+        w
+    };
+    // Another run's id.
+    let mut w = fresh(json!({"run_id": "team-b:payroll", "format": 2, "labels": {}}));
+    let (status, c) = code(w.push(&ts).await).await;
+    assert_eq!(
+        (status, c.as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, "invalid_frames")
+    );
+    // No run.start first.
+    let mut w = Writer {
+        run: "team-a:1".into(),
+        token: agent.clone(),
+        lease: lease.clone(),
+        journal: Journal::new(None),
+    };
+    w.add(recv("hello"));
+    let (status, _) = code(w.push(&ts).await).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    // The right one is stored, and a second run.start later is refused.
+    let mut w = fresh(json!({"run_id": "team-a:1", "format": 2, "labels": {}}));
+    assert_eq!(w.push(&ts).await.status(), StatusCode::OK);
+    w.add(note("run.start", json!({"run_id": "team-a:1"}), vec![]));
+    let resp = w.push(&ts).await;
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "invalid_frames");
+    assert_eq!(v["error"]["cursor"], 1);
+    assert_eq!(stored(&ts, "team-a:1").len(), 1);
+}
+
+/// A client that never finishes its headers is disconnected after the
+/// header timeout, rather than holding a connection for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_that_never_finishes_its_headers_is_closed() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let limits = pragmatic_server::server::Limits {
+        header_read_timeout: std::time::Duration::from_secs(1),
+        ..Default::default()
+    };
+    let ts = TestServer::start_limited(|_| {}, limits).await;
+    let addr = ts.url.trim_start_matches("http://").to_string();
+    let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    s.write_all(b"GET /v1/info HTTP/1.1\r\nHost: x\r\nX-Slow: ")
+        .await
+        .unwrap();
+    let mut buf = [0u8; 256];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(10), s.read(&mut buf)).await;
+    assert!(
+        read.is_ok(),
+        "a connection that stopped mid-headers was still open after 10 s"
+    );
+    // A normal request still works.
+    assert_eq!(ts.get("/v1/info", &ts.admin).await.status(), StatusCode::OK);
+}
+
+/// A request that can only be refused (no lease) is refused before its
+/// body is read, and the client still gets the answer rather than a reset
+/// connection while it sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn frames_without_the_lease_are_refused_before_the_body_is_read() {
+    let ts = TestServer::start(|c| c.lease_ttl_secs = 600).await;
+    let (owner, _) = ts.issue("agent", &["*"], false).await;
+    let (other, _) = ts.issue("agent", &["*"], false).await;
+    let mut w = Writer::create(&ts, &owner, "leased").await;
+    assert_eq!(w.push(&ts).await.status(), StatusCode::OK);
+    for (lease, want) in [
+        ("not-a-lease", "lease_lost"),
+        (w.lease.as_str(), "lease_lost"),
+    ] {
+        let resp = ts
+            .req(Method::POST, &run_path("leased", "/frames?at=1"), &other)
+            .header("pragmatic-lease", lease)
+            .header("pragmatic-frames", "1")
+            .header("pragmatic-head", "0".repeat(64))
+            .body(vec![0u8; 8 << 20])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(code(resp).await, (StatusCode::CONFLICT, want.to_string()));
+    }
+    // A wrong `at` with the lease: conflict, also before the body.
+    let resp = ts
+        .req(Method::POST, &run_path("leased", "/frames?at=7"), &owner)
+        .header("pragmatic-lease", &w.lease)
+        .header("pragmatic-frames", "1")
+        .header("pragmatic-head", "0".repeat(64))
+        .body(vec![0u8; 8 << 20])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(code(resp).await.1, "conflict");
+    // The connection pool still works afterwards.
+    w.add(recv("after"));
+    assert_eq!(w.push(&ts).await.status(), StatusCode::OK);
+}
+
+/// A resend of frames already stored is answered as a duplicate whatever
+/// the lease (design 4.6), also when the writer's journal is not loaded:
+/// the hashes are read from disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicates_are_answered_from_stored_hashes_without_the_lease() {
+    let (ts, _, mut w) = setup().await;
+    let (at, frames, head, k) = {
+        w.add(recv("one more"));
+        w.pending()
+    };
+    assert_eq!(w.push(&ts).await.status(), StatusCode::OK);
+    assert_eq!(w.release(&ts).await.status(), StatusCode::NO_CONTENT);
+    // Released: the writer's journal is dropped. A resend with the old
+    // lease is still a duplicate.
+    assert!(ts.app().store.get("run-1").unwrap().lock().writer.is_none());
+    let resp = send_frames(&ts, &w.token, &w.run, &w.lease, at, k, &head, frames).await;
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["duplicate"], true, "{v}");
+    assert_eq!(v["head"], head);
+    assert!(ts.app().store.get("run-1").unwrap().lock().writer.is_none());
+}

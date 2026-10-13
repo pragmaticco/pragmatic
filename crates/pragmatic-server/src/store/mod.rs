@@ -7,8 +7,13 @@
 //! - `file`, a read-write lock on the journal file's identity. Readers of
 //!   the journal, its entries and evidence hold it shared while they read;
 //!   erasure and deletion, which replace or remove the file, hold it
-//!   exclusively. Appends only extend the file, so they never need it
-//!   exclusively.
+//!   exclusively, and advance the run's file *generation* before they
+//!   release it. Appends only extend the file, so they never need it
+//!   exclusively. A journal download streams for as long as its client
+//!   takes, so it does not hold the lock throughout: it takes it for each
+//!   chunk it reads and stops (aborting the response) once the generation
+//!   has moved, so no byte read after an erasure or deletion committed is
+//!   ever served.
 //! - `state`, a mutex over the run's index (entries, byte length, head),
 //!   its lease and its writer's journal. Every change takes it: appends,
 //!   leases, custody notes, erasure, retention, anchoring snapshots.
@@ -31,13 +36,14 @@
 //! All of this is synchronous: the HTTP layer calls it from blocking tasks.
 
 mod admin;
+mod frames;
 mod index;
 mod read;
 mod write;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
@@ -45,14 +51,15 @@ use pragmatic::Journal;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
-use crate::layout::Layout;
+use crate::layout::{stem as layout_stem, Layout};
 use crate::metrics::Metrics;
-use crate::summary::{OpenIntent, Summary};
+use crate::summary::Summary;
 use crate::webhooks::{WebhookEvent, Webhooks};
 
 pub use admin::{EraseContext, EraseOutcome, EraseParams, Selector};
+pub use frames::{BudgetGuard, ByteBudget, ReadEntry, FULL_READ_BUDGET};
 pub use index::IndexReport;
-pub use read::{verify_json, Durable, DurableFile, ListQuery, RunPage};
+pub use read::{verify_json, Durable, DurableFile, EntryPage, ListQuery, RunPage};
 pub use write::{AppendOk, AppendRequest, LeaseGrant};
 
 /// How often `meta.json` may be rewritten for appends.
@@ -103,7 +110,6 @@ pub struct Meta {
     /// Holds that matched when the file was written (informational: holds
     /// are matched live).
     pub holds: Vec<String>,
-    pub open_intents: Vec<OpenIntent>,
     /// `active`, `idle`, `dangling`, `regressed` or `missing` when written.
     pub status: String,
     /// The token id that created the run.
@@ -111,6 +117,10 @@ pub struct Meta {
     /// Fewer entries than were anchored; appends are refused until an admin
     /// accepts the regression.
     pub regressed: bool,
+    /// When the oldest append not yet independently anchored was made
+    /// (Unix seconds), for the anchoring lag (design 4.7).
+    #[serde(default)]
+    pub unanchored_since: Option<i64>,
     pub summary: Summary,
 }
 
@@ -132,6 +142,9 @@ pub enum EndReason {
     Released,
     Expired,
     Revoked,
+    /// The lease came back with a restored backup and was ended by the
+    /// restore.
+    Restored,
 }
 
 impl EndReason {
@@ -140,6 +153,7 @@ impl EndReason {
             EndReason::Released => "released",
             EndReason::Expired => "expired",
             EndReason::Revoked => "revoked",
+            EndReason::Restored => "restored",
         }
     }
 }
@@ -181,6 +195,9 @@ pub struct RunState {
     /// The stored journal is damaged: reads serve the valid prefix and
     /// writes are refused.
     pub broken: Option<String>,
+    /// The only damage is slots an erasure note lists that still hold
+    /// content: erasing again repairs it, so erasure stays allowed.
+    pub repairable: bool,
     /// The anchor log knows the run but neither a journal nor a tombstone
     /// exists.
     pub missing: bool,
@@ -195,11 +212,37 @@ pub struct Run {
     pub stem: String,
     pub file: RwLock<()>,
     pub state: Mutex<RunState>,
+    /// Advanced, with `file` held exclusively, whenever the journal file is
+    /// replaced (erasure) or removed (deletion): readers that hold an open
+    /// descriptor or cached offsets of an earlier generation must not use
+    /// them.
+    generation: AtomicU64,
 }
 
 impl Run {
+    pub fn new(id: &str, stem: &str, state: RunState) -> Run {
+        Run {
+            id: id.to_string(),
+            stem: stem.to_string(),
+            file: RwLock::new(()),
+            state: Mutex::new(state),
+            generation: AtomicU64::new(0),
+        }
+    }
+
     pub fn lock(&self) -> MutexGuard<'_, RunState> {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The journal file's generation (see the module documentation).
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// The journal file was replaced or removed. Call with `file` held
+    /// exclusively.
+    fn replaced(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -245,60 +288,22 @@ pub struct StoreOptions {
     pub index_key: [u8; 32],
 }
 
-/// Parsed journals for readers, by run and byte length.
-#[derive(Default)]
-struct ReadCache {
-    map: HashMap<String, (u64, Arc<Journal>)>,
-    order: VecDeque<String>,
-    bytes: u64,
-}
-
-/// The most journal bytes kept parsed for readers.
-const READ_CACHE_BYTES: u64 = 256 << 20;
-
-impl ReadCache {
-    fn get(&mut self, run: &str, byte_len: u64) -> Option<Arc<Journal>> {
-        match self.map.get(run) {
-            Some((len, j)) if *len == byte_len => Some(j.clone()),
-            _ => None,
-        }
-    }
-
-    fn put(&mut self, run: &str, byte_len: u64, j: Arc<Journal>) {
-        if byte_len > READ_CACHE_BYTES / 4 {
-            return;
-        }
-        if let Some((old, _)) = self.map.insert(run.to_string(), (byte_len, j)) {
-            self.bytes -= old;
-            self.order.retain(|r| r != run);
-        }
-        self.bytes += byte_len;
-        self.order.push_back(run.to_string());
-        while self.bytes > READ_CACHE_BYTES {
-            let Some(oldest) = self.order.pop_front() else {
-                break;
-            };
-            if let Some((len, _)) = self.map.remove(&oldest) {
-                self.bytes -= len;
-            }
-        }
-    }
-
-    fn forget(&mut self, run: &str) {
-        if let Some((len, _)) = self.map.remove(run) {
-            self.bytes -= len;
-            self.order.retain(|r| r != run);
-        }
-    }
-}
-
 /// Every run.
 pub struct Store {
     pub layout: Layout,
     runs: RwLock<BTreeMap<String, Arc<Run>>>,
     tombstones: RwLock<HashMap<String, Tombstone>>,
     dirty: Mutex<HashSet<String>>,
-    cache: Mutex<ReadCache>,
+    frames: Mutex<frames::FrameCache>,
+    /// Bytes of journals held whole by readers at once.
+    budget: Arc<ByteBudget>,
+    /// Stems (and `runs/<hh>` shard names) whose files could not be read
+    /// at startup: their ids are never treated as absent.
+    unavailable: Mutex<HashSet<String>>,
+    /// Stems whose tombstone could not be read: their ids are deleted.
+    deleted_stems: RwLock<HashSet<String>>,
+    /// One late load at a time.
+    late: Mutex<()>,
     opts: StoreOptions,
     signals: Signals,
 }
@@ -311,10 +316,34 @@ impl Store {
             runs: RwLock::new(BTreeMap::new()),
             tombstones: RwLock::new(HashMap::new()),
             dirty: Mutex::new(HashSet::new()),
-            cache: Mutex::new(ReadCache::default()),
+            frames: Mutex::new(frames::FrameCache::default()),
+            budget: Arc::new(ByteBudget::new(FULL_READ_BUDGET)),
+            unavailable: Mutex::new(HashSet::new()),
+            deleted_stems: RwLock::new(HashSet::new()),
+            late: Mutex::new(()),
             opts,
             signals,
         }
+    }
+
+    /// True when the run with this stem could not be read at startup (its
+    /// own files, or its whole shard).
+    fn is_unavailable(&self, stem: &str) -> bool {
+        let set = self.unavailable.lock().expect("unavailable lock");
+        !set.is_empty() && (set.contains(stem) || set.contains(&stem[..2]))
+    }
+
+    /// The run with this stem was loaded (or found absent) after all.
+    fn available(&self, stem: &str) {
+        self.unavailable
+            .lock()
+            .expect("unavailable lock")
+            .remove(stem);
+    }
+
+    /// The budget for journals held whole (verification, evidence).
+    pub fn budget(&self) -> &Arc<ByteBudget> {
+        &self.budget
     }
 
     pub fn options(&self) -> &StoreOptions {
@@ -326,7 +355,8 @@ impl Store {
         self.runs.read().expect("runs lock").get(run_id).cloned()
     }
 
-    /// The run, or 410 for a tombstone, or 404.
+    /// The run, or 410 for a tombstone, or 503 while its files cannot be
+    /// read, or 404.
     pub fn find(&self, run_id: &str) -> Result<Arc<Run>, ApiError> {
         if let Some(run) = self.get(run_id) {
             return Ok(run);
@@ -334,14 +364,20 @@ impl Store {
         if self.is_tombstoned(run_id) {
             return Err(ApiError::run_deleted());
         }
-        Err(ApiError::not_found())
+        self.load_late(run_id)?.ok_or_else(ApiError::not_found)
     }
 
     pub fn is_tombstoned(&self, run_id: &str) -> bool {
-        self.tombstones
+        if self
+            .tombstones
             .read()
             .expect("tombstones lock")
             .contains_key(run_id)
+        {
+            return true;
+        }
+        let stems = self.deleted_stems.read().expect("deleted stems lock");
+        !stems.is_empty() && stems.contains(&layout_stem(run_id))
     }
 
     /// Every run id, in order.
@@ -392,6 +428,52 @@ impl Store {
         st.writer = None;
     }
 
+    /// Act on a run's verification report. Anything but an ok report marks
+    /// the run damaged, as a broken chain does: content erased without an
+    /// `erasure` note, or a note listing slots that do not exist, is exactly
+    /// the tampering design 2.13 exists to catch, so it raises the
+    /// `chain_broken` webhook and metric, refuses writes and is listed by
+    /// verify-data. Slots a note lists that still hold content can be
+    /// repaired by erasing again, so that alone leaves erasure allowed; an
+    /// ok report afterwards clears it.
+    fn judge(&self, run_id: &str, st: &mut RunState, r: &pragmatic::VerifyReport) {
+        if r.is_ok() {
+            if st.repairable {
+                st.broken = None;
+                st.repairable = false;
+            }
+            return;
+        }
+        let mut why = Vec::new();
+        if let Some(c) = r.first_bad {
+            why.push(format!("verification failed at cursor {c}"));
+        }
+        if !r.unaccounted_erasures.is_empty() {
+            why.push(format!(
+                "{} erased slots no erasure note accounts for",
+                r.unaccounted_erasures.len()
+            ));
+        }
+        if !r.invalid_erasure_notes.is_empty() {
+            why.push(format!(
+                "{} invalid erasure notes",
+                r.invalid_erasure_notes.len()
+            ));
+        }
+        if !r.erasure_incomplete.is_empty() {
+            why.push(format!(
+                "{} slots listed as erased still hold content",
+                r.erasure_incomplete.len()
+            ));
+        }
+        let repairable = why.len() == 1 && !r.erasure_incomplete.is_empty();
+        if st.broken.is_some() && !st.repairable {
+            return;
+        }
+        self.mark_broken(run_id, st, why.join("; "));
+        st.repairable = repairable;
+    }
+
     /// Write `meta.json` now, or (when `force` is false and it was written
     /// less than a second ago) mark it for the flusher.
     fn save_meta(&self, run: &Run, st: &mut RunState, force: bool) -> Result<(), ApiError> {
@@ -416,7 +498,6 @@ impl Store {
 
     fn write_meta(&self, run: &Run, st: &mut RunState) -> Result<(), ApiError> {
         st.meta.leases = st.lease.iter().map(|l| l.record.clone()).collect();
-        st.meta.open_intents = st.meta.summary.open_intents.clone();
         st.meta.status = self.status(st).to_string();
         crate::fsutil::write_json_atomic(&self.layout.meta(&run.stem), &st.meta)?;
         st.meta_written = Some(Instant::now());
@@ -481,26 +562,28 @@ impl Store {
     }
 
     /// Periodic housekeeping: raise `dangling_effect` for newly dangling
-    /// runs, update the gauge, and drop writer journals of runs nobody has
-    /// touched for a while.
+    /// runs, update the dangling and anchoring-lag gauges, and drop writer
+    /// journals of runs nobody has touched for a while.
     pub fn sweep(&self) {
         let mut dangling = 0u64;
+        let mut oldest: Option<i64> = None;
         for run in self.all() {
             let mut st = run.lock();
             if st.deleted {
                 continue;
             }
+            if st.meta.entries > st.meta.anchored_entries {
+                let since = *st
+                    .meta
+                    .unanchored_since
+                    .get_or_insert_with(crate::timefmt::now_unix_secs);
+                oldest = Some(oldest.map_or(since, |o| o.min(since)));
+            }
             if self.is_dangling(&st) {
                 dangling += 1;
                 if !st.dangling_alerted {
                     st.dangling_alerted = true;
-                    let open = st
-                        .meta
-                        .summary
-                        .open_intents
-                        .iter()
-                        .filter(|o| o.kind == "effect")
-                        .count();
+                    let open = st.meta.summary.open_effects;
                     self.webhook(
                         "dangling_effect",
                         &run.id,
@@ -518,10 +601,11 @@ impl Store {
             }
         }
         self.signals.metrics.set_dangling_effects(dangling);
+        self.signals.metrics.set_oldest_unanchored(oldest);
     }
 
     fn forget_cached(&self, run_id: &str) {
-        self.cache.lock().expect("cache lock").forget(run_id);
+        self.frames.lock().expect("frame cache").forget(run_id);
     }
 }
 
@@ -540,6 +624,7 @@ fn state_from_meta(meta: Meta, ttl: Duration) -> RunState {
         last_activity: now,
         meta_written: Some(now),
         broken: None,
+        repairable: false,
         missing: false,
         deleted: false,
         verify: None,

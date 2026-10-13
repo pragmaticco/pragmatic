@@ -7,9 +7,9 @@
 //! structural fields (token id, role, method, route template, run id,
 //! status, raw, cursors, query parameter *names*), and its one payload
 //! slot holds the fields that identify a person (principal, source address,
-//! user agent), so they can be erased like any other content while the
-//! chain still verifies. Query-string values are never logged: they can
-//! carry search terms, and a search term can be personal data.
+//! user agent), apart from the structural fields that are never personal
+//! data. Query-string values are never logged: they can carry search terms,
+//! and a search term can be personal data.
 //!
 //! The first record of a new log is a `run.start` note for the reserved
 //! run id `pragmatic:access-log`, so the log reads like any run in the CLI.
@@ -22,6 +22,8 @@
 //! rather than one per request. Most requests do not wait for their record;
 //! erasure, holds, retention, token changes and raw-content reads do
 //! ([`AccessLog::durable`]): they act only once their record is on disk.
+//! One write is at most [`WRITE_CHUNK`] bytes (a larger batch is written
+//! and fsynced in pieces), so a crash can tear only that much.
 //!
 //! # Failing closed
 //!
@@ -29,29 +31,46 @@
 //! failure cannot be retried: the kernel may already have dropped the
 //! pages), and every authenticated request is refused with 503
 //! `storage_unavailable` until the server is restarted. A server that
-//! cannot record who read what must not serve anything.
+//! cannot record who read what must not serve anything. The failure is
+//! reported through [`AccessLog::on_failure`] (the server raises a webhook
+//! and fails `/readyz`) and [`AccessLog::is_failed`] (a metric).
 //!
-//! The log only grows: it is never shredded by retention policies. It is
-//! not held in memory: the writer keeps the chain's tail
-//! ([`NoteAppender`]), and reads go to the file through an index of frame
-//! offsets.
+//! # Never in memory
+//!
+//! The log only grows: it is never shredded by retention policies, and an
+//! unauthenticated request adds a record as surely as an authenticated
+//! one. So nothing about it is kept per record in memory:
+//!
+//! - the writer keeps the chain's tail ([`NoteAppender`]);
+//! - reads go to the file through an index of frame offsets kept on disk
+//!   (`access.index`, 20 bytes per record: offset, length and a tag of the
+//!   record's run id), which is rebuilt from the log at every start and is
+//!   never trusted over it;
+//! - opening and verifying the log read it frame by frame
+//!   ([`NoteAppender::follow`]), holding one frame at a time, and after a
+//!   crash at most [`TAIL_LIMIT`] bytes of torn tail.
+//!
+//! Each read examines at most [`SCAN_LIMIT`] index entries and then returns
+//! where to continue, whether or not anything matched, so no request walks
+//! the whole log.
 
-use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use pragmatic::journal::{self, decode_frame, split_frames, NoteAppender};
-use pragmatic::sha256::Digest;
-use pragmatic::{Event, Journal, Value};
+use pragmatic::journal::{self, decode_frame, NoteAppender};
+use pragmatic::sha256::{sha256, Digest};
+use pragmatic::{Event, SlotState, Value};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as JsonValue};
 
 use crate::fsutil;
 use crate::timefmt;
+use crate::tokens::scope_matches;
 
 /// The longest the writer waits after its last fsync before the next one.
 pub const GROUP_COMMIT: Duration = Duration::from_millis(50);
@@ -59,9 +78,58 @@ pub const GROUP_COMMIT: Duration = Duration::from_millis(50);
 /// The reserved run id of the access log's `run.start` note.
 pub const ACCESS_LOG_RUN_ID: &str = "pragmatic:access-log";
 
+/// The most bytes one write (and fsync) carries. A batch larger than this
+/// is written in pieces, each durable before the next starts.
+pub const WRITE_CHUNK: usize = 16 << 20;
+
+/// The most bytes after the last good frame that a restart reads to tell
+/// a torn write from damage. A torn write is never longer than
+/// [`WRITE_CHUNK`] plus one record, so a longer tail is corruption, which
+/// is never truncated.
+pub const TAIL_LIMIT: u64 = 64 << 20;
+
+/// The most index entries one read examines.
+pub const SCAN_LIMIT: u64 = 4096;
+
+/// Bytes per index entry: offset (u64), frame length (u32), run tag (u64).
+const INDEX_ENTRY: usize = 20;
+
 /// `<data_dir>/audit/access.journal`.
 pub fn path(data_dir: &Path) -> PathBuf {
     data_dir.join("audit").join("access.journal")
+}
+
+/// The offset index next to a log: `access.index`.
+pub fn index_path(log: &Path) -> PathBuf {
+    log.with_extension("index")
+}
+
+/// `<data_dir>/audit/anchor.json`: the access log's last anchor leaf.
+pub fn leaf_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("audit").join("anchor.json")
+}
+
+/// The access log's last leaf in the anchor log (design 4.7), so the next
+/// batch offers the log only when it grew and names this leaf as its
+/// predecessor, and a restart can tell whether the log still holds the
+/// anchored prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessLeaf {
+    pub leaf_index: u64,
+    pub entries: u64,
+    /// Lowercase hex of the chain head after `entries` records.
+    pub head: String,
+}
+
+/// Read the access log's last leaf (`None` before its first batch).
+pub fn read_leaf(data_dir: &Path) -> io::Result<Option<AccessLeaf>> {
+    fsutil::read_json(&leaf_path(data_dir))
+}
+
+/// Record the access log's last leaf (atomic write).
+pub fn write_leaf(data_dir: &Path, leaf: &AccessLeaf) -> io::Result<()> {
+    fsutil::write_json_atomic(&leaf_path(data_dir), leaf)
 }
 
 /// One access-log record before it is written.
@@ -105,64 +173,48 @@ pub struct Unavailable(pub String);
 
 type Ack = tokio::sync::oneshot::Sender<Result<u64, Unavailable>>;
 
+/// Called once, from the writer thread, when the log fails.
+type FailHook = Box<dyn Fn(&str) + Send + Sync>;
+
 enum Msg {
     Record(Box<AccessRecord>, Option<Ack>),
     Flush(Ack),
 }
 
-/// Byte offsets and runs of the durable records, for serving reads.
-#[derive(Default)]
-struct Index {
-    /// `(offset, length)` of each frame, by cursor.
-    frames: Vec<(u64, u32)>,
-    /// Interned run id of each record (`u32::MAX` for none).
-    runs: Vec<u32>,
-    names: Vec<String>,
-    by_name: HashMap<String, u32>,
+/// The durable end of the log.
+#[derive(Debug, Clone, Copy)]
+struct Tip {
+    entries: u64,
     head: Digest,
-}
-
-impl Index {
-    fn push(&mut self, offset: u64, len: u32, run: Option<&str>) {
-        self.frames.push((offset, len));
-        let id = match run {
-            None => u32::MAX,
-            Some(name) => match self.by_name.get(name) {
-                Some(&i) => i,
-                None => {
-                    let i = self.names.len() as u32;
-                    self.names.push(name.to_string());
-                    self.by_name.insert(name.to_string(), i);
-                    i
-                }
-            },
-        };
-        self.runs.push(id);
-    }
-
-    fn run(&self, cursor: usize) -> Option<&str> {
-        match self.runs.get(cursor) {
-            Some(&u32::MAX) | None => None,
-            Some(&i) => Some(self.names[i as usize].as_str()),
-        }
-    }
+    byte_len: u64,
 }
 
 struct Shared {
     failed: AtomicBool,
     reason: Mutex<Option<String>>,
+    on_fail: OnceLock<FailHook>,
     queued: AtomicU64,
     oldest_ns: AtomicU64,
-    index: RwLock<Index>,
+    /// Records that are durable and indexed: readers never look further.
+    durable: AtomicU64,
+    tip: Mutex<Tip>,
     inject_failure: AtomicBool,
 }
 
-/// The access log: a handle to its writer thread and its index.
+impl Shared {
+    fn tip(&self) -> Tip {
+        *self.tip.lock().expect("tip lock")
+    }
+}
+
+/// The access log: a handle to its writer thread, its file and its index.
 #[derive(Clone)]
 pub struct AccessLog {
     tx: Sender<Msg>,
     shared: Arc<Shared>,
     file: Arc<File>,
+    index: Arc<File>,
+    path: PathBuf,
 }
 
 /// One record as the API serves it.
@@ -172,13 +224,62 @@ pub type RecordView = Map<String, JsonValue>;
 /// after when more may follow.
 pub type ReadPage = (Vec<(u64, Option<String>, journal::Entry)>, Option<u64>);
 
+/// Which records a read returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Filter {
+    /// Every record.
+    All,
+    /// The records of one run.
+    Run(String),
+    /// The records of runs within these scopes (an auditor's view).
+    Scopes(Vec<String>),
+}
+
+impl Filter {
+    fn keeps(&self, run: Option<&str>) -> bool {
+        match (self, run) {
+            (Filter::All, _) => true,
+            (Filter::Run(want), Some(r)) => r == want,
+            (Filter::Scopes(scopes), Some(r)) => scope_matches(scopes, r),
+            _ => false,
+        }
+    }
+
+    /// Whether an index entry with this tag can match, before its record is
+    /// read.
+    fn may_keep(&self, tag: u64) -> bool {
+        match self {
+            Filter::All => true,
+            Filter::Run(want) => tag == run_tag(want),
+            Filter::Scopes(_) => tag != 0,
+        }
+    }
+}
+
+/// What verifying the log found (design 4.13).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct AccessVerify {
+    pub ok: bool,
+    /// Records that verified.
+    pub entries: u64,
+    /// The first record that does not verify.
+    pub first_bad: Option<u64>,
+    /// Bytes after the last record that a crash left (offline only).
+    pub torn_bytes: u64,
+    /// Erased slots: the server never erases access-log records, so any is
+    /// a change made outside it.
+    pub unaccounted_erasures: u64,
+    pub error: Option<String>,
+}
+
 impl AccessLog {
-    /// Open (or create) the log at `path` and start its writer thread.
+    /// Open (or create) the log at `path`, rebuild its index and start its
+    /// writer thread.
     ///
-    /// The whole file is verified once. A torn tail (a crash during a
-    /// write) is moved aside to `access.journal.torn-<unix_ms>` and
-    /// truncated; corruption is an error, and the server refuses to start
-    /// rather than append to a log whose history it cannot vouch for.
+    /// The whole file is read once, frame by frame. A torn tail (a crash
+    /// during a write) is moved aside to `access.journal.torn-<unix_ms>`
+    /// and truncated; corruption is an error, and the server refuses to
+    /// start rather than append to a log whose history it cannot vouch for.
     pub fn open(path: &Path) -> io::Result<AccessLog> {
         if let Some(dir) = path.parent() {
             fsutil::create_dir_durable(dir)?;
@@ -189,25 +290,40 @@ impl AccessLog {
             .create(true)
             .truncate(false)
             .open(path)?;
+        let index_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(index_path(path))?;
         let len = file.metadata()?.len();
-        let (appender, index) = if len == 0 {
-            create(&file)?
+        let (appender, entries) = if len == 0 {
+            create(&file, &index_file)?
         } else {
-            recover(path, &file, len)?
+            recover(path, &file, &index_file, len)?
         };
         let shared = Arc::new(Shared {
             failed: AtomicBool::new(false),
             reason: Mutex::new(None),
+            on_fail: OnceLock::new(),
             queued: AtomicU64::new(0),
             oldest_ns: AtomicU64::new(0),
-            index: RwLock::new(index),
+            durable: AtomicU64::new(entries),
+            tip: Mutex::new(Tip {
+                entries,
+                head: appender.head(),
+                byte_len: appender.byte_len(),
+            }),
             inject_failure: AtomicBool::new(false),
         });
         let file = Arc::new(file);
+        let index = Arc::new(index_file);
         let (tx, rx) = mpsc::channel();
         let writer = Writer {
             rx,
             file: file.clone(),
+            index: index.clone(),
+            committed: appender.clone(),
             appender,
             shared: shared.clone(),
             last_sync: Instant::now() - GROUP_COMMIT,
@@ -215,7 +331,18 @@ impl AccessLog {
         std::thread::Builder::new()
             .name("pragmatic-access-log".into())
             .spawn(move || writer.run())?;
-        Ok(AccessLog { tx, shared, file })
+        Ok(AccessLog {
+            tx,
+            shared,
+            file,
+            index,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Run `hook` (once, on the writer thread) when the log fails.
+    pub fn on_failure(&self, hook: impl Fn(&str) + Send + Sync + 'static) {
+        let _ = self.shared.on_fail.set(Box::new(hook));
     }
 
     /// Queue a record without waiting for it to be durable.
@@ -288,8 +415,8 @@ impl AccessLog {
 
     /// `(entries, head)` of the durable log, for anchoring.
     pub fn tip(&self) -> (u64, Digest) {
-        let index = self.shared.index.read().expect("index lock");
-        (index.frames.len() as u64, index.head)
+        let t = self.shared.tip();
+        (t.entries, t.head)
     }
 
     /// TEST ONLY: make every later write fail, as a full or failing disk
@@ -299,55 +426,135 @@ impl AccessLog {
         self.shared.inject_failure.store(true, Ordering::SeqCst);
     }
 
+    /// The `(offset, length, run tag)` of each durable record in
+    /// `first..first + count` (fewer at the end of the log).
+    fn index_entries(&self, first: u64, count: u64) -> io::Result<Vec<(u64, u32, u64)>> {
+        let durable = self.shared.durable.load(Ordering::Acquire);
+        let end = first.saturating_add(count).min(durable);
+        if first >= end {
+            return Ok(Vec::new());
+        }
+        let mut buf = vec![0u8; ((end - first) as usize) * INDEX_ENTRY];
+        fsutil::read_exact_at(&self.index, &mut buf, first * INDEX_ENTRY as u64)?;
+        Ok(buf.chunks_exact(INDEX_ENTRY).map(decode_index).collect())
+    }
+
+    /// The durable record at `cursor`, decoded.
+    fn record(&self, cursor: u64, offset: u64, len: u32) -> io::Result<journal::Entry> {
+        let mut buf = vec![0u8; len as usize];
+        fsutil::read_exact_at(&self.file, &mut buf, offset)?;
+        decode_frame(&buf, cursor).map_err(|why| io::Error::new(io::ErrorKind::InvalidData, why))
+    }
+
+    /// The chain hash of the durable record at `cursor`, if there is one.
+    pub fn hash_at(&self, cursor: u64) -> io::Result<Option<Digest>> {
+        let Some(&(offset, len, _)) = self.index_entries(cursor, 1)?.first() else {
+            return Ok(None);
+        };
+        let mut hash = [0u8; 32];
+        fsutil::read_exact_at(&self.file, &mut hash, offset + u64::from(len) - 32)?;
+        Ok(Some(hash))
+    }
+
     /// Up to `limit` durable records after cursor `after` (from the start
-    /// when `None`) whose run passes `keep`. Returns the records and the
-    /// cursor to continue after, if more may follow.
-    pub fn read(
-        &self,
-        after: Option<u64>,
-        limit: usize,
-        keep: impl Fn(Option<&str>) -> bool,
-    ) -> io::Result<ReadPage> {
-        let picks: Vec<(u64, u64, u32, Option<String>)> = {
-            let index = self.shared.index.read().expect("index lock");
-            let start = after.map_or(0, |a| a + 1) as usize;
-            let mut picks = Vec::new();
-            for c in start..index.frames.len() {
-                let run = index.run(c);
-                if keep(run) {
-                    let (off, len) = index.frames[c];
-                    picks.push((c as u64, off, len, run.map(str::to_string)));
-                    if picks.len() > limit {
-                        break;
-                    }
+    /// when `None`) that pass `filter`, examining at most [`SCAN_LIMIT`]
+    /// records. Returns the records and the cursor to continue after when
+    /// more may follow: the last record returned, or the last one examined
+    /// when the scan stopped first.
+    pub fn read(&self, after: Option<u64>, limit: usize, filter: &Filter) -> io::Result<ReadPage> {
+        let start = after.map_or(0, |a| a.saturating_add(1));
+        let entries = self.index_entries(start, SCAN_LIMIT)?;
+        let durable = self.shared.durable.load(Ordering::Acquire);
+        let mut out = Vec::new();
+        let mut last = None;
+        for (i, (offset, len, tag)) in entries.into_iter().enumerate() {
+            let cursor = start + i as u64;
+            last = Some(cursor);
+            if !filter.may_keep(tag) {
+                continue;
+            }
+            let entry = self.record(cursor, offset, len)?;
+            let run = note_run_id(&entry.event);
+            if filter.keeps(run.as_deref()) {
+                out.push((cursor, run, entry));
+                if out.len() >= limit {
+                    break;
                 }
             }
-            picks
-        };
-        let more = picks.len() > limit;
-        let mut out = Vec::with_capacity(limit.min(picks.len()));
-        for (cursor, off, len, run) in picks.into_iter().take(limit) {
-            let mut buf = vec![0u8; len as usize];
-            fsutil::read_exact_at(&self.file, &mut buf, off)?;
-            let entry = decode_frame(&buf, cursor)
-                .map_err(|why| io::Error::new(io::ErrorKind::InvalidData, why))?;
-            out.push((cursor, run, entry));
         }
-        let next = if more {
-            out.last().map(|(c, _, _)| *c)
-        } else {
-            None
-        };
+        let next = last.filter(|&c| c + 1 < durable);
         Ok((out, next))
+    }
+
+    /// Verify the durable log, frame by frame: every record decodes, its
+    /// commitments hold and it chains, and the chain ends where the writer
+    /// says it does (design 4.13).
+    pub fn verify(&self) -> AccessVerify {
+        let tip = self.shared.tip();
+        let mut report = verify_file(&self.path, Some(tip.byte_len));
+        if report.error.is_none() && report.first_bad.is_none() && report.entries != tip.entries {
+            report.ok = false;
+            report.error = Some(format!(
+                "the log holds {} records but the writer has {}",
+                report.entries, tip.entries
+            ));
+        }
+        report
     }
 }
 
-/// The JSON view of a record: cursor, time, kind, structural fields and,
-/// from the payload, the personal ones.
+/// Verify a log file on its own, frame by frame (offline, or the durable
+/// prefix `upto` of a live log, past which a writer may be mid-write).
+pub fn verify_file(path: &Path, upto: Option<u64>) -> AccessVerify {
+    let mut report = AccessVerify::default();
+    let len = match upto {
+        Some(n) => Ok(n),
+        None => std::fs::metadata(path).map(|m| m.len()),
+    };
+    let scanned = len.and_then(|len| {
+        scan(path, len, |_, _, entry| {
+            report.unaccounted_erasures += entry
+                .slots
+                .iter()
+                .filter(|s| s.state == SlotState::Erased)
+                .count() as u64;
+            Ok(())
+        })
+    });
+    match scanned {
+        Err(e) => report.error = Some(e.to_string()),
+        Ok(s) => {
+            report.entries = s.tail.entries();
+            match s.damage {
+                None => {}
+                // Inside the durable prefix of a live log nothing can be
+                // torn: every byte of it was fsynced.
+                Some(Damage::Tail { .. }) if upto.is_some() => {
+                    report.first_bad = Some(s.tail.entries())
+                }
+                Some(Damage::Tail { offset }) => match classify(path, &s.tail, offset, s.len) {
+                    Ok(None) => report.torn_bytes = s.len - offset,
+                    Ok(Some(_)) => report.first_bad = Some(s.tail.entries()),
+                    Err(e) => report.error = Some(e.to_string()),
+                },
+            }
+        }
+    }
+    report.ok =
+        report.error.is_none() && report.first_bad.is_none() && report.unaccounted_erasures == 0;
+    report
+}
+
+/// The JSON view of a record: cursor, time, chain hash, kind, structural
+/// fields and, from the payload, the personal ones.
 pub fn record_view(cursor: u64, entry: &journal::Entry) -> RecordView {
     let mut out = Map::new();
     out.insert("cursor".into(), cursor.into());
     out.insert("at".into(), timefmt::rfc3339_ns(entry.at).into());
+    out.insert(
+        "hash".into(),
+        pragmatic::encoding::hex_encode(&entry.hash).into(),
+    );
     if let Event::Note {
         kind,
         data,
@@ -373,8 +580,33 @@ pub fn record_view(cursor: u64, entry: &journal::Entry) -> RecordView {
     out
 }
 
+/// The tag of a run id in the index: the first 8 bytes of its SHA-256
+/// (never 0, which marks a record without a run). Equal tags are confirmed
+/// against the record itself.
+fn run_tag(run_id: &str) -> u64 {
+    let d = sha256(run_id.as_bytes());
+    let tag = u64::from_le_bytes(d[..8].try_into().expect("8 bytes"));
+    tag.max(1)
+}
+
+fn encode_index(offset: u64, len: u32, run: Option<&str>) -> [u8; INDEX_ENTRY] {
+    let mut out = [0u8; INDEX_ENTRY];
+    out[..8].copy_from_slice(&offset.to_le_bytes());
+    out[8..12].copy_from_slice(&len.to_le_bytes());
+    out[12..].copy_from_slice(&run.map_or(0, run_tag).to_le_bytes());
+    out
+}
+
+fn decode_index(b: &[u8]) -> (u64, u32, u64) {
+    (
+        u64::from_le_bytes(b[..8].try_into().expect("8 bytes")),
+        u32::from_le_bytes(b[8..12].try_into().expect("4 bytes")),
+        u64::from_le_bytes(b[12..20].try_into().expect("8 bytes")),
+    )
+}
+
 /// Start a new log: header, then the `run.start` note.
-fn create(file: &File) -> io::Result<(NoteAppender, Index)> {
+fn create(file: &File, index: &File) -> io::Result<(NoteAppender, u64)> {
     let mut appender = NoteAppender::new(None);
     let mut nonce = [0u8; 16];
     pragmatic::rand::fill(&mut nonce)?;
@@ -395,44 +627,139 @@ fn create(file: &File) -> io::Result<(NoteAppender, Index)> {
     bytes.extend_from_slice(&frame);
     fsutil::write_all_at(file, &bytes, 0)?;
     file.sync_all()?;
-    let mut index = Index::default();
-    index.push(offset, frame.len() as u32, None);
-    index.head = appender.head();
-    Ok((appender, index))
+    fsutil::write_all_at(index, &encode_index(offset, frame.len() as u32, None), 0)?;
+    Ok((appender, 1))
 }
 
-/// Verify an existing log, move a torn tail aside, and index it.
-fn recover(path: &Path, file: &File, len: u64) -> io::Result<(NoteAppender, Index)> {
-    let bytes = fsutil::read_prefix(file, len)?;
-    let parsed = Journal::parse(&bytes, None).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("access log {}: {e}", path.display()),
-        )
+/// Where reading a log stopped following its chain.
+enum Damage {
+    /// The frame at `offset` (and everything after it) does not follow.
+    Tail { offset: u64 },
+}
+
+/// What reading a log frame by frame found.
+struct Scanned {
+    tail: NoteAppender,
+    len: u64,
+    damage: Option<Damage>,
+}
+
+/// Read the first `len` bytes of the log at `path` frame by frame, calling
+/// `each(offset, frame length, entry)` for every frame that follows the
+/// chain, and stop at the first that does not.
+fn scan(
+    path: &Path,
+    len: u64,
+    mut each: impl FnMut(u64, u32, &journal::Entry) -> io::Result<()>,
+) -> io::Result<Scanned> {
+    let header_len = journal::HEADER_LEN as u64;
+    let invalid = |why: String| io::Error::new(io::ErrorKind::InvalidData, why);
+    let mut reader = BufReader::with_capacity(1 << 20, File::open(path)?.take(len));
+    let mut header = [0u8; journal::HEADER_LEN];
+    if len < header_len || reader.read_exact(&mut header).is_err() {
+        return Err(invalid(format!("{}: no journal header", path.display())));
+    }
+    if header != journal::header(0) {
+        return Err(invalid(format!(
+            "{}: not an unkeyed format 2 journal",
+            path.display()
+        )));
+    }
+    let mut tail = NoteAppender::new(None);
+    let mut offset = header_len;
+    let mut frame = Vec::new();
+    while offset < len {
+        let damaged = Some(Damage::Tail { offset });
+        let rest = len - offset;
+        if rest < 4 {
+            return Ok(Scanned {
+                tail,
+                len,
+                damage: damaged,
+            });
+        }
+        let mut prefix = [0u8; 4];
+        reader.read_exact(&mut prefix)?;
+        let record = u64::from(u32::from_le_bytes(prefix));
+        let frame_len = 4 + record + 32;
+        if record > journal::MAX_RECORD_BYTES || frame_len > rest {
+            return Ok(Scanned {
+                tail,
+                len,
+                damage: damaged,
+            });
+        }
+        frame.clear();
+        frame.extend_from_slice(&prefix);
+        frame.resize(frame_len as usize, 0);
+        reader.read_exact(&mut frame[4..])?;
+        match tail.follow(&frame) {
+            Ok(entry) => each(offset, frame_len as u32, &entry)?,
+            Err(_) => {
+                return Ok(Scanned {
+                    tail,
+                    len,
+                    damage: damaged,
+                })
+            }
+        }
+        offset += frame_len;
+    }
+    Ok(Scanned {
+        tail,
+        len,
+        damage: None,
+    })
+}
+
+/// Classify the bytes from `offset` to `len` of the log (design 2.14):
+/// `None` for a torn tail. A tail longer than [`TAIL_LIMIT`] is corruption
+/// without being read.
+fn classify(path: &Path, tail: &NoteAppender, offset: u64, len: u64) -> io::Result<Option<String>> {
+    if len - offset > TAIL_LIMIT {
+        return Ok(Some(format!(
+            "{} bytes after the last record that verifies, more than any write leaves",
+            len - offset
+        )));
+    }
+    let mut bytes = vec![0u8; (len - offset) as usize];
+    fsutil::read_exact_at(&File::open(path)?, &mut bytes, offset)?;
+    Ok(tail.classify_tail(&bytes, offset))
+}
+
+/// Verify an existing log frame by frame, rebuild its index, and move a
+/// torn tail aside.
+fn recover(path: &Path, file: &File, index: &File, len: u64) -> io::Result<(NoteAppender, u64)> {
+    let mut out = BufWriter::new(index);
+    let scanned = scan(path, len, |offset, frame_len, entry| {
+        let run = note_run_id(&entry.event);
+        out.write_all(&encode_index(offset, frame_len, run.as_deref()))
     })?;
-    if parsed.tail_len > 0 {
-        let tail = &bytes[parsed.valid_len as usize..];
+    out.flush()?;
+    drop(out);
+    if let Some(Damage::Tail { offset }) = scanned.damage {
+        if let Some(why) = classify(path, &scanned.tail, offset, len)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "access log {}: corrupt at record {}: {why}",
+                    path.display(),
+                    scanned.tail.entries()
+                ),
+            ));
+        }
+        let mut torn = vec![0u8; (len - offset) as usize];
+        fsutil::read_exact_at(file, &mut torn, offset)?;
         let aside = path.with_extension(format!(
             "journal.torn-{}",
             timefmt::now_unix_ns() / 1_000_000
         ));
-        fsutil::write_atomic(&aside, tail)?;
-        file.set_len(parsed.valid_len)?;
+        fsutil::write_atomic(&aside, &torn)?;
+        file.set_len(offset)?;
         file.sync_all()?;
     }
-    let journal = parsed.journal;
-    let appender = NoteAppender::after(&journal).map_err(io::Error::other)?;
-    let frames = split_frames(&bytes[journal::HEADER_LEN..parsed.valid_len as usize])
-        .map_err(|(_, why)| io::Error::new(io::ErrorKind::InvalidData, why))?;
-    let mut index = Index::default();
-    let mut offset = journal::HEADER_LEN as u64;
-    for (frame, entry) in frames.iter().zip(journal.entries()) {
-        let run = note_run_id(&entry.event);
-        index.push(offset, frame.len() as u32, run.as_deref());
-        offset += frame.len() as u64;
-    }
-    index.head = journal.head();
-    Ok((appender, index))
+    let entries = scanned.tail.entries();
+    Ok((scanned.tail, entries))
 }
 
 /// The `run_id` in a record's data, if any.
@@ -450,9 +777,22 @@ fn note_run_id(event: &Event) -> Option<String> {
 struct Writer {
     rx: Receiver<Msg>,
     file: Arc<File>,
+    index: Arc<File>,
+    /// The tail new records are encoded against.
     appender: NoteAppender,
+    /// The tail of what is durable: `appender` goes back to it when a
+    /// write fails.
+    committed: NoteAppender,
     shared: Arc<Shared>,
     last_sync: Instant,
+}
+
+/// Records encoded for one write, with where each goes.
+#[derive(Default)]
+struct Chunk {
+    bytes: Vec<u8>,
+    index: Vec<u8>,
+    msgs: Vec<(Msg, Option<u64>)>,
 }
 
 impl Writer {
@@ -486,45 +826,93 @@ impl Writer {
         }
     }
 
-    /// Encode, write and fsync one batch, then answer every waiter.
+    /// Encode a batch and make it durable in chunks of at most
+    /// [`WRITE_CHUNK`] bytes, answering each chunk's waiters once it is on
+    /// disk. After a failure every remaining waiter is refused.
     fn commit(&mut self, batch: Vec<Msg>) {
-        if self.shared.failed.load(Ordering::SeqCst) {
-            let why = self.shared.reason.lock().expect("reason lock").clone();
-            return answer_all(batch, Err(Unavailable(why.unwrap_or_default())));
-        }
-        let before = self.appender.clone();
-        let mut bytes = Vec::new();
-        let mut placed: Vec<(u64, u32, Option<String>)> = Vec::new();
-        let mut cursors: Vec<Option<u64>> = Vec::with_capacity(batch.len());
-        for msg in &batch {
-            let Msg::Record(record, _) = msg else {
-                cursors.push(None);
-                continue;
+        let mut chunk = Chunk::default();
+        let mut msgs = batch.into_iter();
+        while let Some(msg) = msgs.next() {
+            if self.shared.failed.load(Ordering::SeqCst) {
+                let rest = std::iter::once(msg).chain(msgs).collect();
+                return self.refuse(chunk, rest);
+            }
+            let cursor = match &msg {
+                Msg::Record(record, _) => match self.encode(record, &mut chunk) {
+                    Ok(c) => Some(c),
+                    Err(why) => {
+                        let rest = std::iter::once(msg).chain(msgs).collect();
+                        return self.fail_chunk(chunk, rest, why);
+                    }
+                },
+                Msg::Flush(_) => None,
             };
-            match self.encode(record) {
-                Ok((cursor, frame)) => {
-                    let offset = before.byte_len() + bytes.len() as u64;
-                    placed.push((offset, frame.len() as u32, record.run_id.clone()));
-                    bytes.extend_from_slice(&frame);
-                    cursors.push(Some(cursor));
+            chunk.msgs.push((msg, cursor));
+            if chunk.bytes.len() >= WRITE_CHUNK {
+                if let Err(why) = self.write(&mut chunk) {
+                    return self.fail_chunk(chunk, msgs.collect(), why);
                 }
-                Err(why) => return self.fail(batch, before, why),
             }
         }
-        if !bytes.is_empty() {
-            if let Err(e) = self.write(&bytes, before.byte_len()) {
-                return self.fail(batch, before, format!("access log write failed: {e}"));
+        if let Err(why) = self.write(&mut chunk) {
+            self.fail_chunk(chunk, Vec::new(), why);
+        }
+    }
+
+    /// Encode one record into the chunk. Returns its cursor.
+    fn encode(&mut self, record: &AccessRecord, chunk: &mut Chunk) -> Result<u64, String> {
+        let data = JsonValue::Object(record.data.clone()).to_string();
+        let payload = if record.personal.is_empty() {
+            Vec::new()
+        } else {
+            vec![Value::from(
+                JsonValue::Object(record.personal.clone()).to_string(),
+            )]
+        };
+        let offset = self.appender.byte_len();
+        let (cursor, frame) = self
+            .appender
+            .append(timefmt::now_unix_ns(), &record.kind, &data, &payload)
+            .map_err(|f| format!("access record could not be encoded: {f}"))?;
+        chunk.index.extend_from_slice(&encode_index(
+            offset,
+            frame.len() as u32,
+            record.run_id.as_deref(),
+        ));
+        chunk.bytes.extend_from_slice(&frame);
+        Ok(cursor)
+    }
+
+    /// Write and fsync the chunk, index it, publish the new tip and answer
+    /// its waiters. The chunk is left empty.
+    fn write(&mut self, chunk: &mut Chunk) -> Result<(), String> {
+        if !chunk.bytes.is_empty() {
+            if self.shared.inject_failure.load(Ordering::SeqCst) {
+                return Err("access log write failed: injected write failure".into());
+            }
+            fsutil::write_all_at(&self.file, &chunk.bytes, self.committed.byte_len())
+                .and_then(|_| self.file.sync_data())
+                .map_err(|e| format!("access log write failed: {e}"))?;
+            // The index is derived from the log and rebuilt at every start,
+            // so it is written but not fsynced. A write that fails leaves
+            // records durable that readers cannot reach: fail closed.
+            let at = self.committed.entries() * INDEX_ENTRY as u64;
+            if let Err(e) = fsutil::write_all_at(&self.index, &chunk.index, at) {
+                self.mark_failed(format!("access log index write failed: {e}"));
             }
         }
-        {
-            let mut index = self.shared.index.write().expect("index lock");
-            for (offset, len, run) in placed {
-                index.push(offset, len, run.as_deref());
-            }
-            index.head = self.appender.head();
+        self.committed = self.appender.clone();
+        let entries = self.committed.entries();
+        *self.shared.tip.lock().expect("tip lock") = Tip {
+            entries,
+            head: self.committed.head(),
+            byte_len: self.committed.byte_len(),
+        };
+        if !self.shared.failed.load(Ordering::SeqCst) {
+            self.shared.durable.store(entries, Ordering::Release);
         }
-        let durable = self.appender.entries().saturating_sub(1);
-        for (msg, cursor) in batch.into_iter().zip(cursors) {
+        let durable = entries.saturating_sub(1);
+        for (msg, cursor) in std::mem::take(&mut chunk.msgs) {
             match msg {
                 Msg::Record(_, Some(ack)) => {
                     let _ = ack.send(Ok(cursor.unwrap_or(durable)));
@@ -535,44 +923,42 @@ impl Writer {
                 Msg::Record(_, None) => {}
             }
         }
+        chunk.bytes.clear();
+        chunk.index.clear();
+        Ok(())
     }
 
-    fn encode(&mut self, record: &AccessRecord) -> Result<(u64, Vec<u8>), String> {
-        let data = JsonValue::Object(record.data.clone()).to_string();
-        let payload = if record.personal.is_empty() {
-            Vec::new()
-        } else {
-            vec![Value::from(
-                JsonValue::Object(record.personal.clone()).to_string(),
-            )]
-        };
-        self.appender
-            .append(timefmt::now_unix_ns(), &record.kind, &data, &payload)
-            .map_err(|f| format!("access record could not be encoded: {f}"))
-    }
-
-    fn write(&self, bytes: &[u8], offset: u64) -> io::Result<()> {
-        if self.shared.inject_failure.load(Ordering::SeqCst) {
-            return Err(io::Error::other("injected write failure"));
-        }
-        fsutil::write_all_at(&self.file, bytes, offset)?;
-        self.file.sync_data()
-    }
-
-    /// Mark the log failed for good, roll the file back to its last durable
-    /// length, and refuse every waiter.
-    fn fail(&mut self, batch: Vec<Msg>, before: NoteAppender, why: String) {
-        let _ = self.file.set_len(before.byte_len());
+    /// A chunk could not be made durable: roll the file and the tail back
+    /// to the last durable state, fail for good, and refuse the chunk's
+    /// waiters and everything after them.
+    fn fail_chunk(&mut self, chunk: Chunk, rest: Vec<Msg>, why: String) {
+        let _ = self.file.set_len(self.committed.byte_len());
         let _ = self.file.sync_all();
-        self.appender = before;
+        // Back to the durable tail: the encoded frames were never written.
+        self.appender = self.committed.clone();
+        self.mark_failed(why);
+        self.refuse(chunk, rest);
+    }
+
+    /// Refuse every waiter of `chunk` and of `rest`.
+    fn refuse(&mut self, chunk: Chunk, rest: Vec<Msg>) {
+        let why = self.shared.reason.lock().expect("reason lock").clone();
+        let msgs = chunk.msgs.into_iter().map(|(m, _)| m).chain(rest);
+        answer_all(msgs, Err(Unavailable(why.unwrap_or_default())));
+    }
+
+    fn mark_failed(&self, why: String) {
         *self.shared.reason.lock().expect("reason lock") = Some(why.clone());
-        self.shared.failed.store(true, Ordering::SeqCst);
-        answer_all(batch, Err(Unavailable(why)));
+        if !self.shared.failed.swap(true, Ordering::SeqCst) {
+            if let Some(hook) = self.shared.on_fail.get() {
+                hook(&why);
+            }
+        }
     }
 }
 
-fn answer_all(batch: Vec<Msg>, result: Result<u64, Unavailable>) {
-    for msg in batch {
+fn answer_all(msgs: impl IntoIterator<Item = Msg>, result: Result<u64, Unavailable>) {
+    for msg in msgs {
         let ack = match msg {
             Msg::Record(_, ack) => ack,
             Msg::Flush(ack) => Some(ack),
@@ -587,6 +973,7 @@ fn answer_all(batch: Vec<Msg>, result: Result<u64, Unavailable>) {
 mod tests {
     use super::*;
     use crate::fsutil::testdir::TestDir;
+    use pragmatic::Journal;
 
     fn rt() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
@@ -604,6 +991,19 @@ mod tests {
         r
     }
 
+    fn all(log: &AccessLog, filter: &Filter) -> Vec<u64> {
+        let mut out = Vec::new();
+        let mut after = None;
+        loop {
+            let (page, next) = log.read(after, 1000, filter).unwrap();
+            out.extend(page.iter().map(|(c, _, _)| *c));
+            match next {
+                Some(n) => after = Some(n),
+                None => return out,
+            }
+        }
+    }
+
     #[test]
     fn records_are_durable_and_read_back_in_order() {
         let d = TestDir::new("alog");
@@ -615,35 +1015,51 @@ mod tests {
         }
         let c = rt.block_on(log.durable(rec("a", 99))).unwrap();
         assert_eq!(c, 6);
-        let (all, next) = log.read(None, 100, |_| true).unwrap();
-        assert_eq!(all.len(), 7);
+        let (page, next) = log.read(None, 100, &Filter::All).unwrap();
+        assert_eq!(page.len(), 7);
         assert_eq!(next, None);
-        assert_eq!(all[0].2.event.note_kind(), Some("run.start"));
-        let (only_a, _) = log.read(None, 100, |r| r == Some("a")).unwrap();
+        assert_eq!(page[0].2.event.note_kind(), Some("run.start"));
+        let (only_a, _) = log.read(None, 100, &Filter::Run("a".into())).unwrap();
         assert_eq!(only_a.len(), 4);
         let view = record_view(only_a[0].0, &only_a[0].2);
         assert_eq!(view["run_id"], "a");
         assert_eq!(view["source_ip"], "203.0.113.9");
         assert_eq!(view["kind"], "request");
-        let (page, next) = log.read(None, 2, |_| true).unwrap();
+        assert_eq!(view["hash"].as_str().unwrap().len(), 64);
+        let scoped = Filter::Scopes(vec!["b".into()]);
+        assert_eq!(all(&log, &scoped), vec![2, 4]);
+        let (page, next) = log.read(None, 2, &Filter::All).unwrap();
         assert_eq!(page.len(), 2);
         assert_eq!(next, Some(1));
+        assert_eq!(log.hash_at(6).unwrap(), Some(log.tip().1));
+        assert_eq!(log.hash_at(7).unwrap(), None);
 
-        // Reopen: the file verifies and continues.
+        // Reopen: the file verifies, the index is rebuilt, and the log
+        // continues.
         drop(log);
         let log = AccessLog::open(&p).unwrap();
         assert_eq!(log.tip().0, 7);
+        assert_eq!(all(&log, &Filter::Run("a".into())), vec![1, 3, 5, 6]);
         rt.block_on(log.durable(rec("c", 1))).unwrap();
         let bytes = std::fs::read(&p).unwrap();
         let parsed = Journal::parse(&bytes, None).unwrap();
         assert_eq!(parsed.journal.len(), 8);
         assert_eq!(parsed.journal.head(), log.tip().1);
+        let report = log.verify();
+        assert!(report.ok, "{report:?}");
+        assert_eq!(report.entries, 8);
     }
 
     #[test]
-    fn a_write_failure_fails_closed_for_good() {
+    fn a_write_failure_fails_closed_for_good_and_says_so_once() {
         let d = TestDir::new("alog-fail");
         let log = AccessLog::open(&path(&d)).unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let c = calls.clone();
+        log.on_failure(move |why| {
+            assert!(why.contains("injected"));
+            c.fetch_add(1, Ordering::SeqCst);
+        });
         let rt = rt();
         rt.block_on(log.durable(rec("a", 1))).unwrap();
         log.inject_write_failure();
@@ -652,8 +1068,12 @@ mod tests {
         log.shared.inject_failure.store(false, Ordering::SeqCst);
         // Sticky: even once writes would work again.
         assert!(rt.block_on(log.durable(rec("a", 3))).is_err());
+        assert!(rt.block_on(log.flush()).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         let bytes = std::fs::read(path(&d)).unwrap();
         assert_eq!(Journal::parse(&bytes, None).unwrap().journal.len(), 2);
+        // What was durable before the failure stays readable.
+        assert_eq!(all(&log, &Filter::All), vec![0, 1]);
     }
 
     #[test]
@@ -679,7 +1099,75 @@ mod tests {
         let mut bytes = std::fs::read(&p).unwrap();
         bytes[journal::HEADER_LEN + 20] ^= 1;
         std::fs::write(&p, &bytes).unwrap();
-        assert!(AccessLog::open(&p).is_err());
+        let err = AccessLog::open(&p).err().unwrap();
+        assert!(err.to_string().contains("corrupt at record 0"), "{err}");
+        let report = verify_file(&p, None);
+        assert!(!report.ok);
+        assert_eq!(report.first_bad, Some(0));
+    }
+
+    #[test]
+    fn the_index_is_derived_and_never_trusted() {
+        let d = TestDir::new("alog-index");
+        let p = path(&d);
+        let log = AccessLog::open(&p).unwrap();
+        for i in 0..10 {
+            log.submit(rec(&format!("r{}", i % 3), i));
+        }
+        rt().block_on(log.flush()).unwrap();
+        drop(log);
+        // A damaged or stale index does not matter: it is rebuilt.
+        std::fs::write(index_path(&p), b"garbage").unwrap();
+        let log = AccessLog::open(&p).unwrap();
+        assert_eq!(all(&log, &Filter::Run("r1".into())), vec![2, 5, 8]);
+        assert_eq!(
+            std::fs::metadata(index_path(&p)).unwrap().len(),
+            11 * INDEX_ENTRY as u64
+        );
+    }
+
+    #[test]
+    fn reads_examine_a_bounded_number_of_records() {
+        let d = TestDir::new("alog-scan");
+        let log = AccessLog::open(&path(&d)).unwrap();
+        for i in 0..SCAN_LIMIT + 10 {
+            log.submit(rec("busy", i));
+        }
+        log.submit(rec("quiet", 0));
+        rt().block_on(log.flush()).unwrap();
+        let quiet = Filter::Run("quiet".into());
+        // The first page examines SCAN_LIMIT records, finds nothing and says
+        // where to go on; the second finds the record.
+        let (page, next) = log.read(None, 10, &quiet).unwrap();
+        assert!(page.is_empty());
+        assert_eq!(next, Some(SCAN_LIMIT - 1));
+        let (page, next) = log.read(next, 10, &quiet).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].0, SCAN_LIMIT + 11);
+        assert_eq!(next, None);
+        // Out of scope, the same bound holds.
+        let none = Filter::Scopes(vec!["nobody:".into()]);
+        assert_eq!(log.read(None, 10, &none).unwrap().1, Some(SCAN_LIMIT - 1));
+    }
+
+    #[test]
+    fn large_batches_are_written_in_chunks_that_each_verify() {
+        let d = TestDir::new("alog-chunks");
+        let p = path(&d);
+        let log = AccessLog::open(&p).unwrap();
+        let big = "u".repeat(1 << 20);
+        let n = (WRITE_CHUNK >> 20) as u64 + 4;
+        for i in 0..n {
+            let mut r = rec("big", i);
+            r.personal.insert("user_agent".into(), big.clone().into());
+            log.submit(r);
+        }
+        rt().block_on(log.flush()).unwrap();
+        assert_eq!(log.tip().0, n + 1);
+        assert!(log.verify().ok);
+        drop(log);
+        let log = AccessLog::open(&p).unwrap();
+        assert_eq!(all(&log, &Filter::Run("big".into())).len() as u64, n);
     }
 
     #[test]
