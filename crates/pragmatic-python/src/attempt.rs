@@ -681,7 +681,7 @@ impl Attempt {
             (owned.finish(result), failed_before)
         });
         let stored = take_store_error();
-        self.release_slot();
+        py.detach(|| self.release_slot());
         self.clear_tasks(py);
         match report {
             Ok(r) => Ok(convert_report(r)),
@@ -704,7 +704,7 @@ impl Attempt {
                 drop(sink);
                 owned.abandon();
             });
-            self.release_slot();
+            py.detach(|| self.release_slot());
         }
         self.clear_tasks(py);
     }

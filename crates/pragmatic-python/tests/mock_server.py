@@ -127,8 +127,8 @@ class MockServer:
     def inject(self, method: str, pattern: str, action: str, count: int = 1) -> None:
         """Make the next ``count`` requests matching ``method`` and the path
         regex ``pattern`` fail with ``action``: ``drop`` (process, then close
-        the connection unanswered), ``503``, ``delay:<secs>`` or
-        ``bad_head``."""
+        the connection unanswered), ``503``, ``delay:<secs>``, ``bad_head``
+        or ``error:<status>:<code>`` (answer with that error unprocessed)."""
         with self.lock:
             self.faults.append(Fault(method, pattern, action, count))
 
@@ -265,6 +265,11 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if action and action.startswith("delay:"):
             time.sleep(float(action.split(":", 1)[1]))
+        if action and action.startswith("error:"):
+            _, status, code = action.split(":", 2)
+            self.mock.log.append((method, parts.path, int(status)))
+            self._send(int(status), error(code, f"injected {code}"))
+            return
         if self.headers.get("Authorization") != f"Bearer {self.mock.token}":
             status, out, hdrs = 401, error("unauthorized", "bad token"), {}
         else:

@@ -399,3 +399,37 @@ def test_push_refuses_keyed_and_format_1_journals(tmp_path, server):
     assert "keyed: refused: the journal is keyed" in out.stdout
     assert "old: refused: the journal is a format 1 journal" in out.stdout
     assert server.count("PUT", "/v1/runs/") == 0
+
+
+@pytest.mark.parametrize(
+    "status,code",
+    [(401, "unauthorized"), (403, "forbidden"), (422, "invalid_frames"), (409, "regressed"), (400, "bad_request")],
+)
+def test_definitive_errors_fail_the_session_and_are_never_resent(server, status, code):
+    rt = runtime(server)
+
+    def agent(ctx):
+        server.inject("POST", "/frames$", f"error:{status}:{code}")
+        return ctx.tool("t", lambda: 1)
+
+    with pytest.raises(pragmatic.ServerError) as caught:
+        rt.run(f"e-{code}", agent)
+    assert (caught.value.status, caught.value.code) == (status, code)
+    assert server.url in str(caught.value)
+    appends = [s for m, p, s in server.log if m == "POST" and p == f"/v1/runs/e-{code}/frames"]
+    assert appends[-1] == status and appends.count(status) == 1
+
+
+def test_resuming_a_run_the_server_does_not_have(server):
+    rt = runtime(server)
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        rt.resume("nowhere", lambda ctx: "x")
+    assert server.count("PUT", "/v1/runs/nowhere$") == 0
+
+
+def test_entries_are_read_page_by_page(server):
+    rt = runtime(server)
+    report = rt.run("pages", lambda ctx: [ctx.uuid4() for _ in range(5)] and "ok")
+    entries = rt.store.entries("pages", page=2)
+    assert [e["cursor"] for e in entries] == list(range(report.journal_len))
+    assert server.count("GET", "/v1/runs/pages/entries$") == report.journal_len // 2 + 1

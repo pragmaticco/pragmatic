@@ -232,8 +232,8 @@ impl Runtime {
     }
 
     /// Deliver a value to a run's channel inbox (this process only).
-    fn send(&self, run_id: &str, channel: &str, value: Vec<u8>) {
-        self.inner.send(run_id, channel, Value::from(value));
+    fn send(&self, py: Python<'_>, run_id: &str, channel: &str, value: Vec<u8>) {
+        py.detach(|| self.inner.send(run_id, channel, Value::from(value)));
     }
 }
 
