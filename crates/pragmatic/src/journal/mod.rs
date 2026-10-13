@@ -52,6 +52,7 @@ mod codec;
 mod erase;
 mod legacy;
 mod parse;
+mod receive;
 
 #[cfg(test)]
 mod tests;
@@ -70,6 +71,7 @@ use crate::value::Value;
 pub use erase::{EraseSelector, Erasure, ErasureNote};
 pub use legacy::LegacyEvent;
 pub use parse::{JournalError, Parsed};
+pub use receive::{decode_frame, frame_hash, split_frames, FrameError, NoteAppender};
 
 pub(crate) use parse::first_run_start_id;
 
