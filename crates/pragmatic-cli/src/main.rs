@@ -1,319 +1,163 @@
-//! `pragmatic`: journal tooling for the Pragmatic runtime.
+//! `pragmatic`: tooling for Pragmatic journals and evidence bundles.
 //!
 //! ```text
-//! pragmatic runs   [--dir DIR]                         list runs and their status
-//! pragmatic show   RUN [--dir DIR] [--key-file FILE]   print a run's timeline
-//! pragmatic verify RUN|--all [--dir DIR] [--key-file FILE]
-//!                                                      check chain, commitments, erasures
-//! pragmatic export RUN [--dir DIR] [--key-file FILE] [-o FILE]
-//!                                                      self-contained HTML replay console
-//! pragmatic serve  [--dir DIR] [--key-file FILE] [--port P]
-//!                                                      live web console on localhost
+//! pragmatic runs             list runs and their status
+//! pragmatic show RUN         print a run's timeline
+//! pragmatic verify RUN|--all check chains, commitments and erasures
+//! pragmatic export RUN       write a run's page as self-contained HTML
+//! pragmatic serve            live console on localhost
+//! pragmatic erase RUN        erase slots, keeping the chain verifiable
+//! pragmatic evidence RUN     package a run as an evidence bundle
+//! pragmatic verify-evidence  verify a bundle against pinned trust roots
+//! pragmatic render-evidence  a bundle as HTML or CSV
 //! ```
 //!
-//! Every command is read-only: journals are read as snapshots (a torn tail
-//! is ignored, never truncated) and nothing is ever written to a journal
-//! directory. Format 2 journals and read-only format 1 journals (0.4, 0.5)
-//! are both understood.
+//! Every command except `erase` is read-only: journals are read as
+//! snapshots (a torn tail is ignored, never truncated). Format 2 journals
+//! and read-only format 1 journals (0.4, 0.5) are both understood.
+//!
+//! The CLI makes no network connections, and has no dependencies beyond
+//! the core and console crates.
 
-mod export;
+mod args;
+mod evidence;
+mod journals;
+mod openssl;
 mod serve;
-mod view;
 
-use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use pragmatic::journal::Journal;
-use pragmatic::sha256::hex;
-use pragmatic::{Backend, DirBackend};
+use args::{journal_key, Args, Usage};
 
-struct Args {
-    command: String,
-    positional: Vec<String>,
-    dir: PathBuf,
-    key: Option<Vec<u8>>,
-    out: Option<PathBuf>,
-    all: bool,
-    port: u16,
+/// How a command ends when it does not succeed.
+#[derive(Debug)]
+pub enum Failure {
+    /// Bad arguments: exit 64, with the message.
+    Usage(String),
+    /// A failure with a message: exit 1.
+    Error(String),
+    /// A specific exit code, with a message.
+    Exit(u8, String),
+    /// A specific exit code; the command already printed why.
+    Silent(u8),
 }
 
-fn parse_args() -> Result<Args, String> {
-    let mut argv = std::env::args().skip(1);
-    let command = argv.next().unwrap_or_else(|| "help".to_string());
-    let mut args = Args {
-        command,
-        positional: Vec::new(),
-        dir: PathBuf::from("."),
-        key: None,
-        out: None,
-        all: false,
-        port: 7171,
-    };
-    let mut key_flag: Option<String> = None;
-    let mut key_file: Option<PathBuf> = None;
-    while let Some(a) = argv.next() {
-        match a.as_str() {
-            "--dir" => args.dir = argv.next().ok_or("--dir needs a value")?.into(),
-            "--key" => key_flag = Some(argv.next().ok_or("--key needs a value")?),
-            "--key-file" => key_file = Some(argv.next().ok_or("--key-file needs a value")?.into()),
-            "-o" | "--out" => args.out = Some(argv.next().ok_or("-o needs a value")?.into()),
-            "--all" => args.all = true,
-            "--port" => {
-                args.port = argv
-                    .next()
-                    .ok_or("--port needs a value")?
-                    .parse()
-                    .map_err(|_| "--port must be a number".to_string())?
-            }
-            "-h" | "--help" => {
-                args.command = "help".to_string();
-            }
-            other if other.starts_with('-') => return Err(format!("unknown flag {other}")),
-            other => args.positional.push(other.to_string()),
-        }
-    }
-    args.key = journal_key(key_flag, key_file)?;
-    Ok(args)
-}
-
-/// The HMAC key for keyed journals: `--key-file`, else
-/// `PRAGMATIC_JOURNAL_KEY`, else the deprecated `--key` (which puts the
-/// secret in the process list, so it warns).
-fn journal_key(flag: Option<String>, file: Option<PathBuf>) -> Result<Option<Vec<u8>>, String> {
-    if let Some(path) = file {
-        let mut bytes = std::fs::read(&path)
-            .map_err(|e| format!("cannot read key file {}: {e}", path.display()))?;
-        while bytes.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
-            bytes.pop();
-        }
-        return Ok(Some(bytes));
-    }
-    if let Some(k) = flag {
-        eprintln!(
-            "warning: --key exposes the key to other users of this machine; \
-             use --key-file or PRAGMATIC_JOURNAL_KEY"
-        );
-        return Ok(Some(k.into_bytes()));
-    }
-    Ok(std::env::var("PRAGMATIC_JOURNAL_KEY")
-        .ok()
-        .filter(|k| !k.is_empty())
-        .map(String::into_bytes))
-}
-
-/// The backend over an existing directory. The CLI never creates one.
-fn backend(dir: &Path) -> Result<DirBackend, String> {
-    if !dir.is_dir() {
-        return Err(format!("{} is not a directory", dir.display()));
-    }
-    DirBackend::new(dir).map_err(|e| format!("{}: {e}", dir.display()))
-}
-
-/// Read one run's journal as a snapshot.
-fn open(dir: &Path, run: &str, key: Option<&[u8]>) -> Result<Journal, String> {
-    backend(dir)?
-        .snapshot(run, key)
-        .map_err(|e| format!("{run}: {e}"))
-}
-
-/// Every run id in `dir`.
-fn discover(dir: &Path) -> Result<Vec<String>, String> {
-    backend(dir)?.list().map_err(|e| e.to_string())
-}
-
-fn cmd_runs(args: &Args) -> Result<(), String> {
-    let runs = discover(&args.dir)?;
-    if runs.is_empty() {
-        println!("no journals in {}", args.dir.display());
-        return Ok(());
-    }
-    let (c1, c2, c3, c4, c5) = ("RUN", "FMT", "ENTRIES", "STATUS", "HEAD");
-    println!("{c1:<28} {c2:>3} {c3:>8}  {c4:<9} {c5}");
-    for run in runs {
-        match open(&args.dir, &run, args.key.as_deref()) {
-            Ok(j) => {
-                let status = if j.audit().is_ok() {
-                    "verified"
-                } else {
-                    "BROKEN"
-                };
-                let head = hex(&j.head())[..16].to_string();
-                let mut extra = String::new();
-                let open = view::open_intents(&j).len();
-                if open > 0 {
-                    extra.push_str(&format!("  ({open} open intent(s))"));
-                }
-                if j.torn_bytes() > 0 {
-                    extra.push_str(&format!("  ({} torn bytes ignored)", j.torn_bytes()));
-                }
-                println!(
-                    "{run:<28} {:>3} {:>8}  {status:<9} {head}{extra}",
-                    j.format(),
-                    j.len()
-                );
-            }
-            Err(e) => println!("{run:<28} {:>3} {:>8}  {:<9} {e}", "-", "-", "ERROR"),
-        }
-    }
-    Ok(())
-}
-
-fn cmd_show(args: &Args) -> Result<(), String> {
-    let run = args.positional.first().ok_or("usage: pragmatic show RUN")?;
-    let j = open(&args.dir, run, args.key.as_deref())?;
-    let report = j.audit();
-
-    println!("run      : {run}");
-    println!("format   : {}", j.format());
-    println!(
-        "entries  : {} ({} agent steps)",
-        j.len(),
-        j.program_entries().len()
-    );
-    println!("verify   : {}", view::verify_line(&report));
-    println!("head     : {}", hex(&j.head()));
-    if j.torn_bytes() > 0 {
-        println!(
-            "torn     : {} bytes after the valid prefix (ignored)",
-            j.torn_bytes()
-        );
-    }
-    let open = view::open_intents(&j);
-    if !open.is_empty() {
-        println!(
-            "open     : {} intent(s) without a result, first at cursor {}: interrupted by a crash",
-            open.len(),
-            open[0]
-        );
-    }
-    println!();
-    for e in j.entries() {
-        let erased = view::erased_slots(e);
-        let erased = if erased > 0 {
-            format!("  [{erased} slot(s) erased]")
-        } else {
-            String::new()
-        };
-        println!(
-            "{:>6}  {:<6} {:<18} {}{erased}",
-            e.cursor,
-            view::branch_label(&e.branch),
-            view::label(&e.event),
-            view::summary(&e.event, 100)
-        );
-    }
-    Ok(())
-}
-
-fn cmd_verify(args: &Args) -> Result<(), String> {
-    let targets: Vec<String> = if args.all {
-        discover(&args.dir)?
-    } else {
-        let run = args
-            .positional
-            .first()
-            .ok_or("usage: pragmatic verify RUN (or --all)")?;
-        vec![run.clone()]
-    };
-    let mut failed = false;
-    for run in targets {
-        match open(&args.dir, &run, args.key.as_deref()) {
-            Ok(j) => {
-                let report = j.audit();
-                let torn = if report.torn_bytes > 0 {
-                    format!(", {} torn bytes ignored", report.torn_bytes)
-                } else {
-                    String::new()
-                };
-                println!(
-                    "{run}: {} ({} entries, format {}{torn})",
-                    view::verify_line(&report),
-                    j.len(),
-                    j.format()
-                );
-                failed |= !report.is_ok();
-            }
-            Err(e) => {
-                println!("{e}");
-                failed = true;
-            }
-        }
-    }
-    if failed {
-        Err("verification failed".to_string())
-    } else {
-        Ok(())
+impl From<Usage> for Failure {
+    fn from(u: Usage) -> Failure {
+        Failure::Usage(u.0)
     }
 }
 
-fn cmd_export(args: &Args) -> Result<(), String> {
-    let run = args
-        .positional
-        .first()
-        .ok_or("usage: pragmatic export RUN [-o FILE]")?;
-    let journal = open(&args.dir, run, args.key.as_deref())?;
-    let html = export::render(run, &journal);
-    let out = args
-        .out
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(format!("{run}.html")));
-    std::fs::write(&out, html).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
-    println!("wrote {}", out.display());
-    Ok(())
+impl From<String> for Failure {
+    fn from(e: String) -> Failure {
+        Failure::Error(e)
+    }
 }
 
-fn help() {
-    println!(
-        "pragmatic - journal tooling for the Pragmatic durable-execution runtime
+fn serve(args: &Args) -> Result<(), Failure> {
+    args.only(&["--dir", "--key", "--key-file", "--port"])?;
+    let port = args.number::<u16>("--port")?.unwrap_or(7171);
+    let key = journal_key(args)?;
+    serve::serve(args.dir(), key, port).map_err(Failure::Error)
+}
+
+const HELP: &str = "pragmatic - tooling for Pragmatic journals and evidence bundles
 
 USAGE:
-    pragmatic runs   [--dir DIR] [--key-file FILE]
-    pragmatic show   RUN [--dir DIR] [--key-file FILE]
-    pragmatic verify RUN|--all [--dir DIR] [--key-file FILE]
-    pragmatic export RUN [--dir DIR] [--key-file FILE] [-o FILE]
-    pragmatic serve  [--dir DIR] [--key-file FILE] [--port PORT]
+    pragmatic runs    [--dir DIR]
+    pragmatic show    RUN [--dir DIR]
+    pragmatic verify  RUN|--all [--dir DIR]
+    pragmatic export  RUN [--dir DIR] [-o FILE]
+    pragmatic serve   [--dir DIR] [--port PORT]
+    pragmatic erase   RUN (--cursor N [--slot K] | --match TEXT) --reason-code CODE
+                      [--reason TEXT] [--dir DIR]
+    pragmatic evidence RUN -o FILE [--dir DIR] [--redact none|detectors|binary|all]
+                      [--detectors NAME,...] [--withhold CURSOR:SLOT]...
+    pragmatic verify-evidence FILE [--tsa-roots [OPERATOR=]PEM]...
+                      [--witness-key OPERATOR=VKEY]... [--log-key VKEY]...
+                      [--min-operators N] [--log FILE] [--witness-log FILE]...
+                      [--openssl | --no-openssl]
+    pragmatic verify-evidence --explain
+    pragmatic render-evidence FILE --format html|csv [-o FILE] [trust flags as above]
 
 COMMANDS:
-    runs      List every run journaled under DIR (default: .)
-    show      Print a run's full timeline: branches, steps, notes, erased slots
-    verify    Check every chain link, commitment and erasure; never writes
-    export    Write a self-contained HTML replay console for a run
-    serve     Live web console on http://127.0.0.1:PORT (default 7171)
+    runs             List every run journaled under DIR
+    show             Print a run's timeline: attempts, branches, steps, notes
+    verify           Print the full verification report; never writes
+    export           Write a self-contained HTML page of a run
+    serve            Live console on http://127.0.0.1:PORT (default 7171)
+    erase            Erase slot content under the run's write lock; records an
+                     erasure note by local:<user>@<host>, unauthenticated
+    evidence         Write a local evidence bundle (unanchored, unsigned)
+    verify-evidence  Verify a bundle offline against the roots and keys you pin.
+                     Exit 0 VERIFIED, 2 VERIFIED (PARTIAL), 3 UNANCHORED, 1 FAILED
+    render-evidence  Write a bundle's verification report and timeline (html)
+                     or its records (csv)
 
 OPTIONS:
-    --dir DIR        Journal directory (default: current directory)
+    --dir DIR        Journal directory (default: the current directory)
     --key-file FILE  HMAC key for keyed journals (or PRAGMATIC_JOURNAL_KEY)
     --key KEY        Deprecated: puts the key on the command line
-    -o FILE          Output path for export (default: RUN.html)
-    --port PORT      Port for serve (loopback only; default 7171)"
-    );
+    -o, --out FILE   Output path
+    --tsa-roots      A pinned TSA root PEM; tokens it verifies count for
+                     OPERATOR (default: the file name)
+    --witness-key    A pinned witness key (C2SP vkey, or 64 hex digits), counted
+                     for OPERATOR
+    --log-key        The log's pinned key (C2SP vkey or a file holding one);
+                     checks checkpoint and bundle signatures
+    --min-operators  Distinct trusted operators an anchor needs (default 2)
+    --log FILE       The full anchor log, to find anchors a bundle leaves out
+    --witness-log    A witness's cosigned history, to find split views
+    --openssl        Require openssl for RFC 3161 tokens (default: use it if on PATH)
+    --explain        Print the verification procedure this verifier implements
+
+Usage errors exit 64. Nothing in a bundle is ever trusted: trust comes only from
+the roots and keys given on the command line.";
+
+fn dispatch(args: &Args) -> Result<(), Failure> {
+    if args.has("--help") {
+        println!("{HELP}");
+        return Ok(());
+    }
+    match args.command.as_str() {
+        "runs" => journals::runs(args),
+        "show" => journals::show(args),
+        "verify" => journals::verify(args),
+        "export" => journals::export(args),
+        "serve" => serve(args),
+        "erase" => journals::erase(args),
+        "evidence" => evidence::build(args),
+        "verify-evidence" => evidence::verify(args),
+        "render-evidence" => evidence::render(args),
+        "help" => {
+            println!("{HELP}");
+            Ok(())
+        }
+        other => Err(Failure::Usage(format!(
+            "unknown command '{}' (try: pragmatic help)",
+            pragmatic_console::text::sanitize(other)
+        ))),
+    }
 }
 
 fn main() -> ExitCode {
-    let args = match parse_args() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let result = match args.command.as_str() {
-        "runs" => cmd_runs(&args),
-        "show" => cmd_show(&args),
-        "verify" => cmd_verify(&args),
-        "export" => cmd_export(&args),
-        "serve" => serve::serve(args.dir.clone(), args.key.clone(), args.port),
-        "help" | "--help" | "-h" => {
-            help();
-            Ok(())
-        }
-        other => Err(format!("unknown command '{other}' (try: pragmatic help)")),
-    };
+    let result = Args::parse(std::env::args().skip(1))
+        .map_err(Failure::from)
+        .and_then(|args| dispatch(&args));
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("error: {e}");
+        Err(Failure::Usage(m)) => {
+            eprintln!("error: {m}");
+            ExitCode::from(64)
+        }
+        Err(Failure::Error(m)) => {
+            eprintln!("error: {m}");
             ExitCode::FAILURE
         }
+        Err(Failure::Exit(code, m)) => {
+            eprintln!("error: {m}");
+            ExitCode::from(code)
+        }
+        Err(Failure::Silent(code)) => ExitCode::from(code),
     }
 }
