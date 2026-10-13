@@ -1,0 +1,52 @@
+# Pragmatic Server with Docker Compose (design 4.15).
+#
+#   1. Write a configuration next to this file, starting from
+#      pragmatic.example.toml:
+#        cp pragmatic.example.toml pragmatic.toml
+#      and set, at least:
+#        listen = "0.0.0.0:7272"
+#        allow_plain_http = true      # TLS terminates at your proxy
+#        data_dir = "/var/lib/pragmatic"
+#        [keys] signing_key_file = "/run/secrets/signing_key"
+#        [bootstrap] admin_token_sha256 = "..."   # from `token bootstrap`
+#   2. Create the signing key (kept out of the data volume):
+#        docker compose run --rm --no-deps -v "$PWD/secrets:/out" \
+#          --entrypoint /usr/local/bin/pragmatic-server pragmatic \
+#          --config /etc/pragmatic/pragmatic.toml keygen
+#      or `openssl genpkey -algorithm ed25519 -out secrets/server.ed25519`.
+#   3. docker compose up -d
+#
+# Put a TLS-terminating reverse proxy in front of port 7272; the port is
+# published on the loopback interface only. Volume encryption and the
+# region the volume lives in are yours to choose.
+
+services:
+  pragmatic:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: pragmatic-server:0.6.0
+    restart: unless-stopped
+    read_only: true
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp
+    ports:
+      - "127.0.0.1:7272:7272"
+    volumes:
+      - pragmatic-data:/var/lib/pragmatic
+      - ./pragmatic.toml:/etc/pragmatic/pragmatic.toml:ro
+    secrets:
+      - signing_key
+    environment:
+      PRAGMATIC_CONFIG: /etc/pragmatic/pragmatic.toml
+    stop_grace_period: 30s
+
+secrets:
+  signing_key:
+    file: ./secrets/server.ed25519
+
+volumes:
+  pragmatic-data:

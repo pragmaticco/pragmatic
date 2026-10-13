@@ -10,6 +10,7 @@ members = [
     "crates/pragmatic-ffi",
     "crates/pragmatic-openai",
     "crates/pragmatic-anchor",
+    "crates/pragmatic-server",
 ]
 
 [workspace.package]

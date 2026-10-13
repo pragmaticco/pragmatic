@@ -8,7 +8,10 @@ building evidence bundles, the console and the CLI settled open details
 (3.5, 4.7, 4.10, 4.14, 5.1 to 5.3, 7), after the adversarial review of
 evidence verification, the console and the CLI (1.3, 4.7, 4.10, 4.14, 5.3,
 7, 10), with the anchoring library (1.5, 4.1, 4.2, 4.7, 4.8, 5.1) and
-after its review (4.1, 4.2, 4.7, 4.8, 5.1 to 5.3, 7, 9, 10). This document
+after its review (4.1, 4.2, 4.7, 4.8, 5.1 to 5.3, 7, 9, 10), after
+building the server (4.1 to 4.5, 4.7 to 4.9, 4.13, 4.17) and after the
+security, failure-handling and compliance review of the server (4.1 to
+4.13, 4.16, 4.17). This document
 is the contract
 between the components built for 0.6. Everything marked MUST is
 normative; where code and this document disagree, one of them is a bug.
@@ -917,14 +920,16 @@ Full TOML schema with defaults, in `deploy/pragmatic.example.toml` and
 `docs/server.md`:
 
 ```toml
+name = ""                            # origin pragmatic/<name>/<log id> (4.7); empty = host name
 listen = "127.0.0.1:7272"
 data_dir = "/var/lib/pragmatic"
 allow_plain_http = false
 trusted_proxy_header = ""            # e.g. "x-forwarded-for"
-lease_ttl_secs = 60
+lease_ttl_secs = 60                  # 1 to 3600
 max_request_bytes = 268435456
 max_clock_skew_secs = 300
 public_url = ""
+verify_interval_hours = 24
 
 [keys]
 signing_key_file = "/etc/pragmatic/server.ed25519"   # refused inside data_dir unless allow_key_in_data_dir
@@ -936,7 +941,7 @@ admin_token_sha256 = ""              # first admin; all other tokens are issued 
 
 [anchoring]
 interval_secs = 600                  # 60 to 3600 (4.7)
-min_independent_operators = 2
+min_independent_operators = 2        # at least 1: the server's own signature never counts
 # operator is required; roots_pem holds that operator's trust anchors (4.7)
 tsa = [ { url = "http://timestamp.digicert.com", operator = "digicert", roots_pem = "/etc/pragmatic/tsa/digicert.pem" } ]
 # operator = "" means the witness key's name
@@ -958,7 +963,7 @@ patterns = []                        # regular expressions
 [[webhooks]]
 url = ""
 secret_file = ""
-events = ["chain_broken", "anchor_failed", "regressed", "erasure", "retention", "dangling_effect", "clock_skew", "record_missing"]
+events = ["chain_broken", "anchor_failed", "regressed", "erasure", "retention", "dangling_effect", "clock_skew", "record_missing", "hold", "access_log_failed"]
 
 [witness_mode]
 enabled = false
@@ -979,16 +984,22 @@ licensee = ""
   tokens.json                         issued tokens (atomic writes)
   runs/<hh>/<64hex>.journal           hh = first 2 hex of SHA-256(run_id)
   runs/<hh>/<64hex>.meta.json         {"format":1, run_id, created_at, updated_at, entries, byte_len, head,
-                                       anchored_entries, last_anchor_leaf, leases, holds, open_intents, status}
+                                       anchored_entries, last_anchor_leaf, leases, holds, status,
+                                       unanchored_since, summary (open_intents among it)}
   runs/<hh>/<64hex>.tombstone.json    {run_id, deleted_at, entries, head, policy}
+  runs/<hh>/<64hex>.torn-<unix_ms>    torn tails moved aside (removed by erasure)
+  holds.json                          legal holds (atomic writes)
+  keys.json                           every signing key and its validity window
+  index.key                           the subjects index HMAC key (32 bytes)
   anchors/log.leaves                  the cumulative anchor log, append-only
   anchors/sth/<seq 20-digit>.json     one per batch, create_new, never overwritten
   anchors/batches/<seq 20-digit>.json run id of each leaf of the batch (never served raw)
   anchors/witness/<seq 20-digit>/<label>.json
                                       one verified witness result per witness, create_new
-  witness/witness.journal             witness mode only: cosigned checkpoints, journal format 2
   audit/access.journal                the access log, journal format 2
-  erasure-ledger.jsonl                every erasure and shred, also streamed to webhooks
+  audit/access.index                  its frame offsets, rebuilt from it at every start
+  audit/anchor.json                   the access log's last anchor leaf {leaf_index, entries, head}
+  erasure-ledger.jsonl                every erasure, shred, delete and hold change, written before it commits
 ```
 
 - All JSON files are written as temp file, fsync, rename, fsync directory;
@@ -998,8 +1009,18 @@ licensee = ""
   fsync, under the run's lock.
 - `meta.json` is rewritten at most once per second per run, and at clean
   shutdown.
-- At startup a journal whose size equals `meta.byte_len` is trusted;
-  otherwise it is parsed again.
+- At startup a journal whose size equals `meta.byte_len` and whose last 32
+  bytes equal `meta.head` is trusted; otherwise it is parsed again (4.17),
+  and it must still hold the history meta recorded: at least
+  `meta.entries` entries, entry `meta.entries - 1` hashing to `meta.head`.
+  A journal that lost acknowledged entries or rewrote them is damaged
+  (`chain_broken`) and never truncated; a torn tail is truncated only when
+  the valid prefix covers both `meta.entries` and `anchored_entries`.
+- A run whose files cannot be read at startup is *unavailable*: its id
+  answers 503 `storage_unavailable`, it is loaded on first use once it
+  reads, and its files are never replaced (`PUT` refuses to create a run
+  whose journal, meta or tombstone exists on disk). An unreadable
+  tombstone still deletes its id (410).
 - `/healthz` is live at once. `/readyz` and every run endpoint return 503
   `starting` until the index is ready. Full verification runs in the
   background.
@@ -1016,7 +1037,13 @@ created_at, expires_at, revoked_at}`, stored with `sha256` only.
 
 - `principal` (a person or service identifier) is required.
 - `scopes` is a list of run-id prefixes. It is required for every
-  non-admin role. `["*"]` must be explicit.
+  non-admin role. `["*"]` must be explicit. An admin's scopes are always
+  `["*"]`: tokens, holds and the whole access log cannot be scoped, so an
+  admin token with narrower scopes is refused at issue and never
+  authenticates if one is found in `tokens.json`.
+- The record also holds `created_by`, the token id that issued it, and the
+  issue's access-log intent names the new token's id, durable before the
+  token exists.
 - Roles:
 
 | role | may |
@@ -1045,29 +1072,31 @@ All under `/v1`. Bearer auth. Errors are
 
 | method and path | role | behavior |
 |---|---|---|
-| `GET /v1/info` | any | `{server, version, api_version: 1, min_sdk, journal_format: 2, chain: "sha256", lease_ttl_secs, max_request_bytes, max_frame_bytes, server_time, independent_witness: bool, licensee}` |
+| `GET /v1/info` | any | `{server, version, api_version: 1, min_sdk, journal_format: 2, chain: "sha256", lease_ttl_secs, max_request_bytes, max_frame_bytes, server_time, independent_witness: bool, components: {anchoring, evidence, console: "integrated"\|"not_integrated"}, licensee}`; `independent_witness` is false while anchoring is not integrated |
 | `GET /v1/whoami` | any | as above |
 | `GET /v1/keys` | any | every server signing key `{key_id, public_key, not_before, not_after}` |
 | `GET /v1/runs?prefix=&q=&label.k=v&program=&status=&since=&until=&limit=&after=` | any | `{runs: [RunSummary], next}`. `q` matches run id and label values only, never content |
 | `GET /v1/runs/{id}` | any | `RunSummary` + `{verify: VerifyReport (cached, incremental)}` |
-| `GET /v1/runs/{id}/entries?from=&limit=` | any | Entry JSON (below); content redacted unless `view_raw`; slots over 64 KiB truncated |
+| `GET /v1/runs/{id}/entries?from=&limit=` | any | `{entries: [Entry JSON (below)], next, total}`; content redacted unless `view_raw`; slots over 64 KiB truncated |
 | `GET /v1/runs/{id}/entries/{cursor}/slots/{k}` | any | one slot's content, redaction rules apply |
 | `GET /v1/runs/{id}/journal` | agent (with its lease), admin, auditor+view_raw | journal bytes, `Pragmatic-Entries`, `Pragmatic-Head` |
-| `PUT /v1/runs/{id}` | agent, admin | body: the 16-byte header (flags 0). Creates the run and grants a lease atomically: 201 `{lease, ttl_secs}`; or `run_exists`, `run_deleted` |
-| `POST /v1/runs/{id}/lease` | agent, admin | body `{"holder": client uuid}`. Acquire, or renew if same holder: 200 `{lease, ttl_secs}`; `run_locked` with `Retry-After` and `{holder_expires_in}` |
+| `PUT /v1/runs/{id}` | agent, admin | body: the 16-byte header (flags 0); optional header `Pragmatic-Holder`. Creates the run and grants a lease atomically: 201 `{lease, ttl_secs, entries}`; or `run_exists`, `run_deleted` |
+| `POST /v1/runs/{id}/lease` | agent, admin | body `{"holder": client uuid}`, optional header `Pragmatic-Lease`. Acquire, or renew if same holder and token: 200 `{lease, ttl_secs, entries}`; `run_locked` with `Retry-After` and `{holder_expires_in}` (4.17) |
 | `DELETE /v1/runs/{id}/lease` | agent, admin | header `Pragmatic-Lease`; appends the `custody` note; 204 |
 | `POST /v1/runs/{id}/frames?at=N` | agent, admin | headers `Pragmatic-Lease`, `Pragmatic-Frames: k`, `Pragmatic-Head`; body = k frames. 200 `{entries, head, duplicate}` |
 | `GET /v1/runs/{id}/evidence?redact=&anchor=now` | auditor, admin | evidence bundle; `anchor=now` forces a batch and waits for it |
 | `POST /v1/runs/{id}/erase` | admin | `{"slots": [[c, s], ...] \| "match": "<text>" \| "all", "reason_code", "reason", "force": false, "allow_unfinished": false}` |
 | `POST /v1/holds`, `DELETE /v1/holds/{id}`, `GET /v1/holds` | admin | `{matter, scope: {run_ids} \| {prefix}}` |
+| `POST /v1/runs/{id}/accept-regression` | admin | accept a regressed run's journal as its history; logged before it acts (4.2) |
 | `POST /v1/subjects/search` | admin | body `{"subject": "..."}`; returns run ids from the subject index |
 | `POST /v1/retention/run` | admin | run retention now; report |
+| `POST /v1/verify-data` | admin | run verify-data now (4.13); report |
 | `GET /v1/anchors?after=&limit=`, `GET /v1/anchors/{seq}` | auditor, admin | signed tree heads and witness results; leaves filtered by scope |
 | `GET /v1/anchors/log?from=&to=` | auditor, admin | raw leaves (admin: all; auditor: in-scope leaves with inclusion proofs) |
-| `GET /v1/audit?run_id=&after=&limit=` | admin; auditor for in-scope runs | access-log records |
+| `GET /v1/audit?run_id=&after=&limit=` | admin; auditor for in-scope runs | `{records, next}`; an auditor without `run_id` gets the records of its in-scope runs; each record carries its chain `hash`; personal fields are `[withheld]` without `view_raw`; one call examines at most 4,096 records and `next` says where to continue |
 | `POST /v1/tokens`, `DELETE /v1/tokens/{id}`, `GET /v1/tokens` | admin | token lifecycle |
-| `POST /v1/witness` | witness_client | 4.8 |
-| `GET /v1/witness/log/{origin}?after=` | that origin's auditors, admin | 4.8 |
+| `POST /v1/witness`, `POST /add-checkpoint` | witness_client | 4.8 |
+| `GET /v1/witness/log/{origin}?after=` | that origin's auditors, admin | 4.8; at most 1,000 record entries per call, with `next` |
 | `GET /healthz`, `GET /readyz`, `GET /metrics` | none | `/metrics` carries no run ids or label values |
 
 **RunSummary:** `{run_id, entries, head, created_at, updated_at, status:
@@ -1092,12 +1121,14 @@ len}], hash}`. `text` is used when the bytes are valid UTF-8, otherwise
 | `lease_lost`, `lease_expired` | 409 | fail the session; raise `Locked` |
 | `conflict` | 409 | reconcile through the duplicate rule, otherwise fail |
 | `regressed` | 409 | fail; an admin must act |
+| `chain_broken` | 409 | fail; an admin must act (the stored journal is damaged or missing) |
 | `on_hold`, `retention_locked` | 409 | erasure refused (admin) |
 | `run_deleted` | 410 | raise `Deleted`; never recreate |
 | `invalid_frames` | 422 | fail; never retry |
 | `payload_too_large` | 413 | fail; raise `TooLarge` |
 | `starting`, `storage_unavailable` | 503 + `Retry-After` | resend the identical request until the lease deadline |
 | `bad_request` | 400 | fail |
+| `not_implemented` | 501 | fail (a component is not part of this build) |
 
 ### 4.5 Leases
 
@@ -1113,9 +1144,13 @@ len}], hash}`. `text` is used when the bytes are valid UTF-8, otherwise
   `lease_lost` fails the session.
 - When a lease ends (release, takeover, or lazy-expiry takeover), the
   server appends a `custody` note for it under the run lock before
-  granting the next lease.
+  granting the next lease. A run with no entries yet gets no custody note:
+  its first entry must be `run.start`.
 - `dangling_effect` and status `dangling` require that no renewal has
   happened for more than `2 × ttl`.
+- A holder whose lease was taken over after it expired gets
+  `lease_expired`; a released, revoked (forced erasure) or unknown lease
+  is `lease_lost`.
 
 ### 4.6 Append protocol
 
@@ -1142,6 +1177,15 @@ The server checks, in this order:
     for custody;
   - the head after the last frame must equal `Pragmatic-Head`.
 - All-or-nothing: write, fsync, then update the index.
+- Stored hashes for the duplicate rule come from the writer's journal when
+  it is loaded and otherwise from disk by offset: a request from a token
+  without the lease never loads a journal.
+- Before the body is read, the checks that need no body run (in the same
+  order): existence, writability, and, unless `Pragmatic-Head` equals the
+  stored hash at `at + k - 1` (a possible resend, which the duplicate rule
+  must see), the lease and `at`. A refused body is drained, not buffered.
+- The first entry of a run is its `run.start` note naming the run's own
+  id, and no later entry is a `run.start` (422 `invalid_frames`).
 - Clients resend the identical request on connect errors, timeouts, 502,
   503 and 504 until success, a definitive error, or the lease deadline.
 - **Create:** POST lease. On `not_found`, PUT (which grants the lease).
@@ -1187,12 +1231,17 @@ leaf_data = "pragmatic/v2/leaf" ‖ u8 type (0 run, 1 access log) ‖ u32 len(id
     verifiable random function (RFC 9381) would keep both properties; it
     is deferred (section 10).
 - The access log's leaves (type 1) carry the id `access` in both modes. A
-  server in witness mode anchors its witness journal (4.8) as run
-  `pragmatic:witness`.
+  server in witness mode anchors each origin's witness record (4.8), the
+  run `pragmatic:witness:<name>`, like any other run.
 - Every `interval_secs`, one task snapshots, under each run's lock, the
   fsynced `(entries, head)` of every run and of the access log that
   changed since its last leaf. Runs created by PUT are included even with
-  zero entries.
+  zero entries. Each object names its previous leaf: a run's is in its
+  `meta.json` (written at once when a batch places it), the access log's
+  in `audit/anchor.json`; at startup both are raised to the anchor log's
+  last leaves, which are durable first. At startup and in verify-data the
+  access log must still hold the records its last leaf covers, ending in
+  its head; otherwise `chain_broken` fires for `pragmatic:access-log`.
 - Leaves are appended to the log in order of (type, raw id bytes).
   Duplicate ids within a batch abort the batch.
 - A snapshot with fewer entries than its id's latest leaf, or the same
@@ -1269,8 +1318,10 @@ leaf_data = "pragmatic/v2/leaf" ‖ u8 type (0 run, 1 access log) ‖ u32 len(id
 - **Anchoring never blocks journaling.** The anchoring lag (the age of the
   oldest unanchored append) is a metric and an alert. It is the window in
   which an insider could rewrite history undetected. The server measures
-  it from each append's time and the `anchored_entries` each batch
-  reports.
+  it from its own runs (each records when its oldest append not yet
+  independently anchored was made), so it grows whenever anchoring does
+  not happen, whatever the reason, and it moves only with the
+  `anchored_entries` each batch reports.
 
 Witnesses:
 
@@ -1316,6 +1367,9 @@ Witnesses:
 
 Rules:
 
+- Auditors see the access log's leaves (a count and a head, nothing about
+  any run or person), so they can check the records they read, each
+  served with its chain hash, against an anchored head.
 - The checkpoint file is stored as soon as the server signature exists.
 - Every external witness owes a result for every checkpoint. In each
   pass, each witness works through the checkpoints it owes oldest first,
@@ -1344,8 +1398,9 @@ Rules:
 - A run's leaves in different checkpoints can become independent out of
   order (a retry succeeds late), so `anchored_entries` is the largest
   `entries` among its independently anchored leaves.
-  `min_independent_operators = 0` lets the server's signature alone
-  advance it, for `allow_self_anchoring` deployments.
+  `min_independent_operators` is at least 1: the server's signature never
+  advances it, so an `allow_self_anchoring` deployment without external
+  witnesses keeps `anchored_entries` at 0 and its anchoring lag says so.
 - Advancement survives a crash. Witness results are durable before the
   server records the `anchored_entries` they allow, so the first pass
   after startup reports again, for every id, its newest independently
@@ -1354,12 +1409,15 @@ Rules:
   crash in that window would leave a finished run unanchored forever.
 - Each TSA request times out after 30 s.
 
-**Key rotation:** `keygen --rotate` appends a `key.rotate` record (old and
-new key ids, signed by both) to the access log. `GET /v1/keys` lists every
-key with its validity window. Both keys sign `"pragmatic/v2/key-rotate\n"
-‖ canonical JSON of {at, new_key_id, new_public_key, old_key_id,
-old_public_key}`; the note data is those fields plus `old_signature` and
-`new_signature`, all hex. Key ids are the 4-byte note key ids. The origin
+**Key rotation:** `keygen --rotate` (server stopped) appends a `key.rotate`
+record (old and new key ids, signed by both) to the access log. `GET
+/v1/keys` lists every key with its validity window. Both keys sign
+`"pragmatic/v2/key-rotate\n" ‖ canonical JSON of {at, new_key_id,
+new_public_key, old_key_id, old_public_key}`; the note data is those
+fields plus `old_signature` and `new_signature`, all hex. Key ids are the
+4-byte note key ids, as in checkpoint signature lines and bundle
+signatures (5.1); since four bytes identify a key only as a hint, every
+place that names a key id also carries the full public key. The origin
 does not change on rotation, and the server refuses to sign for a log
 whose checkpoints name another origin.
 
@@ -1394,29 +1452,36 @@ can cosign checkpoints for other logs and join the public witness network.
 - **What it returns:** a `cosignature/v1` signature line (Ed25519)
   covering `"cosignature/v1\ntime <unix>\n" ‖ checkpoint body`.
 - **Its own record:** the witness appends every cosigned checkpoint to its
-  own journal, which it anchors to its own TSAs.
+  own record, which it anchors to its own TSAs.
   `GET /v1/witness/log/{origin}?after=` returns the cosigned history for
   audits.
-  - The journal is `witness/witness.journal`, format 2, run id
-    `pragmatic:witness`, anchored in the server's own log like a run. It
-    is created whole (header and `run.start` published together), so a
-    file shorter than a header or holding no entries is damage: the
-    witness refuses to start rather than begin a fresh journal that has
-    forgotten what it cosigned.
+  - The record of each origin is the server-written run
+    `pragmatic:witness:<name>`, named by the origin entry's configuration
+    `name` (a reserved id no client can write),
+    kept in the run store and anchored in the server's own log like any
+    run. It is created whole (header and `run.start` together), the last
+    cosigned size is read from it under the run's lock, and a damaged
+    record refuses writes (`chain_broken`), so the witness stops cosigning
+    for that origin rather than begin a fresh record that has forgotten
+    what it cosigned.
   - Each cosigned checkpoint is a `witness.cosign` note `{origin,
-    old_size, tree_size, root, timestamp, checkpoint, cosignature}`,
+    old_size, tree_size, root, timestamp}` whose payload slot holds the
+    cosigned checkpoint (the signed note and the cosignature line),
     durable before the cosignature is returned and atomic with the size
     check, so a crash can never make the witness forget a cosignature and
-    sign a fork. The latest size per origin is recovered from it at
-    startup.
+    sign a fork.
   - A correctly signed checkpoint that fails the consistency checks (a
-    fork attempt) is recorded as a `witness.reject` note.
-  - The log endpoint pages by journal cursor: `after` is a cursor, and
-    the response is `{origin, records: [{cursor, ...}], next}`.
-  - In 0.6 the witness keeps its journal in memory and parses it whole
-    at startup (the core `Journal` keeps every entry), about a kilobyte
-    per cosignature. Bounded memory needs a core API that appends to a
-    journal from its tail state (head, length) and is deferred (10).
+    fork attempt) is recorded as a `witness.reject` note `{origin,
+    old_size, tree_size, root, reason}` with the submitted note as its
+    payload slot.
+  - The log endpoint pages by record cursor: `after` is a cursor, one
+    call reads at most 1,000 record entries, and the response is
+    `{origin, cosigned: [{cursor, at, origin, old_size, tree_size, root,
+    timestamp, checkpoint}], next}`.
+  - While a record is written its journal is held whole (the store's
+    writer keeps the parsed journal), about a kilobyte per cosignature.
+    Bounded memory needs a writer that appends from the journal's tail
+    state (head, length) and is deferred (10).
 
 Pragmatic Research runs the hosted witness with this same binary. The CLI
 ships its public keys, an empty list until it launches.
@@ -1432,27 +1497,48 @@ ships its public keys, an empty list until it launches.
     `retain_until`; the refusal is logged with reason `legal_obligation`).
   - A run whose last `attempt.end` is not ok needs `allow_unfinished`; the
     response states the run can no longer resume.
-  - It takes the run's exclusive RW lock. Readers of journal, entries and
-    evidence hold it shared.
-  - It writes per 2.13, then the erasure ledger and access log. The note's
-    `by` is the token id, and `access_log_cursor` points at its access
-    record.
+  - It takes the run's exclusive RW lock. Readers of entries and evidence
+    hold it shared while they read; a journal download holds it for each
+    chunk it reads and is aborted once an erasure or deletion has replaced
+    or removed the file, so no byte read after the erasure committed is
+    served and an erasure never waits for a download.
+  - Every refusal comes before anything changes: with `force` the
+    selector is checked before the lease is revoked.
+  - The access record is made durable, a lease still recorded is ended
+    (custody note, `meta.json` written at once), the erasure ledger record
+    is written (fsynced), and only then is the file committed per 2.13: a
+    restore re-applies the ledger, so no committed erasure may lack its
+    record. The note's `by` is the token id, and `access_log_cursor`
+    points at its access record.
   - Client-supplied `by` values are not accepted.
 - **Holds** are objects. A run is held while any hold matches it,
   including runs created later under a held prefix. Hold changes and
   retention actions take the run's exclusive lock, and retention re-reads
-  holds under that lock immediately before acting.
+  holds under that lock immediately before acting. Placing and removing a
+  hold are erasure-ledger records (with the hold), written before they
+  act and announced by the `hold` webhook (without the matter), so a
+  restore places and removes them again.
 - **Retention**
   - When several policies match, each value is the most restrictive one:
     the largest `retain_min_days`, `deny` over `allow`.
   - Ages count from `updated_at`, and runs with a live lease are skipped.
-  - Shred erases every content slot (reason_code `retention`). Delete
-    removes the journal and writes a tombstone. Tombstoned ids can never
-    be recreated (410).
+  - Shred erases every content slot (reason_code `retention`, `by`
+    `server:retention`). Delete writes its ledger record, then a
+    tombstone, then removes the files. Once the tombstone is durable the
+    run is deleted (its tombstone is registered before it leaves the run
+    map, so no `PUT` slips in between); files that cannot be removed yet
+    are removed at the next start. Tombstoned ids can never be recreated
+    (410). Both are erasure-ledger records.
+  - Runs with reserved `pragmatic:` ids are never touched by retention.
   - Retention runs hourly and on demand.
   - Validation: shred and delete must each be at least `retain_min`.
+  - Combining `shred_after_days` and `delete_after_days` across policies:
+    the smallest non-zero value, but never earlier than the combined
+    `retain_min_days` (0 only when every matching policy says never).
 - **Subjects index:** HMAC(index_key, subject) → run ids, from `run.start`
-  payload slots. Entries are removed when the slot is erased. It is
+  payload slots. Entries are removed when the slot is erased. The hashes
+  are kept in each run's `meta.json` and searched there; `index_key` is
+  `<data_dir>/index.key`. It is
   queried only through admin `POST /v1/subjects/search`, with the
   identifier in the body (never logged).
 
@@ -1471,8 +1557,14 @@ a slot is large, deep or not quite strict JSON:
   a slot that is not UTF-8 is binary as a whole. The detection lives in
   the core (`redact::binary::scan`), shared by the server, the console and
   evidence redaction.
-- Text is redacted with the built-in detectors plus configured patterns.
-- Non-JSON slots are redacted as text.
+- Text is redacted with the built-in detectors plus configured patterns,
+  object keys included; keys that redact alike get a suffix (`[email]`,
+  `[email] (2)`) so the view stays strict JSON.
+- A slot that is JSON but not strict JSON (a repeated key, deep nesting,
+  `NaN`) is still scanned for binary fields in every copy of a repeated
+  key, and the same rules apply, so its binary fields are withheld.
+- Non-JSON slots are redacted as text, and runs of 256 or more base64
+  characters in them are withheld as binary.
 - A slot that starts like JSON but cannot be read to its end is reported
   as `incomplete` by the scan, with whatever was found before it stopped.
   Evidence redaction (`binary`, `detectors`) withholds such slots: what
@@ -1491,13 +1583,25 @@ presented credential's SHA-256), principal, role, method, route
 (template), run_id, status, raw: bool, cursor_from, cursor_to, source_ip,
 user_agent, at}`.
 
-- Query-string values are never logged; only parameter names are.
+- Query-string values are never logged; only parameter names are, at
+  most 32 (the rest are counted). A path's run id is logged only when it
+  is well formed (2.15) or names a run the server holds; otherwise as
+  `invalid_run_id: {bytes, sha256}`.
+- Nothing is kept in memory per record: reads go through an on-disk
+  offset index rebuilt at every start, opening and verifying read the log
+  frame by frame (the core's `NoteAppender::follow` and `classify_tail`),
+  and one read examines at most 4,096 records.
 - One writer task appends with group commit (one fsync at most every
   50 ms).
 - Erasure, holds, retention, token changes and raw-content reads wait
   for their record to be durable before acting.
 - If the access log cannot be written, every authenticated request gets
-  503 `storage_unavailable` (fail closed).
+  503 `storage_unavailable` (fail closed). `/readyz` answers 503 too, the
+  `pragmatic_access_log_failed` gauge is 1, and the `access_log_failed`
+  webhook fires.
+- Viewers without `view_raw` see the personal fields (`principal`,
+  `source_ip`, `user_agent`) as `[withheld]`: content detectors do not
+  recognize every address or name.
 - The access log is never shredded by run policies.
 - At startup the server appends `config.loaded {config_sha256, token_ids,
   key_id}`.
@@ -1513,24 +1617,44 @@ Custody for each run is written into the run's own journal as the
 - `/metrics` exposes `pragmatic_appends_total`,
   `pragmatic_append_seconds` (histogram), `pragmatic_runs`,
   `pragmatic_anchor_failures_total`, `pragmatic_chain_broken_total`,
-  `pragmatic_dangling_effects`, `pragmatic_tokens_total{kind}` and
-  `pragmatic_access_log_lag_seconds`.
+  `pragmatic_dangling_effects`, `pragmatic_tokens_total{kind}`,
+  `pragmatic_access_log_lag_seconds`, `pragmatic_access_log_failed` and
+  `pragmatic_anchor_lag_seconds`.
+- A run is damaged (`chain_broken` webhook and metric, writes refused,
+  listed in verify-data's `failing_run_ids`) when any verification
+  finding is not ok: a failing chain or commitment, and also erasure
+  accounting that does not add up (2.13). When the only finding is
+  `erasure_incomplete`, erasure stays allowed, since erasing again repairs
+  it.
 
 ### 4.13 Backup, restore, verification, upgrades
 
 - **`backup --to DIR`**
+  - Notes the erasure ledger's last record before copying any journal;
+    that is the manifest's `ledger_seq`, so everything recorded while the
+    backup runs is applied again by a restore (re-applying is harmless).
   - Copies each journal up to its indexed length (opened by fd, so an
-    erasure rename is safe), plus meta, anchors, access log, tokens and
-    the erasure ledger.
+    erasure rename is safe), plus meta, anchors, the access log's last
+    leaf and the access log, tokens and the erasure ledger, as streams.
   - Writes `manifest.json` signed by the server key.
-- **`restore --from DIR [--erasure-ledger FILE]`**
-  - Re-applies every ledger entry newer than the snapshot.
+- **`restore --from DIR [--erasure-ledger FILE] [--trust-key HEX]`**
+  (server stopped, empty data directory)
+  - Verifies the manifest signature against keys trusted from outside the
+    backup: the configured signing key, the keys it replaced (kept next to
+    it by `keygen --rotate`), and keys named with `--trust-key`. A key the
+    backup's own key ring names proves nothing. Verifies every file's
+    SHA-256, again as it copies.
+  - Re-applies every ledger entry newer than the snapshot, in order
+    (erasures, shreds, deletes and hold changes), without writing records
+    the restored ledger already holds.
+  - Ends every restored lease with a custody note (`end: "restored"`).
   - Marks runs whose `entries` are fewer than their anchored length as
     `regressed`.
   - Appends a `restore` access record.
   - The docs require streaming the erasure ledger off the host.
 - **`verify-data`** runs every `verify_interval_hours` (default 24) and on
-  demand. It re-verifies every chain, every commitment and every anchor
+  demand (`POST /v1/verify-data`, which the subcommand calls; `--offline`
+  works on a stopped server's data directory). It re-verifies every chain, every commitment and every anchor
   inclusion and consistency proof, and records the results in the access
   log.
 - **`migrate`** upgrades `data_format`. The server refuses to start on an
@@ -1598,6 +1722,118 @@ SSD:
 - At least 1,000 appends per second across 200 concurrent runs.
 - Startup ≤ 30 s with 1 million runs.
 - Journals up to 1 GiB.
+
+### 4.17 Implementation notes and resolutions
+
+Decisions made while building the server, where the sections above were
+silent or disagreed:
+
+- **Configuration additions (4.1).** `name` (the server name in the
+  anchoring origin; default the host name), `verify_interval_hours`
+  (4.13), `[anchoring] min_independent_operators` (4.7), `operator` on TSAs
+  and on witnesses (4.7), and the log's keys on witness-mode origins (4.8
+  requires them). `interval_secs` defaults to 600 as 4.7 states (4.1
+  previously showed 60). Unknown keys are refused. The schema in 4.1 is
+  the reconciled one (section 11).
+- **The holder of a PUT lease (4.4, 4.5).** `PUT` names no holder, so its
+  lease has none until the first `POST lease` that presents the lease id
+  in `Pragmatic-Lease`, which records its holder (`PUT` may also name one
+  in `Pragmatic-Holder`). A `POST lease` naming a holder without that
+  proof is a different holder, so another process using the same token
+  cannot adopt a live lease. Renewal also requires the same token.
+- **Agents read entries.** The endpoint table makes entries readable by
+  any role and the SDK's `rt.entries(id)` needs them, so agents may read
+  the entries and slots of in-scope runs (redacted unless `view_raw`). Raw
+  journal bytes still need the agent's lease.
+- **Custody notes (2.11, 4.5).** `principal` is the token id (2.11 forbids
+  names in notes), `lease` is the hex SHA-256 of the lease id, times are
+  Unix nanoseconds, and an `end` field says `released`, `expired`,
+  `revoked` or `restored` (a lease that came back with a backup and was
+  ended by the restore).
+- **Status.** `dangling` means an `EffectIntent` without a result and no
+  lease activity (renewal or append) for more than `2 × ttl`; dangling
+  draws are re-issued on resume and do not count. `updated_at` moves only
+  on client appends (and creation), so server-written notes (custody,
+  erasure) do not postpone retention.
+- **Append order.** A regressed, damaged or missing run answers its
+  error (`regressed`, `chain_broken`) right after the existence check,
+  before the duplicate rule: its stored hashes cannot be relied on. Header
+  and query problems (`bad_request`) and oversized bodies
+  (`payload_too_large`) are answered before step 2.
+- **Erasure of an unfinished run** without `allow_unfinished` is
+  `400 bad_request` with `"unfinished": true`. A run with an expired (not
+  live) lease is erasable; its lease is ended with a custody note first.
+- **Damaged journals.** A journal that fails to parse at startup, fails
+  background verification (any finding that is not ok, erasure accounting
+  included), no longer matches its index, or no longer holds the history
+  its meta recorded is marked damaged: reads serve its valid prefix,
+  writes and erasure answer `409 chain_broken` (erasure stays allowed when
+  the only finding is `erasure_incomplete`, which erasing again repairs),
+  and the `chain_broken` webhook and metric fire. It is never truncated or
+  rewritten, and its meta is kept.
+- **Unreadable runs (4.2).** Any I/O error reading a run's files at
+  startup (or its whole shard directory) makes the run unavailable rather
+  than absent, because the client action for `not_found` on a lease is
+  `PUT`: answering 404 would let a client replace a history the server
+  only failed to read. Unavailable ids answer 503 and are loaded on first
+  use once they read; `PUT` never replaces files on disk.
+- **The startup shortcut.** A journal is trusted without parsing only when
+  its size equals `meta.byte_len` and its last 32 bytes equal `meta.head`,
+  because an erasure can change the head without changing the size.
+  `meta.json` is written by a flusher, never on the append path, so it lags
+  appends by up to a second; lease changes, creation and erasure write it
+  at once, and a trusted `meta.json` is not rewritten at startup.
+- **Access log records (4.11).** Each record is a note whose `data` holds
+  the structural fields and whose single payload slot holds `principal`,
+  `source_ip` and `user_agent` (and, for a token issue, the new token's
+  name and principal), apart from the structural fields. The format would
+  let those slots be erased while the chain verifies, but this build has
+  no operation that erases access-log records: the log is a security
+  record kept whole (erasing inside a log that is never held in memory
+  needs a streaming rewrite, deferred). Request records have kind
+  `request`; operations that must be durable before they act first write
+  an `intent` record, whose cursor an erasure note's `access_log_cursor`
+  names. `trusted_proxy_header` uses the last address in the header. A
+  failed write fails closed for every authenticated request until
+  restart; unauthenticated requests still get 401. The log is appended
+  through the core's `NoteAppender`, written at most 16 MiB per write (so
+  a torn tail is never longer than that plus a record, and a restart
+  reads at most 64 MiB of tail to classify it), and is never held in
+  memory.
+- **Backup (4.13).** A live backup copies each journal up to
+  `meta.byte_len` (or the last whole frame before it), so it may omit the
+  last second of appends. The manifest is signed over SHA-256 of its
+  canonical JSON without the signature, and its `ledger_seq` is the
+  ledger's position before the first journal was copied. `restore` takes
+  anchored lengths from the restored metas, the newer ledger records and
+  the anchoring library, and ends leases from the backup with custody
+  notes.
+- **Integration points.** Anchoring, evidence bundles and the console
+  renderer plug in through `pragmatic_server::hooks` (`Anchoring`,
+  `EvidenceBuilder`, `ConsoleRenderer`). Until they are integrated the
+  server runs with stubs that anchor nothing and answer `501
+  not_implemented`, and `verify-evidence` defers to the CLI. A stub claims
+  nothing it does not do: `/v1/info` reports `components` and
+  `independent_witness: false`, the anchoring lag grows, and evidence
+  answers 501 before reading the journal. `Anchoring::last_leaves`
+  reports every object's last leaf so startup can recover leaves a crash
+  kept out of `meta.json`.
+- **Reads are bounded by the request (4.4).** Entries and slots are read
+  frame by frame at their offsets (64 MiB of offsets cached across runs,
+  at most 64 MiB of frames per page); verification, evidence and the
+  valid prefix of a damaged journal hold whole journals only within a
+  1 GiB budget shared by all of them; a list examines at most 10,000 runs
+  per page and returns where to continue.
+- **Limits per client (4.16).** A request's headers must arrive within
+  30 s (idle kept-alive connections close after it), at most 4,096
+  connections are served at once, request bodies being received share a
+  1 GiB budget (at least `max_request_bytes`) and must arrive at 256 KiB/s
+  after a 30 s grace. These are `server::Limits`, not configuration.
+- **Console sessions** live in memory: a restart signs everyone out.
+- **Webhook deliveries** waiting for a retry live in memory; the erasure
+  ledger is the durable record to stream off the host. Two events were
+  added: `hold` (a hold placed or removed: its id, scope and ledger seq,
+  never the matter) and `access_log_failed`.
 
 ---
 
@@ -2133,5 +2369,57 @@ from the CLI; Claude Agent SDK capture (hooks and session store);
 LiteLLM's own Anthropic handler; a Pydantic AI durable-execution backend;
 the TypeScript SDK; multi-replica servers; anchor ids bound to the log key
 by a verifiable random function (RFC 9381 ECVRF), so that HMAC-named runs
-can be audited for hidden anchors (4.7); a witness journal in bounded
-memory (a core API to append to a journal from its tail state, 4.8).
+can be audited for hidden anchors (4.7); witness records in bounded
+memory (a writer that appends to a journal from its tail state, 4.8).
+
+---
+
+## 11. Integration decisions
+
+The CLI and evidence, anchoring, server and Python lanes amended this
+document in parallel. Where two of them stated the same rule differently,
+the stricter or more secure statement was kept, and the code that differs
+is brought to it when the server is wired to its components:
+
+- **HMAC anchor ids (4.7, 5.1).** Verifiers check one relation, `id` =
+  HMAC-SHA-256(`anchor_id`, run_id), with `anchor_id` the run's key
+  k_run. The server derives k_run from `anchor_key` with the anchoring
+  library's domain-separated HMAC (`"pragmatic/v2/anchor-salt" ‖
+  run_id`), not a bare HMAC of the run id. Bundles with an `anchor_id`
+  still report `anchor_id_unbound`, and their `--log` audit
+  `log_unauditable`.
+- **Leaf ids (4.7).** 1 to 1024 bytes everywhere: the core and reference
+  verifiers refuse an empty id, as the anchoring library does.
+- **Checkpoint origin (4.7).** `pragmatic/<server name>/<log id>`, fixed by
+  the first key (`LogSigner::generate_log`); the server's `name` is only
+  its middle component.
+- **TSA trust (4.7, 5.2, 5.3).** `--tsa-roots OPERATOR=FILE` requires the
+  operator (the CLI had defaulted it to the file name), every certificate
+  in the file is an anchor (`-partial_chain`), and a token that verifies
+  under the anchors of more than one operator counts for none
+  (`tsa_ambiguous`). The server requires every TSA to name its operator
+  and refuses operators that share an anchor.
+- **Independence (4.7).** `min_independent_operators` is at least 1; the
+  anchoring library also accepted 0, which would let the server's own
+  signature advance `anchored_entries`.
+- **Witnesses (4.1, 4.8).** A witness is configured by its C2SP vkey,
+  which names the key and checks its id, rather than a bare public key.
+  Witness mode signs cosignatures with a key of its own (`[witness_mode]
+  name, key_file`), never the log key, and lists each origin's log vkeys
+  so a witnessed log can rotate its key.
+- **Witness record (4.8).** The server's per-origin record runs in the
+  run store, with every check of the anchoring library's witness and its
+  `witness.reject` notes. The anchoring library's single witness journal
+  is not used by the server.
+- **Key ids (4.7).** The 4-byte note key ids of checkpoints and bundle
+  signatures, always next to the full public key, and the anchoring
+  library's `key.rotate` record, which binds both key ids to the origin.
+  The server's SHA-256 key fingerprints and rotation message give way to
+  them.
+- **Redaction (4.10).** The core scan finds binary fields (`b64_json`
+  included, every copy of a repeated key, no nesting limit, incomplete
+  slots reported) and the server's text rules apply on top (object keys
+  redacted, base64 runs of 256 characters withheld from non-JSON text).
+- **Anchoring lag (4.7).** The server measures it from its own runs, so it
+  grows whatever stops anchoring, and lowers it only by the
+  `anchored_entries` the anchoring library reports.
