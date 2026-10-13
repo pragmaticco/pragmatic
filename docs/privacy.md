@@ -49,7 +49,7 @@ Every journal entry has two kinds of data:
 | Random draw (`Random`) | source and arguments | the value |
 | Program identity, branches, patches | names and hashes, branch numbers | none |
 | Refused step (`Refusal`) | step, name and fault | none |
-| Notes | run id, labels, attempt number, mode, SDK version, token id of the principal, host name, process id, trace id, usage totals, outcome | the run's data subjects; the run's output or error message; an erasure's free-text reason |
+| Notes | run id, labels, attempt number, mode, SDK version, the principal (a token id, or the OS user for local runs), host name, process id, trace id, usage totals, outcome | the run's data subjects; the run's output or error message; an erasure's free-text reason |
 
 Two things follow:
 
@@ -58,6 +58,11 @@ Two things follow:
 - **Some notes describe the machine.** `attempt.start` records the host
   name and process id. If your host names identify people (a developer's
   laptop name, for example), run agents on hosts that do not.
+- **Local runs record the OS user name.** In local runs, the principal in
+  `attempt.start` is the operating-system user, and a local erasure note
+  records `local:<os-user>@<host>`. Both are fields, so they cannot be
+  erased. Run agents, and local erasures, under service accounts rather
+  than personal logins.
 
 ## What can be erased, and what cannot
 
@@ -91,8 +96,11 @@ erased):
   erased content. Erase a run that has not finished only when you will not
   need to resume it (the server asks you to confirm with
   `allow_unfinished`).
-- Erasing one copy of a repeated message erases every copy in that
-  journal, because repeated content is stored once.
+- Repeated content of 256 bytes or more is stored once in a journal, so
+  erasing one copy of it erases every copy. Shorter content, such as a
+  short reply holding an email address or a name, is stored again in
+  every later request that resends the conversation. Erase it with
+  `match`, or erase every slot that holds it.
 
 ## Labels, subjects and run ids
 
@@ -141,7 +149,7 @@ A procedure for a person's request to see (GDPR Article 15) or erase
 
 - Export a run with `pragmatic evidence RUN -o FILE --redact none`, or
   from the server with `GET /v1/runs/{id}/evidence?redact=none` (an
-  auditor or admin token).
+  auditor or admin token with `view_raw`).
 - Withhold other people's content before you hand it over
   (`--withhold CURSOR:SLOT`). A withheld slot keeps its commitment, so
   the copy still verifies.
@@ -239,10 +247,14 @@ erasure = "deny_during_min"
 
 # EU high-risk system logs: at least 6 months, erasure allowed.
 [[retention]]
-match = { prefix = "eu-hiring/", labels = {} }
+match = { prefix = "eu-hiring-", labels = {} }
 retain_min_days = 184
 erasure = "allow"
 ```
+
+A `prefix` is matched against run ids, so use only characters a run id
+can hold: letters, digits, `.`, `_`, `:` and `-`. A prefix with any other
+character, such as `/`, matches no run.
 
 How policies combine:
 

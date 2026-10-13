@@ -46,10 +46,11 @@ implement is [docs/design/system-of-record.md](docs/design/system-of-record.md).
   keep the old one. `on_code_change="refuse"|"continue"` sets what happens
   when the agent's source changes; an accepted change is recorded as a
   `program.change` note.
-- **Run and attempt notes** on a separate branch that replay never reads:
-  run start (run id, labels, data subjects), each attempt's start and end
-  (mode, principal, program hash, outcome, fresh token usage), recovery
-  decisions, custody, erasures and torn tails.
+- **Run and attempt notes** on a separate branch that program replay does
+  not match against (except `program.change` notes when checking code
+  changes): run start (run id, labels, data subjects), each attempt's
+  start and end (mode, principal, program hash, outcome, fresh token
+  usage), recovery decisions, custody, erasures and torn tails.
 - **Erasure.** `pragmatic erase RUN (--cursor N [--slot K] | --match TEXT)
   --reason-code CODE`, and the server's erase endpoint, remove content and
   salts from chosen slots, record an `erasure` note, and leave the chain
@@ -57,8 +58,9 @@ implement is [docs/design/system-of-record.md](docs/design/system-of-record.md).
 - **A fuller verification report.** `verify` now checks every commitment
   as well as the chain, and reports the first bad entry, erasures that are
   unaccounted for or incomplete, and torn bytes. A damaged file is told
-  apart from a crash: only a torn last frame is truncated (and its bytes
-  moved aside first), never acknowledged entries.
+  apart from a crash: only torn, unacknowledged frames at the end are
+  truncated (and their bytes moved aside first), never acknowledged
+  entries.
 - **Evidence bundles.** `pragmatic evidence RUN -o FILE` packages a run,
   with optional redaction that withholds whole slots.
   `pragmatic verify-evidence FILE` checks a bundle offline against the
@@ -122,8 +124,8 @@ implement is [docs/design/system-of-record.md](docs/design/system-of-record.md).
 - **Format 1 journals (written by 0.4 and 0.5) are read-only.** The CLI,
   the console and `verify` still read, verify and export them. Running,
   resuming or replaying them raises `Unsupported` with a pointer to the
-  CLI. 0.4 and 0.5 were never published to a package registry, so no
-  published release is affected.
+  CLI. Finish or export in-flight 0.5 runs before upgrading, because a
+  0.5 run cannot be resumed under 0.6.
 - **Journal file names.** A directory store now names each journal after
   the SHA-256 of its run id, with a sidecar lock file, so any run id maps
   to a safe file name and two ids can no longer share one file. Format 1

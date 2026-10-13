@@ -3,14 +3,16 @@
 # Pragmatic
 
 **The system of record for AI agents.** Every model call and tool call
-your agent makes is recorded before the agent sees the result, in a
-journal that anyone can check without trusting you. A crashed run picks
-up where it stopped, without paying for the same model calls twice.
+your agent makes through Pragmatic's journaled interfaces is recorded
+before the agent sees the result, in a tamper-evident journal. With
+anchoring (0.6, design-partner preview), anyone can check it without
+trusting you. A crashed run picks up where it stopped, without repeating
+recorded model answers or tool calls whose results are on record.
 
 [![CI](https://github.com/pragmaticco/pragmatic/actions/workflows/ci.yml/badge.svg)](https://github.com/pragmaticco/pragmatic/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
-![status: public beta](https://img.shields.io/badge/status-public%20beta-brightgreen.svg)
+![status: pre-release](https://img.shields.io/badge/status-pre--release-yellow.svg)
 
 [Usage guide](docs/usage.md) · [Quickstart](docs/quickstart.md) · [Concepts](docs/concepts.md) ·
 [Threat model](docs/threat-model.md) · [Compliance mapping](docs/compliance.md) ·
@@ -65,10 +67,25 @@ to a journal **before** its result reaches the agent. The journal is:
 
 A run that dies 900 steps into a 1,000-step job resumes from its journal,
 on any machine that can reach the journal. Recorded model answers are read
-back instead of being requested again. Tool calls that already happened
-are not repeated. Only one process writes a run at a time (a file lock on
-one machine, a lease with Pragmatic Server), so two copies of an agent
-never both continue it.
+back instead of being requested again, and tool calls whose results are on
+record are not repeated.
+
+A call that the crash cut off midway, with no result on record, is
+handled in the open:
+
+- A model call is sent again. If the provider answered but the answer was
+  not recorded before the crash, you pay for that call twice.
+- A tool call goes to your `recover` policy, which can record that it
+  happened or perform it again. Without a policy, local runs perform it
+  again; with Pragmatic Server (0.6), a policy is required. In 0.6 a tool
+  that takes an `idempotency_key` argument receives one, so it can
+  recognize the repeat.
+
+Only one process should continue a run at a time. In 0.5 nothing enforces
+this. In 0.6 a file lock stops a second process on the same machine, and
+Pragmatic Server's lease stops one on any machine. A network file system
+gives no exclusion across machines, so do not share a journal directory
+between hosts; use Pragmatic Server instead.
 
 ## How it differs
 
@@ -90,7 +107,7 @@ never both continue it.
 | Tamper evidence | None: an ordinary database | None: the history is not signed or anchored | A hash chain, plus anchoring with independent timestamp authorities (0.6) |
 | How long it is kept | Set by the vendor's plan | Set by the engine's history retention | Your retention policy, with legal holds (0.6) |
 | Replay a run without the model | No | Inside the engine, against its history | Anywhere, from the journal; the model is never called |
-| Crash recovery | No | Yes | Yes, without repeating model or tool calls |
+| Crash recovery | No | Yes | Yes, without repeating recorded model answers or committed tool calls |
 | Erase one person's data and still prove the rest | No | No | Yes (0.6) |
 | Checked by an outsider who does not trust you | No | No | Yes: an offline verifier with pinned trust roots (0.6) |
 | What you run | A hosted service or a self-hosted stack | A cluster or a cloud service | A library in your agent, plus Pragmatic Server if you want it |
@@ -101,10 +118,13 @@ of someone who does not trust you.
 
 ## Your agent, journaled
 
-Until 0.5 is on PyPI, install from a clone of this repository (this needs
-a Rust toolchain):
+Until 0.5 is on PyPI, install it from a clone of this repository, checked
+out at the 0.5 release branch (this needs a Rust toolchain). A clone of
+`main` installs the 0.6 preview instead, which behaves differently from
+what this section describes.
 
 ```sh
+git checkout release/0.5.0
 pip install "./crates/pragmatic-python[anthropic]"   # or [openai]
 ```
 
@@ -129,15 +149,15 @@ def research(ctx):
     client = ctx.wrap(anthropic.Anthropic())            # the only new line
     messages = [{"role": "user", "content": "Find papers on durable execution."}]
     while True:
-        msg = client.messages.create(model="claude-sonnet-5-5", max_tokens=1024,
+        msg = client.messages.create(model="claude-sonnet-5-5", max_tokens=16000,
                                      tools=TOOLS, messages=messages)
         messages.append({"role": "assistant", "content": msg.content})
         if msg.stop_reason != "tool_use":
-            return msg.content[0].text
+            return "".join(b.text for b in msg.content if b.type == "text")
         messages += ctx.run_tools(msg, {"search_corpus": search_corpus})
 
 rt.run("research-42", research)       # record
-rt.resume("research-42", research)    # after a crash: no repeated model or tool calls
+rt.resume("research-42", research)    # after a crash: recorded results are reused
 rt.replay("research-42", research)    # audit: the model is never called, no tool runs
 assert rt.verify("research-42")       # the chain is intact
 ```
@@ -152,8 +172,8 @@ Agents SDK, Pydantic AI, LangChain) are recorded too. Details:
 
 ## Verify a run
 
-From the command line (`cargo install --path crates/pragmatic-cli` until
-the release is published):
+From the command line (`cargo install --path crates/pragmatic-cli` from
+the same checkout, until the release is published):
 
 ```sh
 pragmatic verify research-42 --dir ./journals      # is the chain intact?
@@ -167,9 +187,10 @@ pragmatic evidence research-42 --dir ./journals -o research-42.evidence.json
 pragmatic verify-evidence research-42.evidence.json
 ```
 
-A bundle built from a local journal has no anchors. It proves the record
-is intact, not when it existed, so the verifier reports `UNANCHORED`. A
-bundle exported from Pragmatic Server carries its anchors. The auditor
+A bundle built from a local journal has no anchors. It shows that the
+record is internally consistent, not when it existed or that it was not
+rewritten before export, so the verifier reports `UNANCHORED`. A bundle
+exported from Pragmatic Server carries its anchors. The auditor
 checks it against timestamp-authority roots and keys they obtained
 themselves, never ones taken from the bundle:
 
@@ -192,7 +213,7 @@ The auditor's walkthrough is [docs/evidence.md](docs/evidence.md).
 The open-source runtime writes journals on the machine that runs the
 agent. Pragmatic Server is the commercial product that turns them into a
 shared system of record. It runs inside your own infrastructure, so your
-prompts and outputs never reach us. It provides:
+prompts and outputs never reach us. It is being built for 0.6 to provide:
 
 - one journal store for all your agents, with a single writer per run;
 - independent anchoring with RFC 3161 timestamp authorities and witnesses;
@@ -201,9 +222,12 @@ prompts and outputs never reach us. It provides:
 - redacted views for auditors, and evidence bundles on demand;
 - a console for runs, verification status, holds and the access log.
 
-Pragmatic Server is being built for 0.6 and is available to design
-partners now. It is not generally available. Setup and configuration are
-in [docs/server.md](docs/server.md). To join as a design partner,
+Today, design partners can run a preview with the journal store and its
+leases, roles and scoped tokens, the access log, retention, legal holds,
+erasure and redacted views. Anchoring, evidence export and the console
+are still being integrated for 0.6. Pragmatic Server is not generally
+available. Setup and configuration are in [docs/server.md](docs/server.md).
+To join as a design partner,
 [contact us](mailto:me@aniketh.net?subject=Pragmatic%20design%20partner).
 
 ## Measured, not promised
@@ -217,7 +241,7 @@ Every row is a test in this repository. The timings come from
 | **Crash recovery** (E2) | A run crashed at every possible journal prefix resumes exactly: nothing journaled is requested again, and no tool call is left unaccounted for |
 | **Tool-use loop** | A full Messages API tool loop recorded over real sockets; the API is shut down; resume and replay match byte for byte; the tool ran exactly once |
 | **Journal overhead** (E3) | Appending takes constant time: about 2.2 µs per entry at 1,000 entries and at 1,000,000 (journal format 2, in memory, not counting the disk sync), including a fresh random salt and a SHA-256 commitment for every content slot and the chain hash. Earlier releases quoted about 0.44 µs for format 1, which did less work per entry |
-| **Replay cost** (E3) | 40 calls to a stand-in model that takes 5 ms per call: about 250 ms to record, under 1 ms to replay, because replay makes no model calls |
+| **Replay cost** (E3) | 40 calls to a stand-in model that takes 5 ms per call: about 300 ms to record, under 1 ms to replay, because replay makes no model calls |
 | **Tamper evidence** | Any change to a recorded entry is reported at that entry; a keyed journal refuses a wrong or missing key |
 | **Code-change safety** | Replaying a run under changed agent code stops with `JournalDesync` unless you opt in to the change, and a resume under changed code records the change in the journal |
 
@@ -240,10 +264,14 @@ output or other content leaves the server.
   way is not recorded. MCP tool calls made through the `mcp` package's own
   client need `ctx.tool`, and websocket and realtime APIs are not
   supported yet.
-- In 0.5, `ctx.wrap` records the SDK calls listed above but not every path
-  a framework can take, and it refuses streaming. 0.6 records at the HTTP
-  layer to close that gap. Until 0.6 ships, check that your framework's
-  calls appear in the journal.
+- In 0.5, `ctx.wrap` records only the `create` calls listed above. It
+  refuses streaming and OpenAI's `.parse()`. Other API calls run
+  without being recorded, and nothing warns you: Anthropic's
+  `.parse()`, `count_tokens`, `with_raw_response`, clients made with
+  `client.copy()`, and most framework calls (for example LangChain's
+  `invoke` and the Anthropic tool runner). 0.6 records at the HTTP layer
+  to close that gap. Until 0.6 ships, check that your framework's calls
+  appear in the journal.
 - A journal on the agent's own machine can be deleted by whoever controls
   that machine. Anchoring and Pragmatic Server make deletion and rewriting
   detectable; see the [threat model](docs/threat-model.md).
@@ -270,7 +298,7 @@ byte-compatible across every language and the CLI.
 
 | Crate | What | Dependencies |
 |---|---|---|
-| [`pragmatic`](crates/pragmatic) | The runtime: journal, replay, recovery, verification, evidence bundles | none |
+| [`pragmatic`](crates/pragmatic) | The runtime: journal, replay, recovery, verification; evidence bundles in 0.6 | none |
 | [`pragmatic-macros`](crates/pragmatic-macros) | `#[pragmatic::durable]`: program identity, recorded and checked | none |
 | [`pragmatic-anthropic`](crates/pragmatic-anthropic) | Claude as a journaled model, including tool-use loops | `ureq`, `serde_json` |
 | [`pragmatic-openai`](crates/pragmatic-openai) | Any OpenAI-compatible server as a journaled model | `ureq`, `serde_json` |
@@ -279,6 +307,7 @@ byte-compatible across every language and the CLI.
 | [`pragmatic-python`](crates/pragmatic-python) | The Python SDK (`pragmatic-runtime`) | `pyo3` |
 | [`pragmatic-ffi`](crates/pragmatic-ffi) | The C ABI behind the C++, Java, Go and Node.js bindings | none |
 | [`pragmatic-server`](crates/pragmatic-server) | Pragmatic Server (0.6, commercial) | `axum`, `tokio` |
+| [`pragmatic-anchor`](crates/pragmatic-anchor) | Anchoring for Pragmatic Server (0.6, commercial) | `ureq`, `ed25519-dalek` |
 
 ## Research
 
@@ -295,10 +324,11 @@ doc](docs/concepts.md).
   production, at any scale. Anyone, including an auditor who does not
   trust the operator, can verify a journal or an evidence bundle with
   them. See [LICENSE](LICENSE).
-- **Commercial: Pragmatic Server.** Its source is public in this
-  repository under the Business Source License 1.1, so auditors can read
-  it. Development, testing and evaluation are free. Production use needs
-  a commercial license from Pragmatic Research, Inc. Each version becomes
+- **Commercial: Pragmatic Server** (`pragmatic-server`, with its anchoring
+  crate `pragmatic-anchor`). Their source is public in this repository
+  under the Business Source License 1.1, so auditors can read it.
+  Development, testing and evaluation are free. Production use needs a
+  commercial license from Pragmatic Research, Inc. Each version becomes
   Apache 2.0 four years after its release.
 - **Planned: a hosted independent witness**, run by Pragmatic Research,
   that cosigns anchors and sees only a log name and hashes.

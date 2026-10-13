@@ -28,17 +28,16 @@ engineering can rely on, and we keep crash recovery as the second pillar.
 
 Why:
 
-- **Crash recovery alone is a crowded market.** Durable-execution engines
+- **Crash recovery alone is well served.** Durable-execution engines
   (Temporal, DBOS, Inngest, the durable backends of agent frameworks)
-  already recover workflows well enough for most buyers. Our recovery is
-  better in kind (the model call is modeled, not an opaque cached
-  activity), but buyers feel that only at the margin.
-- **Hash chains alone are free.** Tamper-evident agent logs are now
-  available for free or cheaply, including from large vendors. Small
-  companies already sell anchoring. A hash chain is not a product.
-- **The combination is the product, and nobody else offers it:**
-  1. capture that cannot skip a call (a result reaches the agent only
-     after it is recorded);
+  already recover workflows. Our recovery differs in kind (the model call
+  is modeled, not an opaque cached activity), but recovery is not what an
+  auditor asks about.
+- **Tamper evidence alone is a building block.** A hash chain is not a
+  product on its own.
+- **The combination is the product:**
+  1. capture that cannot skip a call made through the journaled
+     interfaces (a result reaches the agent only after it is recorded);
   2. exact replay with the model never called;
   3. erasure for privacy law that keeps the proof for everything else;
   4. anchoring with independent timestamp authorities and witnesses;
@@ -71,16 +70,15 @@ review, an auditor, an insurer, a regulator or a court.
    to C companies in fintech, insurtech, healthtech and legaltech, whose
    bank, insurer or hospital customers ask for agent audit trails. The
    trigger is a security questionnaire with an AI section, or a customer
-   disputing what an agent did. The founder or CTO decides.
+   disputing what an agent did.
 2. **Next: the head of AI platform at a regulated company.** Regional
    banks, broker-dealers, insurers and fintech lenders. The trigger is
    internal audit or compliance blocking a launch until agent runs can be
    reconstructed, or examiners asking questions. They need self-hosting,
    single sign-on, roles, retention, erasure and contract terms for EU
    financial rules (DORA). Crash recovery is a bonus for them.
-3. **Champion: the chief compliance officer or head of AI governance.**
-   They buy evidence bundles, access logs, legal hold and retention. Their
-   auditors are a referral path.
+3. **Also: the chief compliance officer or head of AI governance,** who
+   needs evidence bundles, access logs, legal hold and retention.
 
 **The first customer runs** AI agents in production, in Python, on the
 Anthropic or OpenAI SDKs, and the agents take actions that matter:
@@ -88,21 +86,22 @@ moving money, deciding identity or anti-money-laundering cases, handling
 claims or underwriting, clinical steps such as prior authorization, legal
 filings.
 
-**Three questions that qualify a lead:**
+**Three questions that show whether Pragmatic fits:**
 
 1. Does the agent take actions, or does it only answer questions?
 2. Does someone outside engineering review what it does?
 3. Could they reconstruct exactly what happened in one specific run today?
 
-**Not a fit in year one:** teams that only run chatbots, hobby users (the
-open-source runtime serves them), and the largest banks, whose buying
-cycles are too long for us now.
+**Not the focus:** teams that only run chatbots, and hobby users (the
+open-source runtime serves them).
 
 ## Why now
 
-- Customers' vendor questionnaires now include AI sections, and insurers
-  are being held responsible for their vendors' AI.
-- Examiners, auditors and courts have started asking for agent records.
+- Customers' vendor questionnaires now include AI sections, and insurance
+  regulators expect insurers to oversee the AI systems they buy from
+  vendors (for example, the NAIC model bulletin on insurers' use of AI).
+- As agents take actions that matter, we expect examiners, auditors and
+  courts to ask for records of what they did.
 - The EU AI Act asks high-risk systems to keep automatic logs. Under the
   AI Omnibus those obligations apply from 2 December 2027. That is a
   reason for buyers to budget in 2027, not a reason to buy in 2026.
@@ -129,10 +128,11 @@ cycles are too long for us now.
   outputs never reach us. There is no license enforcement in code.
 - **Planned: a hosted independent witness.** Run by Pragmatic Research
   with the same server binary in witness mode. It cosigns anchors and sees
-  only hashes. It is part of the Server offering, not a separate business.
+  only hashes.
 - **Auditors never pay to verify.** Viewing and verifying are free.
-- **Design partners** get Pragmatic Server now, in preview. We do not
-  publish prices; design partners contact us.
+- **Design partners** get a preview of Pragmatic Server now. Anchoring,
+  evidence export and the console are still being integrated for 0.6. We
+  do not publish prices; design partners contact us.
 
 The runtime moved from the Business Source License to Apache 2.0 on
 2026-10-13, before its first registry release, so no one depended on the
@@ -177,13 +177,13 @@ for the Claude Agent SDK; LiteLLM's own Anthropic handler; a Pydantic AI
 durable-execution backend; the TypeScript SDK; servers with more than one
 replica.
 
-### Trust work that gates regulated deals
+### Trust work for regulated customers
 
 A penetration test of the Server, a security questionnaire answer set, a
 data processing agreement, a DORA contract addendum, a data-flow diagram
 showing that nothing leaves the customer's network, a hardening guide, and
 signed releases with a software bill of materials. SOC 2 comes when a
-hosted product has paying users or a deal requires it.
+hosted product has paying users or a customer requires it.
 
 ## What we are deliberately not doing
 
@@ -236,28 +236,10 @@ no. Adapters carry only what they need to speak HTTPS and JSON.
 - A customer's auditor, or their customer, verifies an evidence bundle
   offline.
 - A real security questionnaire's AI section is answered with Pragmatic.
-- Commercial conversations are pulled by Pragmatic Server, not pushed by
-  us.
 
 ## Signals to revisit
 
-- **Pilots do not convert** into annual contracts: revisit the order of
-  the two pillars.
 - **Design partners care about recovery and cost and shrug at audit:**
   flip the pillars.
-- **Qualified conversations do not turn into pilots:** change segment, for
-  example to broker-dealers, insurers' AI vendors, or FDA-regulated (GxP)
-  teams.
 - **Auditors reject our bundles:** align the format with their
-  requirements and with the emerging agent-audit-trail standards before
-  selling more.
-- **Buyers insist on SOC 2 Type II before any pilot:** bring it forward,
-  or sell through a partner that already has it.
-- **Temporal ships signed or anchored history:** become the verifier and
-  anchoring layer for Temporal histories, or focus on teams without
-  Temporal.
-- **A free toolkit from a large vendor gains independent anchoring and
-  offline bundles:** interoperate with it, and lead with replay and
-  complete capture.
-- **Most prospects say their model vendor's logs satisfy their
-  auditors:** refocus on multi-provider and high-stakes buyers.
+  requirements and with the emerging agent-audit-trail standards.

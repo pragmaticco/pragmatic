@@ -58,8 +58,8 @@ the journaled interfaces.
 | **Hash chain** (SHA-256 over every entry's structure and its content commitments) | Silent edits, deletions in the middle, reordering, insertion | Anyone who can rewrite the whole file can recompute an unkeyed chain. The chain alone catches accidents and careless edits; it needs anchoring, a key or an earlier copy to catch a deliberate rewrite |
 | **Salted content commitments** (a fresh 16-byte random salt per content slot) | Guessing erased or withheld content from its hash | Erasing a slot drops the salt and the content, and leaves the commitment, so the chain still verifies |
 | **Canonical decoding** (decode, re-encode and compare bytes) | Two encodings of one record, and parser confusion | Applied to the server's append path, file parsing and evidence verification |
-| **Torn-tail versus corruption rules** | Truncating acknowledged entries after damage | A crash can only tear the last frame. Damage that could have hit acknowledged entries is reported as corruption, never silently cut off |
-| **Write-ahead intents** | Repeating a model call or tool call after a crash, and missing a call in the record | An intent is durable before the call or tool runs; its result is durable before the agent sees it |
+| **Torn-tail versus corruption rules** | Truncating acknowledged entries after damage | A crash can only tear unacknowledged frames at the end. Damage that could have hit acknowledged entries is reported as corruption, never silently cut off |
+| **Write-ahead intents** | Missing a call in the record, and repeating a recorded model answer or a committed tool call after a crash | An intent is durable before the call or tool runs; its result is durable before the agent sees it. A call cut off by a crash (intent recorded, result not) can be repeated, and the journal shows it: a model call is sent again, so one paid for but not recorded is paid for twice; a tool call goes to the `recover` policy, with an idempotency key, and local runs perform it again by default (server-backed runs need an explicit policy) |
 | **Single writer** (a file lock locally, a lease on the server) | Two copies of an agent continuing one run | Local file locks do not work across machines on network file systems; use Pragmatic Server for that |
 | **Server-side validation of every append** | An agent writing records that would not verify, writing erased or withheld slots, or writing server-only notes | The server stores nothing that would fail verification. The client compares the head it computed with the head the server returns |
 | **Anchoring** (a Merkle log of every run's state, time-stamped by RFC 3161 authorities and cosigned by witnesses) | A server administrator rewriting or hiding anchored history | See the next two sections for exactly what it proves and the window it leaves |
@@ -168,8 +168,8 @@ outside that journal file:
   (`*.torn-*` files) that hold bytes of frames that never became entries.
 - **Structural fields.** Fields are never erasable: kinds, cursors,
   branches, tool names, channel names, model names, token usage,
-  outcomes, labels, token ids, host names and run ids. They must not hold
-  personal data. See [privacy.md](privacy.md).
+  outcomes, labels, token ids, local OS user names, host names and run
+  ids. They must not hold personal data. See [privacy.md](privacy.md).
 - **Downstream systems.** The model provider's own logs, your
   observability tools and anything a tool sent elsewhere are outside
   Pragmatic.
