@@ -311,6 +311,23 @@ pub(crate) fn meta_outcome(meta: &str) -> Option<String> {
     doc.get("outcome")?.as_str().map(str::to_string)
 }
 
+/// The token counters of a draw's meta `usage` object (spec 2.6), for the
+/// attempt's `usage_fresh`. Counters that are not non-negative integers are
+/// skipped: meta is written by SDKs, and a sum is only meaningful over
+/// counts.
+fn draw_usage(meta: &str) -> Vec<(String, u64)> {
+    let Some(doc) = crate::journal::strict_json_field(meta) else {
+        return Vec::new();
+    };
+    let Some(usage) = doc.get("usage").and_then(Json::as_object) else {
+        return Vec::new();
+    };
+    usage
+        .iter()
+        .filter_map(|(k, v)| v.as_u64_strict().map(|n| (k.clone(), n)))
+        .collect()
+}
+
 /// Check the options of an attempt before anything is checked out or
 /// created, so a refused run leaves nothing behind.
 pub(crate) fn check_options(opts: &RunOptions) -> Result<(), Fault> {
@@ -395,6 +412,14 @@ pub struct Session {
     ///
     /// [`detach_sink`]: Session::detach_sink
     unconfirmed: Vec<(Cursor, String, Value)>,
+    /// The token usage of the draws this attempt completed, summed per
+    /// counter from the `usage` object of each `DrawResult` meta, for
+    /// `attempt.end.usage_fresh`.
+    usage_fresh: BTreeMap<String, u64>,
+    /// Model calls the host's journaled clients let through unrecorded
+    /// (`outside="passthrough"` in Python), for
+    /// `attempt.end.passthrough_calls`.
+    passthrough_calls: u64,
 }
 
 impl fmt::Debug for Session {
@@ -466,6 +491,8 @@ impl Session {
             faulted: HashSet::new(),
             refusals: Vec::new(),
             unconfirmed: Vec::new(),
+            usage_fresh: BTreeMap::new(),
+            passthrough_calls: 0,
         };
         session.index();
         Ok(session)
@@ -595,7 +622,7 @@ impl Session {
             ]),
             None => Json::Null,
         };
-        let data = object(vec![
+        let mut members = vec![
             ("attempt", self.attempt.into()),
             ("host", crate::sys::host_name().into()),
             ("mode", self.mode.as_str().into()),
@@ -610,8 +637,18 @@ impl Session {
             ),
             ("torn_bytes", torn.map_or(0, |t| t.bytes).into()),
             ("traceparent", Json::Null),
-        ]);
-        note_event(note::ATTEMPT_START, data, Vec::new())
+        ];
+        // Present only when an SDK loosens matching, so an attempt that
+        // compares requests exactly carries no claim either way.
+        if !opts.normalization.is_empty() {
+            let rules = opts
+                .normalization
+                .iter()
+                .map(|r| Json::from(r.as_str()))
+                .collect();
+            members.push(("normalization", Json::Array(rules)));
+        }
+        note_event(note::ATTEMPT_START, object(members), Vec::new())
     }
 
     // -----------------------------------------------------------------
@@ -1266,6 +1303,7 @@ impl Session {
             ));
         };
         let ok = outcome != "error";
+        let usage = draw_usage(&meta);
         let appended = self.append(
             &branch,
             Event::DrawResult {
@@ -1283,6 +1321,10 @@ impl Session {
         }
         self.open.remove(&intent);
         self.fresh += 1;
+        for (counter, n) in usage {
+            let total = self.usage_fresh.entry(counter).or_insert(0);
+            *total = total.saturating_add(n);
+        }
         self.sync()?;
         if ok {
             self.label(TraceLabel::Oracle {
@@ -1883,9 +1925,28 @@ impl Session {
         self.peek(b).is_some()
     }
 
+    /// The cursor of the next recorded start event branch `b` will match,
+    /// or `None` at the end of the branch.
+    ///
+    /// For hosts that loosen draw matching (spec 6.6): a host compares its
+    /// normalized request with the normalized parts of this entry and, when
+    /// they agree, begins the draw with the recorded parts, so the core's
+    /// exact comparison holds while the journal keeps the bytes that were
+    /// actually sent.
+    pub fn next_start(&self, b: &Branch) -> Option<Cursor> {
+        self.peek(b)
+    }
+
     /// The entry at `cursor`.
     pub fn entry(&self, cursor: Cursor) -> Option<&Entry> {
         self.journal.get(cursor)
+    }
+
+    /// Count `calls` model calls a host's journaled client let through
+    /// without recording them (spec 6.5, `outside="passthrough"`), so that
+    /// `attempt.end` tells an auditor they happened.
+    pub fn count_passthrough(&mut self, calls: u64) {
+        self.passthrough_calls = self.passthrough_calls.saturating_add(calls);
     }
 
     /// The journal as this session sees it.
@@ -1983,15 +2044,20 @@ impl Session {
                 vec![Value::default(), Value::from(f.to_string())],
             ),
         };
+        let usage = self
+            .usage_fresh
+            .iter()
+            .map(|(k, n)| (k.clone(), Json::from(*n)))
+            .collect();
         let data = object(vec![
             ("attempt", self.attempt.into()),
             ("fault_cursor", cursor),
             ("fault_kind", kind),
             ("fresh", self.fresh.into()),
             ("outcome", outcome.into()),
-            ("passthrough_calls", 0u64.into()),
+            ("passthrough_calls", self.passthrough_calls.into()),
             ("replayed", self.replayed.into()),
-            ("usage_fresh", Json::Object(Vec::new())),
+            ("usage_fresh", Json::Object(usage)),
         ]);
         note_event(note::ATTEMPT_END, data, payload)
     }
@@ -2226,6 +2292,103 @@ mod tests {
         // attempt.end is not written either.
         assert_eq!(s.end(Ok(Value::from("ok"))).unwrap_err(), Fault::LeaseLost);
         assert_eq!(s.journal().len(), len);
+    }
+
+    /// The data of the last note of `kind` in the session's journal.
+    fn note_data(s: &Session, kind: &str) -> Json {
+        let data = s
+            .journal
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|e| match &e.event {
+                Event::Note { kind: k, data, .. } if k == kind => Some(data.clone()),
+                _ => None,
+            })
+            .expect("note present");
+        Json::parse(&data).unwrap()
+    }
+
+    #[test]
+    fn attempt_end_sums_fresh_usage_and_counts_passthrough_calls() {
+        let (_b, mut s) = recording("u", &RunOptions::default());
+        let root = ROOT.to_vec();
+        let metas = [
+            r#"{"outcome":"ok","usage":{"input_tokens":10,"output_tokens":4}}"#,
+            r#"{"outcome":"partial","usage":{"input_tokens":5,"cache_read_tokens":2}}"#,
+            // Not counts: skipped rather than summed.
+            r#"{"outcome":"ok","usage":{"input_tokens":-1,"output_tokens":1.5}}"#,
+            r#"{"outcome":"error","status":429}"#,
+        ];
+        for meta in metas {
+            let DrawStart::Fresh(i) = s.draw_begin(&root, "p", vec![Value::from("q")]).unwrap()
+            else {
+                panic!()
+            };
+            s.draw_end(i, meta.into(), Value::default(), Value::default())
+                .unwrap();
+        }
+        s.count_passthrough(2);
+        s.count_passthrough(1);
+        s.end(Ok(Value::from("done"))).unwrap();
+        let end = note_data(&s, note::ATTEMPT_END);
+        assert_eq!(end.get("passthrough_calls").unwrap().as_u64(), Some(3));
+        assert_eq!(
+            end.get("usage_fresh").unwrap().canonical_string(),
+            r#"{"cache_read_tokens":2,"input_tokens":15,"output_tokens":4}"#
+        );
+    }
+
+    #[test]
+    fn attempt_start_names_normalization_rules_only_when_there_are_some() {
+        let (_b, s) = recording("exact", &RunOptions::default());
+        assert!(note_data(&s, note::ATTEMPT_START)
+            .get("normalization")
+            .is_none());
+        let opts = RunOptions::default().with_normalization(["agents-sdk:prompt_cache_key"]);
+        let (_b, s) = recording("loose", &opts);
+        assert_eq!(
+            note_data(&s, note::ATTEMPT_START)
+                .get("normalization")
+                .unwrap()
+                .canonical_string(),
+            r#"["agents-sdk:prompt_cache_key"]"#
+        );
+    }
+
+    #[test]
+    fn next_start_peeks_without_consuming() {
+        let (backend, mut s) = recording("n", &RunOptions::default());
+        let root = ROOT.to_vec();
+        let DrawStart::Fresh(i) = s.draw_begin(&root, "p", vec![Value::from("q")]).unwrap() else {
+            panic!()
+        };
+        s.draw_end(i, META_OK.into(), Value::default(), Value::from("a"))
+            .unwrap();
+        assert_eq!(
+            s.next_start(&root),
+            None,
+            "a recording branch is at its end"
+        );
+        s.end(Ok(Value::from("done"))).unwrap();
+        drop(s);
+        let journal = backend.snapshot("n", None).unwrap();
+        let mut r = Session::new(
+            "n",
+            Mode::Replay,
+            journal,
+            None,
+            &RunOptions::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(r.next_start(&root), Some(i));
+        assert_eq!(r.next_start(&root), Some(i), "peeking consumes nothing");
+        assert!(matches!(
+            r.draw_begin(&root, "p", vec![Value::from("q")]).unwrap(),
+            DrawStart::Replayed { .. }
+        ));
+        assert_eq!(r.next_start(&root), None);
     }
 
     #[test]
