@@ -104,12 +104,16 @@
 //! - [`redact`]: detectors for personal data and secrets, and redaction.
 //! - [`rand`]: bytes from the operating system's CSPRNG, for slot salts and
 //!   nonces.
+//! - [`evidence`]: evidence bundles, one run's journal packaged with its
+//!   anchors for offline verification against the verifier's own trust
+//!   roots.
 
 pub mod async_runtime;
 pub mod backend;
 pub mod ctx;
 pub mod ed25519;
 pub mod encoding;
+pub mod evidence;
 pub mod fault;
 pub mod journal;
 #[cfg(any(test, feature = "testing"))]

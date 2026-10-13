@@ -3,7 +3,9 @@
 Status: design, revision 3 (2026-10-13), after an adversarial review across
 cryptography, replay correctness, storage and failure handling, compliance,
 developer experience and completeness, amended after the review of the core
-runtime (2.4, 2.6 to 2.8, 2.11, 2.12, 2.14, 3.1 to 3.3, 6.7). This document
+runtime (2.4, 2.6 to 2.8, 2.11, 2.12, 2.14, 3.1 to 3.3, 6.7), and where
+building evidence bundles, the console and the CLI settled open details
+(3.5, 4.7, 4.10, 4.14, 5.1 to 5.3, 7). This document
 is the contract
 between the components built for 0.6. Everything marked MUST is
 normative; where code and this document disagree, one of them is a bug.
@@ -853,7 +855,14 @@ code with the message preserved; there is no header change.
   vectors. Used by the CLI, server and Python native module to verify
   pinned signatures.
 - **`evidence`**: the bundle format (section 5), `to_json`, `from_json`,
-  `verify(bundle, &TrustPolicy) -> EvidenceReport`.
+  `verify(bundle, &TrustPolicy, &dyn TsaVerifier) -> EvidenceReport`, and
+  `verify_with(.., &Audit)` for the full-log audits of 5.3 step 11. RFC
+  3161 signatures go through the `TsaVerifier` trait so the core never runs
+  a process: the CLI implements it with `openssl ts -verify`, and
+  `NoTsaVerifier` reports every token as unchecked. `Bundle::local(journal,
+  run_id, &Redact)` builds an unanchored local bundle and
+  `Bundle::withhold(slots)` withholds more (`Journal::withhold` makes the
+  state 3 copy). `docs/evidence-format.md` is the normative description.
 
 ### 3.6 Testing hooks
 
@@ -1131,8 +1140,13 @@ leaf_data = "pragmatic/v2/leaf" ‖ u8 type (0 run, 1 access log) ‖ u32 len(id
             u64 entries ‖ head(32) ‖ u64 prev_leaf_index (u64::MAX if none)
 ```
 
-- With `anchor_run_ids = "hmac"`, `id` = HMAC-SHA-256(anchor_salt,
-  run_id), and bundles carry the per-run value needed to recompute it.
+- Integers are little-endian, as in the journal, and `id` is at most 1024
+  bytes.
+- With `anchor_run_ids = "hmac"`, `id` = HMAC-SHA-256(k_run, run_id) with
+  the per-run key k_run = HMAC-SHA-256(anchor_salt, run_id), and bundles
+  carry k_run as `anchor_id`. (A literal HMAC-SHA-256(anchor_salt, run_id)
+  could not be recomputed from anything a bundle may disclose; k_run lets
+  the bundle holder recompute the leaf without revealing other runs' ids.)
 - Every `interval_secs`, one task snapshots, under each run's lock, the
   fsynced `(entries, head)` of every run and of the access log that
   changed since its last leaf. Runs created by PUT are included even with
@@ -1274,7 +1288,10 @@ bytes. Each slot is parsed as JSON when possible:
 - Binary fields are replaced by
   `[binary media_type=… bytes=n sha256=…]` and never served. These are
   Anthropic `source.type == "base64"`, OpenAI `data:` URLs, `file_data`,
-  `input_audio.data` and codec `{"$bytes": …}`.
+  `input_audio.data`, OpenAI image `b64_json` and codec `{"$bytes": …}`;
+  a slot that is not UTF-8 is binary as a whole. The detection lives in
+  the core (`redact::binary::scan`), shared by the server, the console and
+  evidence redaction.
 - Text is redacted with the built-in detectors plus configured patterns.
 - Non-JSON slots are redacted as text.
 
@@ -1349,6 +1366,14 @@ Server-rendered with the shared `pragmatic-console` crate:
 - tokens (admin)
 - the licensee in the footer
 
+The `pragmatic-console` crate (Apache-2.0, no dependencies beyond the
+core) renders these pages for the server and the CLI alike:
+`render_run(&RunView)`, `render_index(&[RunRow])`,
+`render_evidence(&Bundle, &EvidenceReport)` and `render_csv(&Bundle)`.
+Pages carry a Content-Security-Policy that loads nothing and run no script;
+all journal and bundle text is escaped, binary values are summarized, and
+slot text is cut at 64 KiB.
+
 ### 4.15 Deployment
 
 - `Dockerfile`: multi-stage; the runtime image includes `openssl`; runs
@@ -1410,18 +1435,41 @@ becomes a directory with the journal as a separate file referenced by
 ```
 
 - Redacted slots are withheld whole (state 3, commitment only). Content is
-  never altered inside a slot.
+  never altered inside a slot. A ref to a withheld slot stays a ref and
+  reads as withheld.
 - `anchors` is the run's full leaf chain, from its first leaf through its
   latest, linked by `prev_leaf_index`.
 - `records` is the journal decoded for human reading (CSV and HTML
-  renderers come from the CLI).
+  renderers come from the console crate): one object per entry with
+  `cursor, at, branch, kind, fields, slots, hash`, each slot `state,
+  commitment, len, text|base64, ref` (normative layout in
+  `docs/evidence-format.md` section 4).
+- Every object has exactly its listed keys; an absent value is `null`
+  (`anchor_id`, `latest_checkpoint`, `verification_spec` and `signature`
+  may be null). A bundle built from a local journal is unsigned and
+  unanchored.
+- `redaction.mode` names the automatic rule the generator applied
+  (`detectors` also withholds binary attachments, which detectors cannot
+  inspect); slots may also be withheld on request, so `redacted_slots` is
+  authoritative. `patterns_sha256` is the SHA-256 of the canonical JSON
+  array of the configured patterns.
+- `signature.key_id` is the 4-byte signed-note key ID of the log's
+  checkpoint key, and `value` is Ed25519 over the 32-byte SHA-256 of the
+  canonical bundle without `signature`.
+- The directory form holds `evidence.json` and the journal file, with
+  `journal` = `{"encoding": "file", "path", "sha256", "entries", "head"}`.
 
 ### 5.2 Trust policy
 
 The verifier takes trust only from its own inputs:
 
-- `--tsa-roots FILE` (repeatable PEM)
-- `--witness-key NAME=HEX` (repeatable)
+- `--tsa-roots [OPERATOR=]FILE` (repeatable PEM). A token counts for the
+  operator of the pinned root that verifies it (by default the file's
+  name), never for the operator the bundle names, so a bundle cannot make
+  one TSA count twice.
+- `--witness-key OPERATOR=VKEY` (repeatable; `OPERATOR=HEX` is accepted
+  for a 32-byte cosignature key whose cosigner name is `OPERATOR`)
+- `--log-key VKEY`: the log's checkpoint key, which also signs bundles
 - the hosted Pragmatic Witness keys built into the CLI, with validity
   windows (an empty list until the witness launches)
 
@@ -1479,6 +1527,16 @@ and never counts as independent.
 
 Every reported time comes from a signed structure. Unsigned JSON times
 are informational and must equal the signed values.
+
+Every finding has a stable code (`docs/evidence-format.md` section 9), and
+all are reported, not only the first. Integrity failures make the verdict
+`FAILED`. A witness that does not verify against anything pinned is
+self-asserted and simply does not count (`tsa_untrusted`,
+`cosignature_untrusted`), but a malformed witness, a token over another
+digest, or a cosignature line from a pinned key that does not verify is a
+failure. `--log FILE` takes `{"leaves": [hex...]}`, every leaf from index
+0; `--witness-log FILE` takes `{"witness", "origin", "checkpoints":
+[signed note...]}`.
 
 `docs/evidence-format.md` and a standard-library-only Python reference
 verifier (`tools/verify_evidence.py`, which needs `openssl` on PATH)
@@ -1678,14 +1736,22 @@ loosened.
   intents and results, erased, withheld and ref slots, notes, custody,
   attempts and `at` times. Format 1 is read-only.
 - `verify` prints the `VerifyReport` and never writes to the file.
-- `erase RUN (--cursor N [--slot K] | --match TEXT) --reason-code C` works
-  through a DirBackend checkout. Its `by` is
-  `local:<os-user>@<host>` with `authenticated: false`.
-- `evidence RUN -o FILE` builds a local bundle (unanchored unless anchors
-  exist).
-- `verify-evidence FILE [--tsa-roots F]... [--witness-key N=HEX]...
-  [--log F] [--witness-log F] [--explain]`.
-- `render-evidence FILE --format html|csv`.
+- `erase RUN (--cursor N [--slot K] | --match TEXT) --reason-code C
+  [--reason TEXT]` works through a DirBackend checkout. Its `by` is
+  `local:<os-user>@<host>` with `authenticated: false`. `--cursor` alone
+  erases every slot of the entry. `reason_code` is a structural field, so
+  it is limited to `[a-z0-9_.:-]{1,64}`; free text goes in `--reason`.
+- `evidence RUN -o FILE [--redact none|detectors|binary|all]
+  [--detectors NAME,...] [--withhold CURSOR:SLOT]...` builds a local
+  bundle (unanchored unless anchors exist), in the directory form above
+  100 MiB. Keyed journals are refused.
+- `verify-evidence FILE [--tsa-roots [OP=]F]... [--witness-key OP=VKEY]...
+  [--log-key VKEY]... [--min-operators N] [--log F] [--witness-log F]...
+  [--openssl | --no-openssl] [--explain]`. OpenSSL is used when it is on
+  PATH; `--openssl` requires it. FILE may be a directory bundle.
+- `render-evidence FILE --format html|csv [-o FILE]`, with the same trust
+  flags (the page shows the verification report).
+- Usage errors exit 64, distinct from every verification outcome.
 - No secrets in argv: `--key-file` and `PRAGMATIC_JOURNAL_KEY` replace
   `--key`. `--key` remains, deprecated, with a warning.
 

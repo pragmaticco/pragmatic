@@ -1,0 +1,10 @@
+{
+ "checkpoints": [
+  "pragmatic/fixture.example\n3\ncXZdlXSt9Zxd7xMJuuDj9hBZ+JYD9foai/MI0CdsoCw=\n\n— pragmatic/fixture.example jcEwFvRFkjbQGJovhxsRdx2UnI6uW6S10YL8GCPHgoUeDOxsakGIEE0c1Gnv9/xQ6t0v2RE2yJISs0X5+GQIpcqe0Ac=\n— witness.fixture.example 1w8xdgAAAABqzjlgXnYcfGhwHSSkyvUk/1GqemQzb6H0HuFtuFeqXShzoBGN40hQy7LqVs4ELq4MkyoC6bkQ3bKL+8a1N/+L4dnVAg==\n",
+  "pragmatic/fixture.example\n6\nT3ZlvKKS/rips7ujum0rdqGazNOocc67c898aXSyvWk=\n\n— pragmatic/fixture.example jcEwFpJPp6kuOqEe6g5sSQwnhk9uHmYNNxK4QzoN89xFJdZEEw7bGDfP0hZvVS91dIe15cp5G/m7c1N/XaRFtpSaxwU=\n— witness.fixture.example 1w8xdgAAAABqzju4gXLk2WRBtdV2/8amL0GvncEIvfMzZ5VXRd1NlTndSetAOmCletTplu3Yoyui2MsOPETzK9vR+dm1hAeToxXYAQ==\n",
+  "pragmatic/fixture.example\n9\nW5GslJ0JHJaQxbX08uMmRUMEX0pm81O3LdMv90Viv9s=\n\n— pragmatic/fixture.example jcEwFpNAQptcLFpUBchIQ++/Ar9E+IsLNl7DpNNRkRNy0OI0MWuOKwBS/66yC+eaPWbLR+o9v/z74gJ7l2L5jDxqsQc=\n— witness.fixture.example 1w8xdgAAAABqzj4Qtvwd07CahkvBCnQu648Sk7lwO99gsifSgOahZJaDatEANvBErsfvToFi5S9JTW46ruONXXWJUV9rPFTPiqNvCQ==\n",
+  "pragmatic/fixture.example\n11\n4jT1pTnVy3+R1GisEGGNrdudwnNkEvXaeZefRYonHDA=\n\n— pragmatic/fixture.example jcEwFpiiqjcZw3ctJm05c0YUHGPFwUOCaHLum1EOoGsavvLIHHbzVTQNYAfaeqBCE8GE7EDiYl7pVEglyQH/VZi1TwI=\n— witness.fixture.example 1w8xdgAAAABqzkBoYWgBwRjRjoHx+PBPktRWaHuFp07jYuGC5/GIm32yQrvtVUNZRnoqzNDPRjbd+Ryfu3ZB0d2WszI0IKOspqTdAg==\n"
+ ],
+ "origin": "pragmatic/fixture.example",
+ "witness": "witness.fixture.example"
+}
