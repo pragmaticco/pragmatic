@@ -467,7 +467,11 @@ impl Runtime {
 impl Runtime {
     #[new]
     #[pyo3(signature = (dir, oracle=None, key=None))]
-    fn new(dir: &str, oracle: Option<Py<PyAny>>, key: Option<Bound<'_, PyBytes>>) -> PyResult<Self> {
+    fn new(
+        dir: &str,
+        oracle: Option<Py<PyAny>>,
+        key: Option<Bound<'_, PyBytes>>,
+    ) -> PyResult<Self> {
         let mut inner = pragmatic_rt::Runtime::on_dir(dir, PyCallableOracle { func: oracle })
             .map_err(|e| PragmaticError::new_err(e.to_string()))?;
         if let Some(k) = key {
