@@ -109,10 +109,10 @@ journaled; replay reconstructs it by re-execution.
 
 ## Sync, async, Python - one semantics
 
-The record/replay primitives live in one place (the context's
-`oracle_replay`/`oracle_commit`, `effect_replay`/`effect_begin`/`effect_commit`)
-and every surface - sync `Ctx`, async `AsyncCtx`, and the Python `Ctx` -
-drives those same primitives. Strict replay's "the model is never called"
+The record/replay primitives live in one place (the attempt's `Session`:
+`draw_begin`/`draw_end`, `effect_begin`/`effect_end`, `recv`, `now`,
+`random`, `fork`/`join`) and every surface - sync `Ctx`, async `AsyncCtx`,
+and the Python `Ctx` - drives those same primitives. Strict replay's "the model is never called"
 holds identically everywhere because the mode check runs *before* the
 fresh-sample path, not because an oracle was swapped out. Journals are
 byte-compatible across all three surfaces and the CLI.

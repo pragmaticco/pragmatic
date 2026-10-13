@@ -109,7 +109,7 @@ fn research(ctx: &mut Ctx) -> Result<Value, Fault> {
 }
 
 fn main() -> Result<(), Fault> {
-    let mut rt = Runtime::on_dir("./journals", SeededOracle::new(42))?;
+    let rt = Runtime::on_dir("./journals", SeededOracle::new(42))?;
     let report = rt.run("research-42", research)?;
     println!("output: {}", report.output);
     println!("{} steps journaled", report.journal_len);
@@ -132,7 +132,7 @@ let oracle = AnthropicOracle::from_env()?    // reads ANTHROPIC_API_KEY
     .model("claude-sonnet-5")
     .max_tokens(1024);
 
-let mut rt = Runtime::on_dir("./journals", oracle)?;
+let rt = Runtime::on_dir("./journals", oracle)?;
 ```
 
 Or any OpenAI-compatible server - OpenAI itself, or a local Ollama / vLLM /

@@ -786,3 +786,62 @@ fn e2_handled_failures_at_the_end_of_a_run_are_not_retried() {
         "the handled model failure was retried"
     );
 }
+
+/// Intents opened together on one branch (a streamed model call left open
+/// while a tool runs) and both left without a result by a crash, with a
+/// later step after them: neither is at the frontier. The draw is re-issued
+/// under its own intent and the effect is decided by the policy.
+#[test]
+fn e2_open_intents_away_from_the_frontier() {
+    use pragmatic::journal::ROOT;
+    use pragmatic::{DrawStart, EffectStart};
+
+    let rt = Runtime::in_memory(CountingOracle::new(SeededOracle::new(4)));
+    let root = ROOT.to_vec();
+    let question = || vec![Value::from("streamed question")];
+    let (draw, effect) = {
+        let mut attempt = rt.begin("away", Mode::Run, RunOptions::default()).unwrap();
+        let s = attempt.session();
+        let DrawStart::Fresh(draw) = s.draw_begin(&root, "stream", question()).unwrap() else {
+            panic!("fresh run")
+        };
+        let EffectStart::Fresh { intent, .. } =
+            s.effect_begin(&root, "lookup", Value::from("q")).unwrap()
+        else {
+            panic!("fresh run")
+        };
+        s.now(&root).unwrap();
+        // The process dies here.
+        (draw, intent)
+    };
+
+    let mut decided = Vec::new();
+    let mut policy = |req: &RecoverRequest<'_>| {
+        decided.push((req.name.to_string(), req.intent, req.failure.is_some()));
+        Recover::Commit(Value::from("looked up before the crash"))
+    };
+    let mut attempt = rt
+        .begin_with("away", Mode::Resume, RunOptions::default(), &mut policy)
+        .unwrap();
+    let s = attempt.session();
+    assert_eq!(
+        s.draw_begin(&root, "stream", question()).unwrap(),
+        DrawStart::Fresh(draw),
+        "re-issued under the recorded intent"
+    );
+    s.draw_end(
+        draw,
+        r#"{"outcome":"ok"}"#.into(),
+        Value::default(),
+        Value::from("answer"),
+    )
+    .unwrap();
+    assert_eq!(
+        s.effect_begin(&root, "lookup", Value::from("q")).unwrap(),
+        EffectStart::Replayed(Value::from("looked up before the crash"))
+    );
+    s.now(&root).unwrap();
+    attempt.finish(Ok(Value::from("done"))).unwrap();
+    assert_eq!(decided, vec![("lookup".to_string(), effect, false)]);
+    assert!(rt.verify("away").unwrap().is_ok());
+}
