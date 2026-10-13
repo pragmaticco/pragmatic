@@ -19,8 +19,8 @@ path = "src/main.rs"
 # Zero dependencies beyond the core and the console, like the core itself:
 # the CLI verifies evidence for parties who trust nobody's supply chain.
 [dependencies]
-pragmatic = { version = "0.5.0", path = "../pragmatic", default-features = false }
-pragmatic-console = { version = "0.5.0", path = "../pragmatic-console" }
+pragmatic = { version = "0.6.0", path = "../pragmatic", default-features = false }
+pragmatic-console = { version = "0.6.0", path = "../pragmatic-console" }
 
 # The integration tests seed journal directories with the runtime.
 [dev-dependencies]

@@ -2819,5 +2819,3 @@ Not yet true of the code:
 - Server views detect binary fields with their own rules, which now
   include `b64_json`; they move to `redact::binary::scan` (4.10).
   Evidence redaction already uses the core scan.
-- `/v1/info` announces `min_sdk` 0.6.0 while the workspace, and so the
-  Python SDK built from it, is still versioned 0.5.0.

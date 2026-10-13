@@ -170,7 +170,7 @@ class MockServer:
             "server": "mock",
             "version": "0.6.0",
             "api_version": self.api_version,
-            "min_sdk": "0.5.0",
+            "min_sdk": "0.6.0",
             "journal_format": 2,
             "chain": "sha256",
             "lease_ttl_secs": self.ttl,

@@ -52,8 +52,12 @@ is pushed from a branch or a pull request.
 
 ## Cutting a release
 
-1. Bump `version` in the root `Cargo.toml` (`[workspace.package]`) and the
-   `pragmatic-macros` version pin in `crates/pragmatic/Cargo.toml`.
+1. Bump `version` in the root `Cargo.toml` (`[workspace.package]`) and
+   every pin on a workspace crate (`version = "X.Y.Z", path = "../..."` in
+   `crates/*/Cargo.toml`). The Python package takes its version from Cargo.
+   Pragmatic Server announces the oldest SDK it accepts as `min_sdk` in
+   `/v1/info` (`crates/pragmatic-server/src/server.rs`); raise it when the
+   server's API changes in a way older SDKs cannot follow.
 2. Move the `Unreleased` notes in `CHANGELOG.md` under the new version.
 3. Check locally:
    ```sh

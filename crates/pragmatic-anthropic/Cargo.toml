@@ -16,6 +16,6 @@ authors.workspace = true
 # outside world, so they carry the minimum needed to do it well: an HTTPS
 # client and a JSON codec.
 [dependencies]
-pragmatic = { version = "0.5.0", path = "../pragmatic", default-features = false }
+pragmatic = { version = "0.6.0", path = "../pragmatic", default-features = false }
 ureq = { version = "2", default-features = false, features = ["tls"] }
 serde_json = "1"

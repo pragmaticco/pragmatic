@@ -16,7 +16,7 @@ authors.workspace = true
 # renders untrusted journal content, and every line of code it pulls in is
 # code that sees that content.
 [dependencies]
-pragmatic = { version = "0.5.0", path = "../pragmatic", default-features = false }
+pragmatic = { version = "0.6.0", path = "../pragmatic", default-features = false }
 
 # The tests render format 1 journals, which only the `testing` feature can
 # write.
