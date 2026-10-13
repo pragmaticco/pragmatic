@@ -67,15 +67,24 @@ nonce; a witness receives `(origin, seq, tree_size, root)`; webhooks
 receive event type, run id and counts. No content or field data leaves
 the server.
 
-### 1.5 Licensing
+### 1.5 Licensing (decided 2026-10-13)
 
-All components remain BUSL-1.1 with the existing Additional Use Grant;
-production use by organizations at or above the grant threshold needs a
-commercial license for every component. `crates/pragmatic-server` has
-`publish = false` and is excluded from `cargo publish --workspace`; it
-ships as a container image and binaries. There is no license enforcement
-in code; `[license] licensee` from the server config is shown in the
-console footer and `/v1/info`.
+- **Open source, Apache-2.0:** the runtime, SDKs, bindings, CLI, journal
+  format, verifier and `pragmatic-console`.
+- **Commercial, `crates/pragmatic-server`:** the source stays public in
+  this repository under the Business Source License 1.1, so auditors can
+  inspect it.
+  - Its Additional Use Grant covers only non-production use:
+    development, testing and evaluation.
+  - Production use needs a commercial license from Pragmatic Research,
+    Inc.
+  - Each version converts to Apache-2.0 four years after release.
+  - The server crate carries its own `LICENSE` file and
+    `license = "BUSL-1.1"`, has `publish = false`, is excluded from
+    `cargo publish --workspace`, and ships as a container image and
+    binaries.
+- **No license enforcement in code:** `[license] licensee` from the server
+  config is shown in the console footer and in `/v1/info`.
 
 ---
 
