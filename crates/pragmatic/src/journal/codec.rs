@@ -163,7 +163,13 @@ pub(crate) fn commitment(salt: &[u8; SALT_LEN], content: &[u8]) -> Digest {
 /// accepts or rejects; it never changes bytes.
 pub(crate) fn strict_json(bytes: &[u8]) -> Result<Json, &'static str> {
     let text = std::str::from_utf8(bytes).map_err(|_| "JSON field is not UTF-8")?;
-    let value = json::parse(text).map_err(|e| e.reason)?;
+    // The parser enforces the same limits, so its reasons are mapped onto the
+    // journal's own wording to keep one message per rule.
+    let value = json::parse(text).map_err(|e| match e.reason {
+        "duplicate object key" => "JSON field has a duplicate key",
+        "nesting too deep" => "JSON field is nested deeper than 64",
+        other => other,
+    })?;
     if value.duplicate_key().is_some() {
         return Err("JSON field has a duplicate key");
     }
