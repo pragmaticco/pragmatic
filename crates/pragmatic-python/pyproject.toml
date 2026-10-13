@@ -4,12 +4,12 @@ build-backend = "maturin"
 
 [project]
 name = "pragmatic-runtime"
-description = "Durable execution for agents that don't run deterministically. Journals every step an agent takes, so it survives any crash and replays exactly - nondeterministic model behavior included."
+description = "The black-box recorder for LLM agents: journal every model and tool call of your Anthropic or OpenAI SDK agent, resume crashed runs without re-paying for tokens, and replay any run exactly for audit."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "BUSL-1.1" }
 authors = [{ name = "Pragmatic Research, Inc.", email = "me@aniketh.net" }]
-keywords = ["agents", "llm", "durable-execution", "replay", "crash-recovery"]
+keywords = ["agents", "llm", "anthropic", "openai", "audit", "durable-execution", "replay", "crash-recovery"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Programming Language :: Rust",
@@ -22,6 +22,11 @@ dynamic = ["version"]
 Homepage = "https://aniketh.net/pragmatic/"
 Repository = "https://github.com/pragmaticco/pragmaticMain"
 
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.40"]
+openai = ["openai>=1.40"]
+
 [tool.maturin]
-module-name = "pragmatic"
+module-name = "pragmatic._native"
+python-source = "python"
 features = ["pyo3/extension-module"]

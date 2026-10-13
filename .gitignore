@@ -5,3 +5,9 @@ Cargo.lock
 
 # Local Claude Code config
 .claude/
+
+# Built Python extension (maturin develop)
+*.so
+*.pyd
+__pycache__/
+.venv/

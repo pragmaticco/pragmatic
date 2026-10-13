@@ -53,11 +53,46 @@ semantics, not assumed.
 3. **Replay faithfully.** Reproduce the entire run bit-for-bit for
    time-travel debugging and audit - with the model never consulted.
 
-## A real agent, durable end to end
+## Your agent, journaled - one line
 
-Not a toy prompt loop - a Messages-API tool-use agent. Claude decides when
-to call tools, each tool runs as a write-ahead journaled effect, and the
-whole loop records, resumes, and replays:
+```sh
+pip install "pragmatic-runtime[anthropic]"    # or [openai]
+```
+
+Keep your agent as it is. Wrap the SDK client and hand tool calls to
+`ctx.run_tools`; every model call and tool call is now journaled:
+
+```python
+import anthropic, pragmatic
+
+rt = pragmatic.Runtime("./journals")
+
+def research(ctx):
+    client = ctx.wrap(anthropic.Anthropic())            # the only new line
+    messages = [{"role": "user", "content": "Find papers on durable execution."}]
+    while True:
+        msg = client.messages.create(model="claude-sonnet-5-5", max_tokens=1024,
+                                     tools=TOOLS, messages=messages)
+        messages.append({"role": "assistant", "content": msg.content})
+        if msg.stop_reason != "tool_use":
+            return msg.content[0].text
+        messages += ctx.run_tools(msg, {"search_corpus": search_corpus})
+
+rt.run("research-42", research)       # record
+rt.resume("research-42", research)    # after a crash: no repeated API or tool calls
+rt.replay("research-42", research)    # audit: nothing is called at all
+rt.verify("research-42")              # tamper evidence: the hash chain is intact
+```
+
+Works with `Anthropic`, `AsyncAnthropic`, `OpenAI`, and `AsyncOpenAI`
+(Messages, Chat Completions, and Responses APIs). Details:
+[crates/pragmatic-python](crates/pragmatic-python).
+
+## In Rust
+
+The same guarantees natively. Claude decides when to call tools, each tool
+runs as a write-ahead journaled effect, and the whole loop records,
+resumes, and replays:
 
 ```rust
 use pragmatic::{Ctx, Fault, Runtime, Value};
@@ -100,9 +135,8 @@ Try the runtime without a model: `cargo run -p pragmatic --example research_agen
 
 **Async?** Same guarantees, `await`ed - executor-agnostic (tokio, smol, or
 the built-in `block_on`), still zero dependencies (`AsyncRuntime`, see
-[docs/usage.md](docs/usage.md)). **Python?** The same runtime, importable -
-`pip install pragmatic-runtime`; journals are byte-compatible with Rust and
-the CLI ([crates/pragmatic-python](crates/pragmatic-python)). **C++, Java,
+[docs/usage.md](docs/usage.md)). **Python?** The same runtime (above); journals
+are byte-compatible with Rust and the CLI. **C++, Java,
 Go, Node.js?** One C ABI ([bindings/](bindings/)), full record → resume →
 replay surface, typed faults.
 

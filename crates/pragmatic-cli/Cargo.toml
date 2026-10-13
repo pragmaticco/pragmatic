@@ -17,4 +17,4 @@ path = "src/main.rs"
 
 # Zero dependencies beyond the core, like the core itself.
 [dependencies]
-pragmatic = { version = "0.4.0", path = "../pragmatic", default-features = false }
+pragmatic = { version = "0.5.0", path = "../pragmatic", default-features = false }

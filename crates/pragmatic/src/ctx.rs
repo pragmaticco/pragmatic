@@ -168,7 +168,13 @@ impl<'a> Ctx<'a> {
     /// serve the recorded outcome ([O-rep]) or signal that a fresh sample is
     /// required (`None` - [O-resume] fall-through). Shared by the sync and
     /// async surfaces.
-    pub(crate) fn oracle_replay(&mut self, prompt: &Value) -> Result<Option<Value>, Fault> {
+    ///
+    /// Together with [`oracle_commit`](Self::oracle_commit) this is the
+    /// split-phase draw for hosts that perform the model call themselves
+    /// (language bindings, async SDK clients): call `oracle_replay`, and
+    /// only if it returns `None`, sample and pass the outcome to
+    /// `oracle_commit` with the same prompt before any other step.
+    pub fn oracle_replay(&mut self, prompt: &Value) -> Result<Option<Value>, Fault> {
         self.charge_budget()?;
         if let Some((cursor, event)) = self.replay_next() {
             return match event {
@@ -197,7 +203,7 @@ impl<'a> Ctx<'a> {
     /// The record half of an oracle draw: journal the realized outcome
     /// ([O-rec]). Only called after [`oracle_replay`](Self::oracle_replay)
     /// returned `None`.
-    pub(crate) fn oracle_commit(
+    pub fn oracle_commit(
         &mut self,
         prompt: Value,
         outcome: Value,
@@ -291,11 +297,7 @@ impl<'a> Ctx<'a> {
     /// the journal is exhausted here, or every recorded intent for this step
     /// was closed by a compensation (undone after a crash) and the loop
     /// consumed those pairs.
-    pub(crate) fn effect_replay(
-        &mut self,
-        name: &str,
-        arg: &Value,
-    ) -> Result<Option<Value>, Fault> {
+    pub fn effect_replay(&mut self, name: &str, arg: &Value) -> Result<Option<Value>, Fault> {
         if let Some(caps) = &self.caps {
             if !caps.contains(name) {
                 return Err(Fault::CapabilityDenied(name.to_string()));
@@ -370,7 +372,7 @@ impl<'a> Ctx<'a> {
     /// [Eff-intent]: journal the write-ahead intent - durable BEFORE the
     /// world can change. Only called after
     /// [`effect_replay`](Self::effect_replay) returned `None`.
-    pub(crate) fn effect_begin(&mut self, name: &str, arg: Value) -> Result<(), Fault> {
+    pub fn effect_begin(&mut self, name: &str, arg: Value) -> Result<(), Fault> {
         self.journal.append(Event::EffectIntent {
             name: name.to_string(),
             arg,
@@ -380,7 +382,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// [Eff-commit]: journal the realized result after the effect succeeds.
-    pub(crate) fn effect_commit(&mut self, name: &str, result: Value) -> Result<Value, Fault> {
+    pub fn effect_commit(&mut self, name: &str, result: Value) -> Result<Value, Fault> {
         let cursor = self.journal.append(Event::EffectCommit {
             name: name.to_string(),
             result: result.clone(),

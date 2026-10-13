@@ -4,6 +4,52 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com); versions follow
 [SemVer](https://semver.org) (pre-1.0: minor bumps may break).
 
+## [0.5.0] - Unreleased · drop-in Python
+
+### Added
+- **Drop-in journaling for the Anthropic and OpenAI Python SDKs.**
+  `ctx.wrap(client)` returns a client you use exactly as before; every
+  `messages.create` / `beta.messages.create` (Anthropic) and
+  `chat.completions.create` / `responses.create` (OpenAI) call is
+  journaled with its full request and response. Sync and async clients
+  both work. Resume and replay hand back the same SDK response types
+  rebuilt from the journal, with zero network calls. Streaming and
+  `.parse()` are refused inside a durable run rather than silently
+  bypassing the journal. Transport settings (`timeout`, `extra_headers`,
+  `extra_query`) are never recorded, so auth headers stay out of journals.
+- **`ctx.run_tools(response, tools)`** (and `arun_tools`): performs every
+  tool call in an Anthropic `Message`, OpenAI `ChatCompletion`, or OpenAI
+  `Response` as a write-ahead journaled effect named `tool:<name>` and
+  returns the messages to append in the provider's format. A tool that
+  raises is recorded and reported to the model as an error result.
+- **Python surface parity with Rust:** `ctx.draw`/`adraw` for any other
+  model client, `ctx.tool`/`atool` for journaled function calls,
+  `ctx.aeffect`, async agents, `@pragmatic.durable` (source-hash program
+  marker, so a changed agent refuses to replay), per-run `budget` and
+  `caps`, a `recover` policy on `resume`, and `PRAGMATIC_JOURNAL_KEY` for
+  signed journals.
+- **Typed Python exceptions:** `PragmaticError`, with `JournalDesync` and
+  `ReplayExhausted` subclasses. Faults keep their type across the Python
+  boundary, and exceptions raised by agent code propagate unchanged.
+- End-to-end Python tests drive the real Anthropic and OpenAI SDKs over a
+  mock transport through record, crash, resume, and replay, run in CI on
+  Python 3.10 and 3.13.
+- `RELEASING.md`: one-time registry setup and the release checklist.
+
+### Changed
+- The Python package is now a mixed Rust/Python package: the extension
+  moved to `pragmatic._native` and the public API lives in pure Python.
+  `import pragmatic` and the existing `Runtime`/`ctx.oracle`/`ctx.effect`
+  API are unchanged; `Runtime`'s `oracle` argument is now optional.
+- `Ctx::oracle_replay`/`oracle_commit` and `effect_replay`/`effect_begin`/
+  `effect_commit` are public: the split-phase record/replay steps for
+  hosts that perform model and tool calls themselves.
+- PyPI publishing uses trusted publishing (no API token). The v0.4.0
+  release never reached PyPI or crates.io because the registry tokens were
+  missing; 0.5.0 is the first published release.
+- Roadmap reordered in `docs/STRATEGY.md`: installable drop-in Python
+  first, then the hosted console, then the TypeScript SDK.
+
 ## [0.4.0] - 2026-08-08 · polyglot launch
 
 ### Added

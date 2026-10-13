@@ -44,20 +44,36 @@ demos should do the same.
 
 ## Roadmap priorities, in order
 
-1. **Prove the abstraction on real agents.** Done for Anthropic (v0.5:
-   structured `Conversation`/`Turn` tool-use loop, wire-tested end to end).
-   Next: the same structured-conversation surface for `pragmatic-openai`,
-   so tool-loop agents are portable across both adapters.
-2. **TypeScript SDK as a first-class citizen.** Agents live in Python and
-   TypeScript. The koffi-based Node binding is a proof of the C ABI, not a
-   DX. A real TS package (typed `Conversation`/`Turn`, promise-native ctx,
-   npm-installable with prebuilt binaries) is the next major surface.
-3. **Minimal hosted console for design partners.** The commercial layer.
-   Journal upload/sync + the existing console UI + retention policy +
-   alerting on chain breaks and dangling effects. Ship embarrassingly
-   small, to 2–3 design partners with a real compliance need; let their
-   usage set the packaging and pricing.
-4. **Only then:** breadth (more adapters, more bindings, distributed
+Reordered 2026-09-30. The earlier order put adapter parity first, but an
+audit found two gaps that block every user before any adapter matters:
+nothing was installable (the v0.4.0 release never reached PyPI or
+crates.io), and the Python surface only journaled `str -> str` calls, so a
+real SDK-based agent had to be rewritten to use Pragmatic. Most agents are
+Python calling the Anthropic or OpenAI SDK directly; that is where
+adoption is decided.
+
+1. **Installable, and drop-in for Python agents.** Done in v0.5:
+   `ctx.wrap(client)` journals the Anthropic and OpenAI SDKs (sync and
+   async, Messages, Chat Completions, Responses) with no other code
+   changes, and `ctx.run_tools` journals tool execution in each provider's
+   format. Release publishing is wired to PyPI trusted publishing and
+   crates.io. Next: streaming support, the one common call pattern still
+   refused.
+2. **Minimal hosted console for design partners.** The commercial layer,
+   and the surface the audit buyer (not the developer) actually uses:
+   journal upload/sync, a run browser built on the existing console UI,
+   retention policy, PII redaction on export, alerting on chain breaks and
+   dangling effects, and chain heads anchored outside the customer's
+   infrastructure so tamper evidence holds against whoever holds the
+   files. Ship embarrassingly small, to 2-3 design partners with a real
+   compliance need; let their usage set packaging and pricing.
+3. **TypeScript SDK as a first-class citizen.** The same drop-in shape
+   (`ctx.wrap` over the official Anthropic/OpenAI TS SDKs), npm-installable
+   with prebuilt binaries. The koffi-based Node binding is a proof of the C
+   ABI, not a DX.
+4. **Only then:** breadth (structured tool-use parity in the Rust
+   `pragmatic-openai` adapter, more adapters, framework integrations such
+   as LangGraph and the OpenAI Agents SDK, more bindings, distributed
    journals).
 
 ## What we are deliberately NOT doing
