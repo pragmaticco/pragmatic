@@ -179,6 +179,6 @@ The first public release. Workspace of four crates:
 - E3: O(1) append, flat from 1k to 1M entries (~0.8 µs with full hash
   chaining, release build); ~1000× replay speedup under a 1 ms/draw oracle.
 
-[0.4.0]: https://github.com/pragmaticco/pragmaticMain/releases/tag/v0.4.0
-[0.3.0]: https://github.com/pragmaticco/pragmaticMain/releases/tag/v0.3.0
-[0.2.0]: https://github.com/pragmaticco/pragmaticMain/releases/tag/v0.2.0
+[0.4.0]: https://github.com/pragmaticco/pragmatic/releases/tag/v0.4.0
+[0.3.0]: https://github.com/pragmaticco/pragmatic/releases/tag/v0.3.0
+[0.2.0]: https://github.com/pragmaticco/pragmatic/releases/tag/v0.2.0

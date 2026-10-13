@@ -147,7 +147,7 @@ pub fn page(title: &str, body: &str) -> String {
 {body}
 <div class="foot">
   <span>append-only · hash-chained · replay reads the journal, never the model</span>
-  <span><a href="https://github.com/pragmaticco/pragmaticMain">pragmatic {version}</a></span>
+  <span><a href="https://github.com/pragmaticco/pragmatic">pragmatic {version}</a></span>
 </div>
 </div>
 </body>

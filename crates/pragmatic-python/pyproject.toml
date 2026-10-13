@@ -20,7 +20,7 @@ dynamic = ["version"]
 
 [project.urls]
 Homepage = "https://aniketh.net/pragmatic/"
-Repository = "https://github.com/pragmaticco/pragmaticMain"
+Repository = "https://github.com/pragmaticco/pragmatic"
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40"]

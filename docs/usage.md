@@ -26,8 +26,8 @@ Clone the repo and run the landing-page example. It uses a seeded stand-in
 for the model, so it needs no API key and no network:
 
 ```sh
-git clone https://github.com/pragmaticco/pragmaticMain
-cd pragmaticMain
+git clone https://github.com/pragmaticco/pragmatic
+cd pragmatic
 cargo run --example research_agent
 ```
 

@@ -13,7 +13,7 @@ Both registries need an account owner to authorize this repository once.
 1. Sign in at pypi.org and open *Your account → Publishing → Add a new
    pending publisher*.
 2. PyPI project name `pragmatic-runtime`, owner `pragmaticco`, repository
-   `pragmaticMain`, workflow `release.yml`, environment `pypi`.
+   `pragmatic`, workflow `release.yml`, environment `pypi`.
 3. In the GitHub repository settings, create an environment named `pypi`
    (optionally with required reviewers, so a release needs a click).
 
