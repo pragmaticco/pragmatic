@@ -210,3 +210,43 @@ fn write_run(l: &layout::Layout, run: &str, index_key: &[u8]) {
     };
     std::fs::write(l.meta(&stem), serde_json::to_vec(&meta).unwrap()).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "load test: writes a 1 GiB journal"]
+async fn a_one_gib_journal_is_appended_restarted_and_served() {
+    let ts = TestServer::start(|c| c.max_request_bytes = 1 << 30).await;
+    let (agent, _) = ts.issue("agent", &["*"], false).await;
+    let mut w = Writer::create(&ts, &agent, "big").await;
+    assert_eq!(w.push(&ts).await.status(), StatusCode::OK);
+    // 16 slots of 64 MiB, each distinct so none is deduplicated.
+    for i in 0..16u8 {
+        let mut content = vec![b'a' + i; 64 << 20];
+        content[0] = i;
+        w.journal
+            .append(
+                journal::ROOT,
+                pragmatic::Event::ChannelRecv {
+                    channel: "in".into(),
+                    value: Content::from(content),
+                },
+            )
+            .unwrap();
+        assert_eq!(w.push(&ts).await.status(), StatusCode::OK);
+    }
+    let size = w.journal.byte_len();
+    assert!(size > 1 << 30);
+    let ts = ts.restart().await;
+    let started = Instant::now();
+    let resp = ts.get(&run_path("big", "/journal"), &ts.admin).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.bytes().await.unwrap();
+    eprintln!("served {} bytes in {:?}", body.len(), started.elapsed());
+    assert_eq!(body.len() as u64, size);
+    let v: serde_json::Value = ts
+        .get(&run_path("big", "/entries?from=16&limit=1"), &ts.admin)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["entries"][0]["slots"][0]["truncated"], true);
+}

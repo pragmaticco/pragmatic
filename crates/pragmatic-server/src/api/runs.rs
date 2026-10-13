@@ -223,16 +223,18 @@ pub async fn journal(
     }
     raw_read(&app, &p, &id, "journal").await?;
     let (a, run) = (app.clone(), id.clone());
-    let durable = blocking(move || a.store.durable(&run)).await?;
-    let mut resp = Response::new(Body::from(durable.bytes));
+    let durable = blocking(move || a.store.open_durable(&run)).await?;
+    let (entries, head) = (durable.entries, durable.head.clone());
+    let mut resp = Response::new(super::stream::file_body(durable.file, durable.byte_len));
     let h = resp.headers_mut();
     h.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
     );
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    h.insert("pragmatic-entries", HeaderValue::from(durable.entries));
-    if let Ok(v) = HeaderValue::from_str(&durable.head) {
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from(durable.byte_len));
+    h.insert("pragmatic-entries", HeaderValue::from(entries));
+    if let Ok(v) = HeaderValue::from_str(&head) {
         h.insert("pragmatic-head", v);
     }
     Ok(noted(
@@ -240,7 +242,7 @@ pub async fn journal(
         AccessNote {
             raw: true,
             cursor_from: Some(0),
-            cursor_to: Some(durable.entries),
+            cursor_to: Some(entries),
             ..AccessNote::default()
         },
     ))

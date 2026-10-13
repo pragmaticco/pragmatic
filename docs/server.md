@@ -248,6 +248,10 @@ access log and the custody notes.
 - A run has at most one lease. The SDK renews it every third of
   `lease_ttl_secs`. A lease that expires keeps working for its holder until
   another holder asks for the run.
+- Renewing needs the same token and the same holder id. A lease granted
+  when a run is created has no holder id yet: the first renewal must name
+  the lease in the `Pragmatic-Lease` header, which records the holder, so
+  another process with the same token cannot take a live lease over.
 - When a lease ends (released, taken over, or revoked by a forced erasure)
   the server appends a **custody note** to the run: which token held it,
   the entries before and after, how many append requests it made, and
@@ -386,7 +390,8 @@ Every cosigned checkpoint is recorded in the server-written run
 - **Memory.** About 1 KiB per stored run for the index, plus the full
   journal of every run that is being written to (it is loaded while its
   lease is active), plus up to 256 MiB of parsed journals cached for
-  readers.
+  readers, plus about 24 bytes per access-log record (the log itself stays
+  on disk; the server keeps where each record starts).
 - **CPU.** Appends are dominated by fsync; reads of large journals parse
   them, so give auditor-heavy deployments more cores.
 - **Targets** (release build, 4 vCPU, SSD): one-frame appends of up to

@@ -50,10 +50,23 @@ pub struct RunPage {
     pub next: Option<String>,
 }
 
+/// An open journal file and the length of its durable prefix.
+///
+/// The descriptor stays valid however long the reader takes: erasure
+/// replaces a journal by renaming a new file into place and deletion
+/// unlinks it, and neither changes the bytes an open descriptor reads. So a
+/// large journal can be streamed without holding the run's lock.
+pub struct DurableFile {
+    pub file: File,
+    pub byte_len: u64,
+    pub entries: u64,
+    pub head: String,
+}
+
 impl Store {
-    /// The run's durable prefix as bytes. Holds the file lock shared while
-    /// reading.
-    pub fn durable(&self, run_id: &str) -> Result<Durable, ApiError> {
+    /// Open the run's journal and note its durable prefix, under the file
+    /// lock held shared.
+    pub fn open_durable(&self, run_id: &str) -> Result<DurableFile, ApiError> {
         let run = self.find(run_id)?;
         let _file = run.file.read().unwrap_or_else(|p| p.into_inner());
         let (entries, head, byte_len) = {
@@ -67,10 +80,21 @@ impl Store {
             (st.meta.entries, st.meta.head.clone(), st.meta.byte_len)
         };
         let file = File::open(self.layout.journal(&run.stem))?;
-        let bytes = fsutil::read_prefix(&file, byte_len)?;
-        Ok(Durable {
+        Ok(DurableFile {
+            file,
+            byte_len,
             entries,
             head,
+        })
+    }
+
+    /// The run's durable prefix as bytes.
+    pub fn durable(&self, run_id: &str) -> Result<Durable, ApiError> {
+        let d = self.open_durable(run_id)?;
+        let bytes = fsutil::read_prefix(&d.file, d.byte_len)?;
+        Ok(Durable {
+            entries: d.entries,
+            head: d.head,
             bytes,
         })
     }

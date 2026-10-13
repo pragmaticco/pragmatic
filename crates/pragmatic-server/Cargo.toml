@@ -34,6 +34,7 @@ subtle = "2"
 clap = { version = "4", features = ["derive", "env"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 http-body-util = "0.1"
+futures-core = "0.3"
 form_urlencoded = "1"
 percent-encoding = "2"
 

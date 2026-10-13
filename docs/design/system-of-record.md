@@ -1434,6 +1434,11 @@ silent or disagreed:
   draws are re-issued on resume and do not count. `updated_at` moves only
   on client appends (and creation), so server-written notes (custody,
   erasure) do not postpone retention.
+- **Append order.** A regressed, damaged or missing run answers its
+  error (`regressed`, `chain_broken`) right after the existence check,
+  before the duplicate rule: its stored hashes cannot be relied on. Header
+  and query problems (`bad_request`) and oversized bodies
+  (`payload_too_large`) are answered before step 2.
 - **Erasure of an unfinished run** without `allow_unfinished` is
   `400 bad_request` with `"unfinished": true`. A run with an expired (not
   live) lease is erasable; its lease is ended with a custody note first.

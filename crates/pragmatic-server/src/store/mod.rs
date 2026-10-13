@@ -13,9 +13,11 @@
 //!   its lease and its writer's journal. Every change takes it: appends,
 //!   leases, custody notes, erasure, retention, anchoring snapshots.
 //!
-//! The lock order is: the run map, then `file`, then `state`, then holds.
-//! The run map is never held while a run's locks are, except when a new run
-//! is inserted (its locks are taken before anyone can see it).
+//! The lock order is `file`, then `state`, then holds. The run map is
+//! never held while waiting for a run's lock: lookups copy what they need
+//! out of it and release it first. A run's `state` may be held while the
+//! map is locked (creating or deleting a run), which cannot deadlock for
+//! that reason.
 //!
 //! # The index
 //!
@@ -50,7 +52,7 @@ use crate::webhooks::{WebhookEvent, Webhooks};
 
 pub use admin::{EraseContext, EraseOutcome, EraseParams, Selector};
 pub use index::IndexReport;
-pub use read::{verify_json, Durable, ListQuery, RunPage};
+pub use read::{verify_json, Durable, DurableFile, ListQuery, RunPage};
 pub use write::{AppendOk, AppendRequest, LeaseGrant};
 
 /// How often `meta.json` may be rewritten for appends.

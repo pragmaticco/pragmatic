@@ -21,6 +21,7 @@ pub mod console;
 pub mod info;
 pub mod middleware;
 pub mod runs;
+pub mod stream;
 pub mod witness;
 
 use std::sync::Arc;

@@ -115,25 +115,25 @@ pub struct BackupReport {
     pub manifest: PathBuf,
 }
 
-/// The largest whole-frame prefix of `bytes` (a journal file) not longer
-/// than `limit`.
-fn frame_prefix(bytes: &[u8], limit: u64) -> usize {
-    let limit = (limit as usize).min(bytes.len());
-    if limit < HEADER_LEN {
-        return 0;
+/// The largest whole-frame prefix of a journal file not longer than
+/// `limit`, found by reading only the frames' length prefixes.
+fn frame_prefix(file: &fs::File, limit: u64) -> io::Result<u64> {
+    let limit = limit.min(file.metadata()?.len());
+    let header = HEADER_LEN as u64;
+    if limit < header {
+        return Ok(0);
     }
-    let mut pos = HEADER_LEN;
-    while pos < limit {
-        let Some(len) = bytes.get(pos..pos + 4) else {
-            break;
-        };
-        let end = pos + 4 + u32::from_le_bytes(len.try_into().expect("4 bytes")) as usize + 32;
+    let mut pos = header;
+    let mut len = [0u8; 4];
+    while pos + 4 <= limit {
+        fsutil::read_exact_at(file, &mut len, pos)?;
+        let end = pos + 4 + u64::from(u32::from_le_bytes(len)) + 32;
         if end > limit {
             break;
         }
         pos = end;
     }
-    pos
+    Ok(pos)
 }
 
 struct Copier<'a> {
@@ -158,6 +158,35 @@ impl Copier<'_> {
             sha256: hex_encode(&sha256(bytes)),
         });
         self.bytes += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Copy the first `len` bytes of an open file to `rel`, hashing as it
+    /// goes, without holding the file in memory.
+    fn put_prefix(&mut self, rel: &str, file: &fs::File, len: u64) -> io::Result<()> {
+        use std::io::Write;
+        let dest = self.to.join(rel);
+        if let Some(dir) = dest.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let mut out = io::BufWriter::new(fs::File::create(&dest)?);
+        let mut hash = pragmatic::sha256::Sha256::new();
+        let mut buf = vec![0u8; 1 << 20];
+        let mut offset = 0u64;
+        while offset < len {
+            let n = (len - offset).min(buf.len() as u64) as usize;
+            fsutil::read_exact_at(file, &mut buf[..n], offset)?;
+            hash.update(&buf[..n]);
+            out.write_all(&buf[..n])?;
+            offset += n as u64;
+        }
+        out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+        self.files.push(ManifestFile {
+            path: rel.to_string(),
+            bytes: len,
+            sha256: hex_encode(&hash.finalize()),
+        });
+        self.bytes += len;
         Ok(())
     }
 
@@ -274,14 +303,12 @@ fn copy_runs(layout: &Layout, c: &mut Copier<'_>) -> io::Result<Vec<ManifestRun>
             let meta_bytes = fs::read(layout.meta(stem))?;
             let meta: Meta = serde_json::from_slice(&meta_bytes)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let size = journal.metadata()?.len();
-            let bytes = fsutil::read_prefix(&journal, size.min(meta.byte_len))?;
-            let cut = frame_prefix(&bytes, meta.byte_len);
-            c.put(&format!("runs/{hh}/{stem}.journal"), &bytes[..cut])?;
+            let cut = frame_prefix(&journal, meta.byte_len)?;
+            c.put_prefix(&format!("runs/{hh}/{stem}.journal"), &journal, cut)?;
             c.put(&format!("runs/{hh}/{stem}.meta.json"), &meta_bytes)?;
             runs.push(ManifestRun {
                 run_id: meta.run_id,
-                byte_len: cut as u64,
+                byte_len: cut,
             });
         }
     }
@@ -292,10 +319,10 @@ fn copy_runs(layout: &Layout, c: &mut Copier<'_>) -> io::Result<Vec<ManifestRun>
 /// The access log, to its last whole frame.
 fn copy_access_log(c: &mut Copier<'_>) -> io::Result<()> {
     let rel = "audit/access.journal";
-    match fs::read(c.from.join(rel)) {
-        Ok(bytes) => {
-            let cut = frame_prefix(&bytes, bytes.len() as u64);
-            c.put(rel, &bytes[..cut])
+    match fs::File::open(c.from.join(rel)) {
+        Ok(file) => {
+            let cut = frame_prefix(&file, u64::MAX)?;
+            c.put_prefix(rel, &file, cut)
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -603,9 +630,13 @@ mod tests {
         }
         j.mark_persisted(j.len());
         let bytes = j.to_bytes();
-        assert_eq!(frame_prefix(&bytes, bytes.len() as u64), bytes.len());
-        let one = HEADER_LEN + j.frame_bytes(0).unwrap().len();
-        assert_eq!(frame_prefix(&bytes, one as u64 + 5), one);
-        assert_eq!(frame_prefix(&bytes, 3), 0);
+        let d = crate::fsutil::testdir::TestDir::new("prefix");
+        let path = d.join("j");
+        fs::write(&path, &bytes).unwrap();
+        let f = fs::File::open(&path).unwrap();
+        assert_eq!(frame_prefix(&f, u64::MAX).unwrap(), bytes.len() as u64);
+        let one = (HEADER_LEN + j.frame_bytes(0).unwrap().len()) as u64;
+        assert_eq!(frame_prefix(&f, one + 5).unwrap(), one);
+        assert_eq!(frame_prefix(&f, 3).unwrap(), 0);
     }
 }
