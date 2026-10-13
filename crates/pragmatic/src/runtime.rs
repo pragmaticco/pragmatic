@@ -243,6 +243,60 @@ impl Attempt<'_> {
     pub fn finish(self, result: Result<Value, Fault>) -> Result<RunReport, Fault> {
         finish_session(self.session, result)
     }
+
+    /// Detach the attempt from the runtime's oracle, so it can be stored in
+    /// an object, moved to another thread and finished there. Bindings
+    /// whose agents make their own model calls (through the split-phase
+    /// [`Session::draw_begin`] and [`Session::draw_end`]) hold attempts
+    /// this way; they never need the oracle that [`ctx`](Self::ctx) calls.
+    pub fn into_owned(self) -> OwnedAttempt {
+        OwnedAttempt {
+            session: self.session,
+        }
+    }
+}
+
+/// An [`Attempt`] that borrows nothing: its session, and through it the
+/// run's lock or lease, belong to it alone. Made by
+/// [`Attempt::into_owned`].
+///
+/// It is `Send`, so a host can keep it behind a lock of its own and step it
+/// from whichever thread the agent is on. It has no root [`Ctx`]: every step
+/// goes through the session's split-phase primitives. Dropping it, or
+/// [`abandon`](Self::abandon)ing it, is a crash, exactly as for an
+/// [`Attempt`].
+pub struct OwnedAttempt {
+    session: Session,
+}
+
+impl std::fmt::Debug for OwnedAttempt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedAttempt")
+            .field("session", &self.session)
+            .finish()
+    }
+}
+
+impl OwnedAttempt {
+    /// The session, for split-phase steps on any branch.
+    pub fn session(&mut self) -> &mut Session {
+        &mut self.session
+    }
+
+    /// End the attempt with the agent's result, as [`Attempt::finish`]
+    /// does. A host that detached the session's sink attaches it again
+    /// first, so `attempt.end` is persisted before the run is checked in.
+    pub fn finish(self, result: Result<Value, Fault>) -> Result<RunReport, Fault> {
+        finish_session(self.session, result)
+    }
+
+    /// End the attempt as a crash (spec 2.7, rule 7): nothing more is
+    /// journaled, `attempt.end` is not written, entries that were never
+    /// persisted are dropped, and the run's lock or lease is released.
+    /// Messages whose receives never became durable go back to the inbox.
+    pub fn abandon(mut self) {
+        self.session.requeue_unconfirmed();
+    }
 }
 
 static REFUSING: RefusingOracle = RefusingOracle;
@@ -492,5 +546,120 @@ impl<O: Oracle> Runtime<O> {
     /// The saga's checkout (see [`Supervisor`](crate::Supervisor)).
     pub(crate) fn checkout(&self, run_id: &str) -> Result<Checkout, Fault> {
         self.core.checkout(run_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::journal::Event;
+    use crate::oracle::SeededOracle;
+    use crate::session::{DrawStart, EffectStart};
+
+    fn send<T: Send>(_: &T) {}
+
+    #[test]
+    fn an_owned_attempt_moves_to_another_thread_and_finishes_there() {
+        let rt = Runtime::in_memory(SeededOracle::new(1));
+        let mut attempt = rt
+            .begin("owned", Mode::Run, RunOptions::default())
+            .unwrap()
+            .into_owned();
+        send(&attempt);
+        let root = ROOT.to_vec();
+        let DrawStart::Fresh(intent) = attempt
+            .session()
+            .draw_begin(&root, "test", vec![Value::from("prompt")])
+            .unwrap()
+        else {
+            panic!("a fresh draw")
+        };
+        let report = std::thread::spawn(move || {
+            attempt
+                .session()
+                .draw_end(
+                    intent,
+                    r#"{"outcome":"ok"}"#.into(),
+                    Value::default(),
+                    Value::from("answer"),
+                )
+                .unwrap();
+            attempt.finish(Ok(Value::from("done")))
+        })
+        .join()
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.output.as_str(), "done");
+        assert_eq!(report.fresh_steps, 1);
+        // The run was checked back in: it replays, and resumes.
+        let mut again = rt
+            .begin("owned", Mode::Replay, RunOptions::default())
+            .unwrap();
+        let replayed = again
+            .session()
+            .draw_begin(&root, "test", vec![Value::from("prompt")])
+            .unwrap();
+        assert!(matches!(replayed, DrawStart::Replayed { body, .. } if body.as_str() == "answer"));
+        assert!(rt
+            .begin("owned", Mode::Resume, RunOptions::default())
+            .is_ok());
+    }
+
+    #[test]
+    fn an_abandoned_attempt_is_a_crash() {
+        let rt = Runtime::in_memory(SeededOracle::new(1));
+        let mut attempt = rt
+            .begin("crashed", Mode::Run, RunOptions::default())
+            .unwrap()
+            .into_owned();
+        let root = ROOT.to_vec();
+        let EffectStart::Fresh { intent, .. } = attempt
+            .session()
+            .effect_begin(&root, "charge", Value::from("10 EUR"))
+            .unwrap()
+        else {
+            panic!("a fresh effect")
+        };
+        // Taken while the effect runs: the lock is held.
+        assert_eq!(
+            rt.begin("crashed", Mode::Resume, RunOptions::default())
+                .unwrap_err(),
+            Fault::Locked {
+                retry_after_secs: None
+            }
+        );
+        attempt.abandon();
+        // The intent is durable, its result never written, and no
+        // attempt.end follows it.
+        let stored = rt.snapshot("crashed").unwrap();
+        assert!(matches!(
+            stored.get(intent).map(|e| &e.event),
+            Some(Event::EffectIntent { .. })
+        ));
+        assert_eq!(stored.len(), intent + 1);
+        assert!(rt
+            .begin("crashed", Mode::Resume, RunOptions::default())
+            .is_ok());
+    }
+
+    #[test]
+    fn abandoning_hands_undurable_receives_back() {
+        let rt = Runtime::in_memory(SeededOracle::new(1));
+        rt.send("inbox", "jobs", "only");
+        let mut attempt = rt
+            .begin("inbox", Mode::Run, RunOptions::default())
+            .unwrap()
+            .into_owned();
+        let _sink = attempt.session().detach_sink();
+        let root = ROOT.to_vec();
+        assert_eq!(
+            attempt.session().recv(&root, "jobs").unwrap().as_str(),
+            "only"
+        );
+        attempt.abandon();
+        // The receive never became durable, so the next attempt gets the
+        // message again.
+        let report = rt.run("inbox", |ctx| ctx.recv("jobs")).unwrap();
+        assert_eq!(report.output.as_str(), "only");
     }
 }

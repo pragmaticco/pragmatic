@@ -387,6 +387,14 @@ pub struct Session {
     /// Refusals not journaled yet, in the order they happened, with their
     /// branches (see the module documentation).
     refusals: Vec<(Branch, Event)>,
+    /// Messages taken off the inbox whose `ChannelRecv` is appended but not
+    /// yet known to be durable: `(cursor, channel, value)`. Only a session
+    /// whose sink is detached has any (see [`detach_sink`]); they go back
+    /// to the front of their channels if the persist fails or the attempt
+    /// is abandoned.
+    ///
+    /// [`detach_sink`]: Session::detach_sink
+    unconfirmed: Vec<(Cursor, String, Value)>,
 }
 
 impl fmt::Debug for Session {
@@ -457,6 +465,7 @@ impl Session {
             attempt: 0,
             faulted: HashSet::new(),
             refusals: Vec::new(),
+            unconfirmed: Vec::new(),
         };
         session.index();
         Ok(session)
@@ -959,12 +968,12 @@ impl Session {
         let upto = self.journal.len();
         match sink.persist(at, frames, &head) {
             Ok(()) => {
-                self.journal.mark_persisted(upto);
+                self.mark_persisted(upto);
                 Ok(())
             }
             Err(e) => {
                 let fault = e.into_fault(size);
-                self.failed = Some(fault.clone());
+                self.persist_failed(fault.clone());
                 Err(fault)
             }
         }
@@ -982,13 +991,56 @@ impl Session {
     /// Record that the first `upto_entries` entries are durable.
     pub fn mark_persisted(&mut self, upto_entries: u64) {
         self.journal.mark_persisted(upto_entries);
+        self.unconfirmed.retain(|(c, _, _)| *c >= upto_entries);
     }
 
     /// Record that a persist done outside the session failed, which fails
-    /// the session exactly as an inline persist error would.
+    /// the session exactly as an inline persist error would. Messages whose
+    /// receives were not durable go back to the front of their channels, so
+    /// the next attempt receives them again (spec 3.1).
     pub fn persist_failed(&mut self, fault: Fault) {
         if self.failed.is_none() {
             self.failed = Some(fault);
+        }
+        self.requeue_unconfirmed();
+    }
+
+    /// Take the sink out of the session, for hosts that persist on a thread
+    /// of their own (spec 6.2: an async binding persists on a dedicated
+    /// executor so its event loop never blocks on storage).
+    ///
+    /// While the sink is detached, the primitives append their entries and
+    /// return without persisting: the host takes the frames with
+    /// [`unpersisted`](Self::unpersisted), persists them through the sink
+    /// outside any lock on the session, and reports the outcome with
+    /// [`mark_persisted`](Self::mark_persisted) or
+    /// [`persist_failed`](Self::persist_failed). The durability rule is then
+    /// the host's to keep: a step's value may be released only once
+    /// [`Journal::persisted_len`] covers the step's entries, and a draw or
+    /// effect may be performed only once its intent is durable. Reattach
+    /// the sink with [`attach_sink`](Self::attach_sink) before the attempt
+    /// finishes, so `attempt.end` is persisted inline.
+    ///
+    /// Returns `None` for a strict replay, which has no sink.
+    pub fn detach_sink(&mut self) -> Option<Box<dyn Sink>> {
+        self.sink.take()
+    }
+
+    /// Put back a sink taken with [`detach_sink`](Self::detach_sink).
+    pub fn attach_sink(&mut self, sink: Box<dyn Sink>) {
+        self.sink = Some(sink);
+    }
+
+    /// Put the messages of receives that never became durable back at the
+    /// front of their channels, newest first so the oldest ends up first.
+    pub(crate) fn requeue_unconfirmed(&mut self) {
+        let Some(inbox) = &self.inbox else {
+            self.unconfirmed.clear();
+            return;
+        };
+        let mut inbox = lock_inbox(inbox);
+        for (_, channel, value) in self.unconfirmed.drain(..).rev() {
+            inbox.entry(channel).or_default().push_front(value);
         }
     }
 
@@ -1459,11 +1511,18 @@ impl Session {
             },
         )?;
         // Durable now, so take it. Only the attempt holding the run receives
-        // on its inbox, so the front is still this message.
+        // on its inbox, so the front is still this message. With the sink
+        // detached the host persists later: the message is taken now (so a
+        // second receive gets the next one) and put back if that persist
+        // fails.
         if let Some(inbox) = &self.inbox {
             lock_inbox(inbox)
                 .get_mut(channel)
                 .and_then(VecDeque::pop_front);
+        }
+        if self.sink.is_none() && self.journal.persisted_len() <= cursor {
+            self.unconfirmed
+                .push((cursor, channel.to_string(), value.clone()));
         }
         self.label(TraceLabel::Recv {
             branch: b.clone(),
@@ -1640,8 +1699,11 @@ impl Session {
             .map_or(Ok(()), Err)
     }
 
-    /// [`join`](Self::join), with the check's result for every child.
-    pub(crate) fn join_each(
+    /// [`join`](Self::join), with the check's result for every child, in
+    /// child order. Hosts that run the children themselves combine these
+    /// with the children's own failures to raise the failure of the
+    /// lowest-index failed child (rule 4 of spec 2.7).
+    pub fn join_each(
         &mut self,
         parent: &Branch,
         children: &[Branch],
@@ -2369,5 +2431,133 @@ mod tests {
             object(vec![("b", Json::from(1u8)), ("a", Json::Null)]),
             r#"{"a":null,"b":1}"#
         );
+    }
+
+    /// A recording session over a fresh in-memory run, with an inbox.
+    fn recording_with_inbox(run_id: &str) -> (MemoryBackend, Session, Inbox) {
+        let backend = MemoryBackend::new();
+        let co = backend.checkout(run_id, true, None).unwrap();
+        let inbox = Inbox::default();
+        let opts = RunOptions::default();
+        let mut s = Session::new(
+            run_id,
+            Mode::Run,
+            co.journal,
+            Some((co.sink, co.guard)),
+            &opts,
+            Some(inbox.clone()),
+        )
+        .unwrap();
+        s.start(&opts, None, None, false).unwrap();
+        (backend, s, inbox)
+    }
+
+    fn deliver(inbox: &Inbox, channel: &str, value: &str) {
+        lock_inbox(inbox)
+            .entry(channel.to_string())
+            .or_default()
+            .push_back(Value::from(value));
+    }
+
+    fn queued(inbox: &Inbox, channel: &str) -> Vec<String> {
+        lock_inbox(inbox)
+            .get(channel)
+            .map(|q| q.iter().map(|v| v.as_str().into_owned()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_detached_sink_leaves_persistence_to_the_host() {
+        let (backend, mut s, _inbox) = recording_with_inbox("d");
+        let root = ROOT.to_vec();
+        let durable = s.journal().len();
+        let mut sink = s.detach_sink().expect("a recording session has a sink");
+        s.now(&root).unwrap();
+        let EffectStart::Fresh { intent, .. } =
+            s.effect_begin(&root, "send", Value::from("a")).unwrap()
+        else {
+            panic!("a fresh effect")
+        };
+        // Appended, not persisted: the host owns the sink now.
+        assert_eq!(s.journal().persisted_len(), durable);
+        assert_eq!(backend.snapshot("d", None).unwrap().len(), durable);
+        let (at, frames, head) = s.unpersisted().expect("two entries are pending");
+        assert_eq!(at, durable);
+        let upto = s.journal().len();
+        sink.persist(at, &frames, &head).unwrap();
+        s.mark_persisted(upto);
+        assert!(s.unpersisted().is_none());
+        assert_eq!(backend.snapshot("d", None).unwrap().len(), upto);
+        // Reattached, the end of the attempt persists inline again.
+        s.effect_end(intent, Ok(Value::from("r"))).unwrap();
+        s.attach_sink(sink);
+        s.end(Ok(Value::from("done"))).unwrap();
+        assert!(s.unpersisted().is_none());
+        assert_eq!(
+            backend.snapshot("d", None).unwrap().len(),
+            s.journal().len()
+        );
+    }
+
+    #[test]
+    fn receives_go_back_to_the_inbox_when_their_persist_fails() {
+        let (backend, mut s, inbox) = recording_with_inbox("q");
+        let root = ROOT.to_vec();
+        deliver(&inbox, "jobs", "first");
+        deliver(&inbox, "jobs", "second");
+        deliver(&inbox, "jobs", "third");
+        let _sink = s.detach_sink().unwrap();
+        // Two receives before any persist: each takes its own message.
+        assert_eq!(s.recv(&root, "jobs").unwrap().as_str(), "first");
+        assert_eq!(s.recv(&root, "jobs").unwrap().as_str(), "second");
+        assert_eq!(queued(&inbox, "jobs"), ["third"]);
+        s.persist_failed(Fault::Unavailable("server went away".into()));
+        // Neither receive became durable, so both messages are back, in
+        // order, for the next attempt.
+        assert_eq!(queued(&inbox, "jobs"), ["first", "second", "third"]);
+        assert_eq!(
+            s.recv(&root, "jobs").unwrap_err(),
+            Fault::Unavailable("server went away".into())
+        );
+        let stored = backend.snapshot("q", None).unwrap();
+        assert!(stored
+            .entries()
+            .iter()
+            .all(|e| !matches!(e.event, Event::ChannelRecv { .. })));
+    }
+
+    #[test]
+    fn durable_receives_stay_taken() {
+        let (_backend, mut s, inbox) = recording_with_inbox("k");
+        let root = ROOT.to_vec();
+        deliver(&inbox, "jobs", "first");
+        deliver(&inbox, "jobs", "second");
+        let mut sink = s.detach_sink().unwrap();
+        assert_eq!(s.recv(&root, "jobs").unwrap().as_str(), "first");
+        let (at, frames, head) = s.unpersisted().unwrap();
+        sink.persist(at, &frames, &head).unwrap();
+        s.mark_persisted(s.journal().len());
+        assert_eq!(s.recv(&root, "jobs").unwrap().as_str(), "second");
+        s.persist_failed(Fault::LeaseLost);
+        // Only the receive that never became durable is handed back.
+        assert_eq!(queued(&inbox, "jobs"), ["second"]);
+    }
+
+    #[test]
+    fn join_each_reports_every_child() {
+        let (_b, mut s) = recording("j", &RunOptions::default());
+        let root = ROOT.to_vec();
+        let children = s.fork(&root, 3).unwrap();
+        let EffectStart::Fresh { .. } = s
+            .effect_begin(&children[1], "left open", Value::from("x"))
+            .unwrap()
+        else {
+            panic!("a fresh effect")
+        };
+        let checks = s.join_each(&root, &children, &[true, true, false]);
+        assert_eq!(checks.len(), 3);
+        assert!(checks[0].is_ok());
+        assert!(matches!(checks[1], Err(Fault::DanglingIntent { .. })));
+        assert!(checks[2].is_ok(), "a failed child is exempt");
     }
 }
