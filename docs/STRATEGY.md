@@ -101,10 +101,14 @@ fails loudly at cursor 0 instead of diverging silently, and the journal is
 an exportable, tamper-evident audit artifact rather than engine-internal
 state. Full table in the README.
 
-**Why BSL and not Apache?** The commercial layer is hosted journaling; BSL
-prevents a cloud vendor from shipping it first while keeping the runtime
-free for effectively everyone (< $1M revenue, non-production, and every
-release converts to Apache 2.0 after four years).
+**Why Apache for the runtime and SDKs?** They are built into customers'
+production agents, which is exactly where corporate open-source reviews
+reject source-available licenses, and the closest free alternatives are
+permissively licensed. The verifier must be free to run for auditors who
+do not trust the operator. The value we charge for is the Pragmatic Server
+and the hosted witness, which carry their own commercial license. The
+runtime moved from BUSL-1.1 to Apache-2.0 on 2026-10-13, before its first
+registry release, so no one depended on the earlier terms.
 
 **Why zero dependencies in the core?** The runtime asks to be linked into
 someone's production agent. Every transitive dependency is a reason to say

@@ -37,6 +37,11 @@ All notable changes to this project are documented here. The format follows
 - `RELEASING.md`: one-time registry setup and the release checklist.
 
 ### Changed
+- **License: Apache-2.0.** The runtime, SDKs, bindings, CLI and journal
+  format are now open source under the Apache License 2.0, replacing the
+  Business Source License 1.1 used by 0.4.0. 0.4.0 was never published to
+  a package registry, so 0.5.0 is the first published release and is
+  Apache-2.0 from the start. Contributions require a DCO sign-off.
 - The Python package is now a mixed Rust/Python package: the extension
   moved to `pragmatic._native` and the public API lives in pure Python.
   `import pragmatic` and the existing `Runtime`/`ctx.oracle`/`ctx.effect`

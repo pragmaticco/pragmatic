@@ -7,11 +7,12 @@ name = "pragmatic-runtime"
 description = "The black-box recorder for LLM agents: journal every model and tool call of your Anthropic or OpenAI SDK agent, resume crashed runs without re-paying for tokens, and replay any run exactly for audit."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "BUSL-1.1" }
+license = { text = "Apache-2.0" }
 authors = [{ name = "Pragmatic Research, Inc.", email = "me@aniketh.net" }]
 keywords = ["agents", "llm", "anthropic", "openai", "audit", "durable-execution", "replay", "crash-recovery"]
 classifiers = [
     "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
     "Topic :: Software Development :: Libraries",
