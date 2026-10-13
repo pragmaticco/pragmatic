@@ -1,0 +1,383 @@
+//! Redacted views of slot content (design 4.10).
+//!
+//! Redaction is a view, never a write: the journal keeps its bytes and its
+//! chain. A viewer without `view_raw` never receives salts, raw journal
+//! bytes or the bytes of anything binary, and the text it receives has
+//! personal data and secrets replaced.
+//!
+//! Each slot is parsed as strict JSON when it can be:
+//!
+//! - **Binary fields** are replaced by
+//!   `[binary media_type=… bytes=n sha256=…]` and never served: Anthropic
+//!   content blocks whose `source.type` is `base64`, `data:` URLs (OpenAI
+//!   image inputs), `file_data`, `input_audio.data`, and codec
+//!   `{"$bytes": …}` objects. They are never scanned either; a detector
+//!   finding "personal data" inside base64 would be noise.
+//! - **Text** (every other string, and numbers, which can hold a card
+//!   number) goes through the core detectors and the configured patterns.
+//!
+//! Slots that are not JSON are redacted as text, with any embedded
+//! `data:...;base64,...` URL replaced first. Slots that are not UTF-8 are
+//! binary and never served without `view_raw`.
+//!
+//! Redaction does not look inside images, PDFs or audio, and regex
+//! redaction is not de-identification: the documentation says so.
+
+use pragmatic::encoding::{base64_decode, hex_encode};
+use pragmatic::json::{self, Json};
+use pragmatic::redact::{self, Kind};
+use pragmatic::sha256::sha256;
+use regex::Regex;
+use serde::Serialize;
+
+use crate::config::{ConfigError, RedactionConfig};
+
+/// What a configured pattern's matches are replaced with.
+pub const PATTERN_PLACEHOLDER: &str = "[redacted]";
+
+/// The redaction rules of one server.
+#[derive(Debug, Clone)]
+pub struct Redactor {
+    kinds: Vec<Kind>,
+    patterns: Vec<Regex>,
+    data_url: Regex,
+}
+
+/// A binary value that was withheld from a view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BinaryInfo {
+    pub media_type: String,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+impl BinaryInfo {
+    fn of(media_type: &str, bytes: &[u8]) -> BinaryInfo {
+        BinaryInfo {
+            media_type: media_type.to_string(),
+            bytes: bytes.len() as u64,
+            sha256: hex_encode(&sha256(bytes)),
+        }
+    }
+
+    /// `[binary media_type=… bytes=n sha256=…]`.
+    pub fn placeholder(&self) -> String {
+        format!(
+            "[binary media_type={} bytes={} sha256={}]",
+            self.media_type, self.bytes, self.sha256
+        )
+    }
+}
+
+/// A slot's content as a viewer without `view_raw` sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Redacted {
+    /// Redacted text (possibly re-serialized JSON).
+    Text(String),
+    /// Bytes that are not UTF-8: described, never served.
+    Binary(BinaryInfo),
+}
+
+impl Redactor {
+    /// Build the rules from the `[redaction]` section.
+    pub fn new(config: &RedactionConfig) -> Result<Redactor, ConfigError> {
+        let mut patterns = Vec::new();
+        for (i, p) in config.patterns.iter().enumerate() {
+            patterns.push(
+                Regex::new(p).map_err(|e| ConfigError(format!("redaction.patterns[{i}]: {e}")))?,
+            );
+        }
+        Ok(Redactor {
+            kinds: config.kinds()?,
+            patterns,
+            data_url: Regex::new(
+                r"data:([A-Za-z0-9.+/-]*)(?:;[A-Za-z0-9=._-]+)*;base64,([A-Za-z0-9+/]*=*)",
+            )
+            .expect("static pattern"),
+        })
+    }
+
+    /// The names of the detectors in use, for evidence bundles.
+    pub fn detector_names(&self) -> Vec<&'static str> {
+        self.kinds.iter().map(|k| k.name()).collect()
+    }
+
+    /// SHA-256 over the configured patterns (newline-separated), so a
+    /// bundle can say which patterns were applied without listing them.
+    pub fn patterns_sha256(&self) -> String {
+        let joined: Vec<&str> = self.patterns.iter().map(Regex::as_str).collect();
+        hex_encode(&sha256(joined.join("\n").as_bytes()))
+    }
+
+    /// Redact free text: embedded `data:` URLs, then the detectors, then
+    /// the configured patterns.
+    pub fn redact_text(&self, text: &str) -> String {
+        let text = self.data_url.replace_all(text, |c: &regex::Captures<'_>| {
+            let media = c.get(1).map_or("", |m| m.as_str());
+            let media = if media.is_empty() {
+                "application/octet-stream"
+            } else {
+                media
+            };
+            let b64 = c.get(2).map_or("", |m| m.as_str());
+            binary_of_base64(media, b64).placeholder()
+        });
+        let (mut out, _) = redact::redact(&text, &self.kinds);
+        for p in &self.patterns {
+            if p.is_match(&out) {
+                out = p.replace_all(&out, PATTERN_PLACEHOLDER).into_owned();
+            }
+        }
+        out
+    }
+
+    /// Redact one slot's bytes (see the module documentation).
+    pub fn redact_slot(&self, bytes: &[u8]) -> Redacted {
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return Redacted::Binary(BinaryInfo::of("application/octet-stream", bytes));
+        };
+        match json::parse(text) {
+            Ok(doc) if is_container(&doc) => {
+                Redacted::Text(self.redact_json(doc, None).to_string())
+            }
+            _ => Redacted::Text(self.redact_text(text)),
+        }
+    }
+
+    /// Redact a JSON value in place of its binary fields and text.
+    /// `key` is the member name the value sits under.
+    fn redact_json(&self, value: Json, key: Option<&str>) -> Json {
+        match value {
+            Json::String(s) => {
+                if let Some(b) = self.data_url_binary(&s) {
+                    return Json::String(b.placeholder());
+                }
+                if key == Some("file_data") {
+                    return Json::String(
+                        binary_of_base64("application/octet-stream", &s).placeholder(),
+                    );
+                }
+                Json::String(self.redact_text(&s))
+            }
+            Json::Number(n) => {
+                let redacted = self.redact_text(n.as_str());
+                if redacted == n.as_str() {
+                    Json::Number(n)
+                } else {
+                    Json::String(redacted)
+                }
+            }
+            Json::Array(items) => Json::Array(
+                items
+                    .into_iter()
+                    .map(|v| self.redact_json(v, None))
+                    .collect(),
+            ),
+            Json::Object(members) => Json::Object(self.redact_object(members, key)),
+            other => other,
+        }
+    }
+
+    fn redact_object(
+        &self,
+        members: Vec<(String, Json)>,
+        key: Option<&str>,
+    ) -> Vec<(String, Json)> {
+        let binary_data = binary_member(&members, key);
+        members
+            .into_iter()
+            .map(|(k, v)| {
+                if let (Some((field, media)), Json::String(s)) = (&binary_data, &v) {
+                    if k == *field {
+                        return (k, Json::String(binary_of_base64(media, s).placeholder()));
+                    }
+                }
+                let v = self.redact_json(v, Some(&k));
+                (k, v)
+            })
+            .collect()
+    }
+
+    fn data_url_binary(&self, s: &str) -> Option<BinaryInfo> {
+        if !s.starts_with("data:") {
+            return None;
+        }
+        let c = self.data_url.captures(s)?;
+        if c.get(0)?.start() != 0 {
+            return None;
+        }
+        let media = c.get(1).map_or("", |m| m.as_str());
+        let media = if media.is_empty() {
+            "application/octet-stream"
+        } else {
+            media
+        };
+        let b64 = &s[c.get(2)?.start()..];
+        Some(binary_of_base64(media, b64))
+    }
+}
+
+fn is_container(doc: &Json) -> bool {
+    matches!(doc, Json::Object(_) | Json::Array(_) | Json::String(_))
+}
+
+/// If this object is one of the known binary shapes, the member that holds
+/// the bytes and its media type:
+///
+/// - `{"type": "base64", "media_type": "...", "data": "..."}` (an
+///   Anthropic `source`);
+/// - `{"data": "...", "format": "wav"}` under `input_audio`;
+/// - `{"$bytes": "..."}` (the codec's bytes form).
+fn binary_member(members: &[(String, Json)], key: Option<&str>) -> Option<(&'static str, String)> {
+    let get = |name: &str| {
+        members
+            .iter()
+            .find(|(k, _)| k == name)
+            .and_then(|(_, v)| match v {
+                Json::String(s) => Some(s.as_str()),
+                _ => None,
+            })
+    };
+    if get("type") == Some("base64") && get("data").is_some() {
+        let media = get("media_type").unwrap_or("application/octet-stream");
+        return Some(("data", media.to_string()));
+    }
+    if key == Some("input_audio") && get("data").is_some() {
+        let media = get("format").map_or("audio/unknown".to_string(), |f| format!("audio/{f}"));
+        return Some(("data", media));
+    }
+    if members.len() == 1 && get("$bytes").is_some() {
+        return Some(("$bytes", "application/octet-stream".to_string()));
+    }
+    None
+}
+
+/// Describe base64 text: its decoded bytes when it decodes, otherwise the
+/// text itself (either way nothing of it is served).
+fn binary_of_base64(media_type: &str, text: &str) -> BinaryInfo {
+    let text = text.strip_prefix("data:").map_or(text, |rest| {
+        rest.split_once(";base64,").map_or(text, |(_, b64)| b64)
+    });
+    match base64_decode(text) {
+        Ok(bytes) => BinaryInfo::of(media_type, &bytes),
+        Err(_) => BinaryInfo::of(media_type, text.as_bytes()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pragmatic::encoding::base64_encode;
+
+    fn redactor() -> Redactor {
+        Redactor::new(&RedactionConfig {
+            patterns: vec![r"ACME-\d{6}".into()],
+            ..RedactionConfig::default()
+        })
+        .unwrap()
+    }
+
+    fn text(r: Redacted) -> String {
+        match r {
+            Redacted::Text(t) => t,
+            Redacted::Binary(b) => panic!("binary {b:?}"),
+        }
+    }
+
+    #[test]
+    fn text_detectors_and_patterns() {
+        let r = redactor();
+        let out = r.redact_text("mail jane.doe@example.com about ACME-123456, ip 10.1.2.3");
+        assert!(!out.contains("jane.doe"));
+        assert!(!out.contains("123456"));
+        assert!(!out.contains("10.1.2.3"));
+        assert!(
+            out.contains("[email]") && out.contains(PATTERN_PLACEHOLDER) && out.contains("[ipv4]")
+        );
+    }
+
+    #[test]
+    fn anthropic_base64_sources_are_withheld_and_described() {
+        let png = vec![0x89u8, b'P', b'N', b'G', 1, 2, 3];
+        let slot = format!(
+            r#"{{"role":"user","content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{}"}}}},{{"type":"text","text":"call +1 415 555 0100"}}]}}"#,
+            base64_encode(&png)
+        );
+        let out = text(redactor().redact_slot(slot.as_bytes()));
+        assert!(!out.contains(&base64_encode(&png)));
+        assert!(out.contains("[binary media_type=image/png bytes=7 sha256="));
+        assert!(out.contains(&hex_encode(&sha256(&png))));
+        assert!(!out.contains("555 0100"));
+        // Structure survives, in its original key order.
+        assert!(out.starts_with(r#"{"role":"user","content":[{"type":"image""#));
+    }
+
+    #[test]
+    fn data_urls_file_data_audio_and_codec_bytes() {
+        let b64 = base64_encode(b"%PDF-1.7 secret");
+        let r = redactor();
+        let cases = [
+            format!(
+                r#"{{"type":"image_url","image_url":{{"url":"data:image/jpeg;base64,{b64}"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"file","file":{{"filename":"a.pdf","file_data":"data:application/pdf;base64,{b64}"}}}}"#
+            ),
+            format!(r#"{{"type":"input_audio","input_audio":{{"data":"{b64}","format":"wav"}}}}"#),
+            format!(r#"{{"arg":{{"$bytes":"{b64}"}}}}"#),
+        ];
+        for (case, media) in cases.iter().zip([
+            "image/jpeg",
+            "application/pdf",
+            "audio/wav",
+            "application/octet-stream",
+        ]) {
+            let out = text(r.redact_slot(case.as_bytes()));
+            assert!(!out.contains(&b64), "{out}");
+            assert!(
+                out.contains(&format!("media_type={media} bytes=15")),
+                "{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn data_urls_inside_plain_text_are_withheld() {
+        let b64 = base64_encode(b"jpeg bytes here");
+        let t = format!("see data:image/jpeg;base64,{b64} for the scan");
+        let out = text(redactor().redact_slot(t.as_bytes()));
+        assert!(!out.contains(&b64));
+        assert!(out.contains("[binary media_type=image/jpeg bytes=15"));
+    }
+
+    #[test]
+    fn numbers_holding_cards_are_redacted() {
+        let out = text(redactor().redact_slot(br#"{"card":4111111111111111,"n":42}"#));
+        assert!(!out.contains("4111111111111111"), "{out}");
+        assert!(out.contains(r#""n":42"#));
+    }
+
+    #[test]
+    fn non_utf8_is_binary_and_bad_json_is_text() {
+        match redactor().redact_slot(&[0xff, 0xfe, 0x00]) {
+            Redacted::Binary(b) => assert_eq!(b.bytes, 3),
+            other => panic!("{other:?}"),
+        }
+        // Duplicate keys: not strict JSON, so the whole text is redacted.
+        let out = text(redactor().redact_slot(br#"{"a":"x@y.example","a":"z@w.example"}"#));
+        assert!(
+            !out.contains("x@y.example") && !out.contains("z@w.example"),
+            "{out}"
+        );
+        // A JSON string slot is redacted inside.
+        let out = text(redactor().redact_slot(br#""write to bob@example.org""#));
+        assert!(out.contains("[email]"), "{out}");
+    }
+
+    #[test]
+    fn pattern_digest_is_stable() {
+        let a = redactor().patterns_sha256();
+        assert_eq!(a, redactor().patterns_sha256());
+        assert_eq!(a.len(), 64);
+    }
+}
