@@ -124,4 +124,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc, x86_64-pc-windows-gnu
       - run: cargo check -p pragmatic --no-default-features
+      # The OS randomness module has per-platform FFI; check that the
+      # Windows declarations compile without needing a Windows runner.
+      - run: cargo check -p pragmatic --all-targets --target x86_64-pc-windows-msvc
+      - run: cargo check -p pragmatic --all-targets --target x86_64-pc-windows-gnu
+
+  os-randomness:
+    name: core OS randomness (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p pragmatic --lib rand::
