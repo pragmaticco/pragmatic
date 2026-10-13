@@ -25,3 +25,13 @@ authors = ["Pragmatic Research, Inc. <me@aniketh.net>"]
 [profile.release]
 lto = true
 codegen-units = 1
+
+# The Python extension and the C ABI library are loaded at runtime with
+# dlopen. On macOS 27 the default release strip of debug info leaves a
+# library whose string table dyld rejects ("mis-aligned LINKEDIT string
+# pool"), so these two are not stripped. They stay small (about 0.3 MB).
+[profile.release.package.pragmatic-python]
+strip = "none"
+
+[profile.release.package.pragmatic-ffi]
+strip = "none"
