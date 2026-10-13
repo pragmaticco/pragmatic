@@ -69,7 +69,7 @@ const SALT_DOMAIN: &[u8] = b"pragmatic/v2/anchor-salt";
 /// and previous index.
 const FIXED_LEN: usize = LEAF_PREFIX.len() + 1 + 4 + 8 + 32 + 8;
 
-/// The longest leaf encoding: [`FIXED_LEN`] plus [`MAX_ID_LEN`].
+/// The longest leaf encoding: the fixed fields plus [`MAX_ID_LEN`].
 pub const MAX_LEAF_LEN: usize = FIXED_LEN + MAX_ID_LEN;
 
 /// What a leaf anchors.

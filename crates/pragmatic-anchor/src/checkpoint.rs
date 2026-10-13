@@ -8,11 +8,23 @@
 //! ```
 //!
 //! signed as a C2SP `signed-note` by the server's Ed25519 key. The key's
-//! name in the note is the log's origin, `pragmatic/<server name>`, and its
-//! key id is `SHA-256(name ‖ 0x0A ‖ 0x01 ‖ public key)[:4]`, the signed-note
-//! recommendation, so Go's `sumdb/note`, Sigstore tooling and the public
-//! witness network can all verify Pragmatic checkpoints with a standard
-//! vkey.
+//! name in the note is the log's origin, `pragmatic/<server name>/<log
+//! id>` ([`origin_for`]), and its key id is `SHA-256(name ‖ 0x0A ‖ 0x01 ‖
+//! public key)[:4]`, the signed-note recommendation, so Go's `sumdb/note`,
+//! Sigstore tooling and the public witness network can all verify
+//! Pragmatic checkpoints with a standard vkey.
+//!
+//! # Origins are unique
+//!
+//! Witnesses keep their state per origin line, so two logs with one origin
+//! cannot share a witness: the first one's tree blocks the second's, and
+//! the second's honest checkpoints look like fork attempts. Server names
+//! are chosen locally (many deployments will call theirs `prod`), so the
+//! origin ends in a log id taken from the log's first public key, which
+//! makes two logs share an origin only if they share a key. The origin is
+//! fixed when the first key is generated ([`LogSigner::generate_log`]) and
+//! stays the same across key rotations: it is the key name in every later
+//! key file.
 //!
 //! Formatting and verification are the core's ([`pragmatic::note`]); this
 //! module adds only what needs a private key. Witnesses timestamp
@@ -39,15 +51,30 @@ use crate::error::AnchorError;
 /// The prefix of a private key in the Go `note` format.
 const SKEY_PREFIX: &str = "PRIVATE+KEY+";
 
-/// The origin of a Pragmatic Server's log: `pragmatic/<server name>`.
-pub fn origin_for(server_name: &str) -> String {
-    format!("pragmatic/{server_name}")
+/// Hex digits of the log id at the end of an origin.
+const LOG_ID_HEX_LEN: usize = 16;
+
+/// The origin of a new Pragmatic Server log: `pragmatic/<server name>/<log
+/// id>`, where the log id is the first 8 bytes of SHA-256 of the log's
+/// first public key, as 16 lowercase hex digits. See the module
+/// documentation for why the origin is not just the server name.
+pub fn origin_for(server_name: &str, first_public_key: &[u8; 32]) -> String {
+    let digest = sha256(first_public_key);
+    let log_id = hex_encode(&digest[..LOG_ID_HEX_LEN / 2]);
+    format!("pragmatic/{server_name}/{log_id}")
 }
 
 /// `anchor_digest = SHA-256(checkpoint body)`: what RFC 3161 witnesses
 /// timestamp.
 pub fn anchor_digest(body: &str) -> Digest {
     sha256(body.as_bytes())
+}
+
+/// 32 bytes from the operating system's CSPRNG, for a new key.
+fn fresh_seed() -> Result<[u8; 32], AnchorError> {
+    let mut seed = [0u8; 32];
+    pragmatic::rand::fill(&mut seed).map_err(AnchorError::io("reading the OS CSPRNG"))?;
+    Ok(seed)
 }
 
 /// An Ed25519 signing key with the note key name it signs under. Used for
@@ -94,9 +121,7 @@ impl NoteSigner {
 
     /// A fresh signer with a seed from the operating system's CSPRNG.
     pub fn generate(name: &str, signature_type: SignatureType) -> Result<NoteSigner, AnchorError> {
-        let mut seed = [0u8; 32];
-        pragmatic::rand::fill(&mut seed).map_err(AnchorError::io("reading the OS CSPRNG"))?;
-        NoteSigner::from_seed(name, signature_type, seed)
+        NoteSigner::from_seed(name, signature_type, fresh_seed()?)
     }
 
     /// Parse a private key in the Go `note` format. The key id must match
@@ -196,11 +221,24 @@ impl LogSigner {
         )?))
     }
 
-    /// A fresh log key for `origin` (`keygen`).
+    /// A fresh log key for an existing log's `origin` (`keygen --rotate`:
+    /// the origin never changes).
     pub fn generate(origin: &str) -> Result<LogSigner, AnchorError> {
-        let mut seed = [0u8; 32];
-        pragmatic::rand::fill(&mut seed).map_err(AnchorError::io("reading the OS CSPRNG"))?;
-        LogSigner::from_seed(origin, seed)
+        LogSigner::from_seed(origin, fresh_seed()?)
+    }
+
+    /// The first key of a new log for `server_name` (`keygen`): a fresh
+    /// key, under the origin [`origin_for`] derives from the server name
+    /// and that key.
+    pub fn generate_log(server_name: &str) -> Result<LogSigner, AnchorError> {
+        LogSigner::new_log_from_seed(server_name, fresh_seed()?)
+    }
+
+    /// [`LogSigner::generate_log`] from a given seed (deterministic keys
+    /// for tests and fixtures).
+    pub fn new_log_from_seed(server_name: &str, seed: [u8; 32]) -> Result<LogSigner, AnchorError> {
+        let public = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        LogSigner::from_seed(&origin_for(server_name, &public), seed)
     }
 
     /// Parse the key file (Go `note` private key format, type `0x01`).
@@ -534,6 +572,28 @@ mod tests {
         assert!(LogSigner::parse_skey(&cosigner.encode_skey()).is_err());
         assert!(LogSigner::parse_skey("PRIVATE+KEY+x").is_err());
         assert!(LogSigner::from_seed("has space", [0; 32]).is_err());
+    }
+
+    /// Two servers that both call themselves `prod` get different origins,
+    /// so one witness can serve both; the origin is a valid key name and
+    /// stays fixed across rotation (rotation keeps the name).
+    #[test]
+    fn new_logs_get_unique_origins() {
+        let a = LogSigner::new_log_from_seed("prod", [1u8; 32]).unwrap();
+        let b = LogSigner::new_log_from_seed("prod", [2u8; 32]).unwrap();
+        assert_ne!(a.origin(), b.origin());
+        let expected = format!(
+            "pragmatic/prod/{}",
+            hex_encode(&sha256(&a.public_key())[..8])
+        );
+        assert_eq!(a.origin(), expected);
+        assert!(note::is_valid_origin(a.origin()));
+        let rotated = LogSigner::generate(a.origin()).unwrap();
+        assert_eq!(rotated.origin(), a.origin());
+        assert_ne!(rotated.public_key(), a.public_key());
+        let fresh = LogSigner::generate_log("prod").unwrap();
+        assert!(fresh.origin().starts_with("pragmatic/prod/"));
+        assert!(LogSigner::generate_log("has space").is_err());
     }
 
     /// The Go `note` package's own example key, so key files made by Go

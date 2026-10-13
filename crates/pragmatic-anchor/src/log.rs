@@ -19,25 +19,55 @@
 //! # Commit order and recovery
 //!
 //! A batch is committed by, in order: appending its leaves and fsyncing
-//! the leaves file, creating its batch index, then creating its checkpoint
-//! file (each fsynced with its directory). The checkpoint file is the
-//! commit point: the latest checkpoint's tree size says how many leaves
-//! are real. At startup ([`AnchorLog::open`]):
+//! the leaves file, writing its batch index, then publishing its
+//! checkpoint file (each fsynced with its directory). The checkpoint file
+//! is the commit point: the latest checkpoint's tree size says how many
+//! leaves are real.
 //!
-//! - leaves past the latest checkpoint were never signed or shown to
-//!   anyone (a crash between the two writes). They are moved aside to
-//!   `log.leaves.uncommitted-<unix ms>` and the file is truncated;
-//! - a latest checkpoint file that is not even JSON is a torn write of the
-//!   same kind and is moved aside too; any other unreadable checkpoint, a
-//!   leaf inside the checkpointed prefix that does not decode, a root the
-//!   leaves do not reproduce or a broken `prev_leaf_index` chain is
+//! Checkpoint files and witness results are *published*: written under a
+//! temporary name, fsynced, then linked to their real name, which never
+//! replaces a file. A crash therefore leaves either no checkpoint file or
+//! a complete one, never a torn one, and a checkpoint file that does not
+//! parse can only have been damaged after it was written.
+//!
+//! At startup ([`AnchorLog::open`]):
+//!
+//! - the `sth/` and `batches/` directories are fsynced first, so every
+//!   file recovery reads is durable before anything is built on it, and
+//!   temporary files left by a crash are removed;
+//! - a witness result directory for a sequence number with no checkpoint
+//!   file at or past the latest is [`AnchorError::Corrupt`]: witnesses are
+//!   asked only after a checkpoint is durable, so that checkpoint was
+//!   committed and published, and recovering past it would sign a second,
+//!   different tree under its sequence number (a fork) and throw away the
+//!   third parties' evidence. Witness results are never deleted;
+//! - any checkpoint file that does not parse, a leaf inside the
+//!   checkpointed prefix that does not decode, a root the leaves do not
+//!   reproduce or a broken `prev_leaf_index` chain is likewise
 //!   [`AnchorError::Corrupt`], never repaired;
-//! - batch indexes newer than the latest checkpoint are removed, and the
-//!   next sequence number is the latest one plus one.
+//! - leaves past the latest checkpoint were never signed or shown to
+//!   anyone (a crash before the checkpoint was published). They are moved
+//!   aside to `log.leaves.uncommitted-<unix ms>` and the file is
+//!   truncated. Batch indexes newer than the latest checkpoint are
+//!   removed, and the next sequence number is the latest one plus one.
+//!
+//! Nothing is moved or removed until every check has passed, so a log
+//! refused as corrupt is left exactly as it was found.
 //!
 //! Every checkpoint's root is recomputed from the leaves while they are
 //! read, so a damaged leaf, or a checkpoint file edited to claim another
 //! root, is found at startup rather than by an auditor.
+//!
+//! # Failed writes
+//!
+//! A batch that fails before its checkpoint file is published is rolled
+//! back. One whose checkpoint file was published but whose directory
+//! fsync failed may or may not survive a crash, so it is *not* rolled
+//! back (truncating the leaves under a checkpoint that may persist would
+//! leave a log that can never be opened again): the log is poisoned
+//! instead and refuses writes until [`AnchorLog::reopen`], whose recovery
+//! settles the question either way. The checkpoint is never shown to a
+//! witness before then.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -52,8 +82,8 @@ use pragmatic::sha256::Digest;
 use crate::checkpoint::{json_hex, json_str, json_u64, LogSigner, SignedCheckpoint};
 use crate::error::AnchorError;
 use crate::fsutil::{
-    create_new_durable, ensure_dir, parse_seq_name, read_exact_at, seq_name, sync_dir, unix_millis,
-    write_atomic,
+    create_new_durable, ensure_dir, parse_seq_name, publish_new_durable, read_exact_at,
+    remove_temp_files, seq_name, sync_dir, unix_millis, write_atomic,
 };
 use crate::leaf::{id_key, Leaf, LeafType, MAX_ID_LEN, MAX_LEAF_LEN};
 use crate::tree::{LeafHashSource, NoSource, TreeCache, DEFAULT_CHUNK_BITS};
@@ -321,10 +351,8 @@ pub struct RecoveryReport {
     pub uncommitted_bytes: u64,
     /// Where they went.
     pub moved_aside: Option<PathBuf>,
-    /// A latest checkpoint file that was a torn write, moved aside.
-    pub torn_checkpoint: Option<PathBuf>,
-    /// Batch indexes and witness directories newer than the latest
-    /// checkpoint, removed.
+    /// Batch indexes newer than the latest checkpoint, and temporary files
+    /// left by a crash, removed.
     pub removed_stale: Vec<PathBuf>,
     /// Sequence numbers below the latest with no checkpoint file. Appending
     /// stays safe, but the gap means files were deleted: alert.
@@ -371,11 +399,11 @@ impl AnchorLog {
         chunk_bits: u32,
     ) -> Result<(AnchorLog, RecoveryReport), AnchorError> {
         let dir = dir.as_ref().to_path_buf();
-        for sub in ["", STH_DIR, BATCH_DIR, WITNESS_DIR] {
-            ensure_dir(&dir.join(sub))?;
-        }
+        prepare_layout(&dir)?;
         let mut report = RecoveryReport::default();
         let stored = load_checkpoints(&dir, &mut report)?;
+        let next_seq = stored.last().map_or(0, |c| c.seq + 1);
+        refuse_orphaned_witness_results(&dir, next_seq)?;
         let committed = stored.last().map_or(0, |c| c.tree_size());
         let boundaries = batch_boundaries(&stored);
         let checkpoints: Vec<CheckpointMeta> = stored.iter().map(StoredCheckpoint::meta).collect();
@@ -411,12 +439,33 @@ impl AnchorLog {
             poisoned: false,
         };
         log.scan_leaves(committed, &boundaries)?;
+        // Every check has passed; only now is anything moved or removed.
         log.cut_uncommitted(&mut report)?;
         log.remove_stale(&mut report)?;
+        for sub in ["", STH_DIR, BATCH_DIR] {
+            report
+                .removed_stale
+                .extend(remove_temp_files(&log.dir.join(sub))?);
+        }
         report.leaves = log.tree.size();
         report.checkpoints = log.checkpoints.len() as u64;
         report.next_seq = log.next_seq();
         Ok((log, report))
+    }
+
+    /// Close and open the log again, running recovery: the way out of a
+    /// poisoned log (see the module documentation) without restarting the
+    /// process. On error the log stays as it was (still poisoned).
+    pub fn reopen(&mut self) -> Result<RecoveryReport, AnchorError> {
+        let (fresh, report) = AnchorLog::open_with_chunk_bits(&self.dir, self.leaves.chunk_bits)?;
+        *self = fresh;
+        Ok(report)
+    }
+
+    /// True if an earlier write failed in a way that left memory and disk
+    /// possibly out of step: writes are refused until [`AnchorLog::reopen`].
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     /// Read the first `committed` leaves, rebuilding the tree, the chunk
@@ -531,8 +580,10 @@ impl AnchorLog {
         Ok(())
     }
 
-    /// Remove batch indexes and witness directories newer than the latest
-    /// checkpoint, and note the batch indexes that are missing.
+    /// Remove batch indexes newer than the latest checkpoint (written
+    /// before a crash stopped the checkpoint), and note the batch indexes
+    /// that are missing. Witness results are never removed: one past the
+    /// latest checkpoint was refused as corruption before this runs.
     fn remove_stale(&mut self, report: &mut RecoveryReport) -> Result<(), AnchorError> {
         let next = self.next_seq();
         let batch_dir = self.dir.join(BATCH_DIR);
@@ -553,15 +604,7 @@ impl AnchorLog {
                 report.missing_batch_index.push(c.seq);
             }
         }
-        let witness_dir = self.dir.join(WITNESS_DIR);
-        for (seq, path) in list_seq_entries(&witness_dir, "")? {
-            if seq >= next {
-                fs::remove_dir_all(&path)
-                    .map_err(AnchorError::io(format!("removing {}", path.display())))?;
-                report.removed_stale.push(path);
-            }
-        }
-        sync_dir(&witness_dir)
+        Ok(())
     }
 
     fn note_latest(&mut self, index: u64, leaf: &Leaf) {
@@ -726,8 +769,9 @@ impl AnchorLog {
     }
 
     /// The verified witness results stored for checkpoint `seq`. Files that
-    /// do not parse (a write torn by a crash) are skipped: they count for
-    /// nothing, and [`AnchorLog::store_witness`] replaces them.
+    /// do not parse (damaged: results are published atomically) are
+    /// skipped: they count for nothing, and [`AnchorLog::store_witness`]
+    /// replaces them with the next verified result.
     pub fn witnesses(&self, seq: u64) -> Result<Vec<WitnessRecord>, AnchorError> {
         let dir = self.dir.join(WITNESS_DIR).join(seq_name(seq, ""));
         let entries = match fs::read_dir(&dir) {
@@ -758,9 +802,11 @@ impl AnchorLog {
 
     /// Append one batch: order the leaves by (type, id), reject duplicate
     /// ids, link each to its id's previous leaf, write and fsync them,
-    /// write the batch index, sign the checkpoint and store it. Nothing is
-    /// committed unless every step succeeds; a failure after the leaves
-    /// were written rolls them back.
+    /// write the batch index, sign the checkpoint and publish it. Nothing
+    /// is committed unless every step succeeds. A failure before the
+    /// checkpoint file exists rolls the leaves back; a failure after it may
+    /// exist (its directory fsync) poisons the log instead, as the module
+    /// documentation explains.
     pub fn append_batch(
         &mut self,
         mut new_leaves: Vec<NewLeaf>,
@@ -832,16 +878,29 @@ impl AnchorLog {
                     leaves: committed,
                 })
             }
-            Err(e) => {
+            Err(CommitError {
+                error,
+                published: false,
+            }) => {
                 self.rollback(old_size, old_len);
-                Err(e)
+                Err(error)
+            }
+            Err(CommitError {
+                error,
+                published: true,
+            }) => {
+                // The checkpoint file exists and may survive a crash, so the
+                // leaves under it must stay; reopening settles it.
+                self.poisoned = true;
+                Err(error)
             }
         }
     }
 
-    /// Sign and store the checkpoint for the leaves just appended, with the
-    /// batch index first. On failure nothing of this batch remains on disk
-    /// except the leaves, which the caller rolls back.
+    /// Sign and publish the checkpoint for the leaves just appended, with
+    /// the batch index first. On failure the error says whether the
+    /// checkpoint file may exist: if not, nothing of this batch remains on
+    /// disk except the leaves, which the caller rolls back.
     fn commit_checkpoint(
         &mut self,
         seq: u64,
@@ -849,7 +908,7 @@ impl AnchorLog {
         committed: &[CommittedLeaf],
         signer: &LogSigner,
         now_unix: u64,
-    ) -> Result<StoredCheckpoint, AnchorError> {
+    ) -> Result<StoredCheckpoint, CommitError> {
         let size = self.size();
         let root = self.tree.root(size, &NoSource)?;
         let prev_tree_size = self.checkpoints.last().map_or(0, |c| c.tree_size);
@@ -865,14 +924,22 @@ impl AnchorLog {
             )?,
             created_at: now_unix,
         };
+        // The batch index is replaced, not published: one left by an
+        // earlier failed attempt at this sequence number is stale by
+        // definition and must not block the retry.
         let batch_path = self.dir.join(BATCH_DIR).join(seq_name(seq, ".json"));
         let batch = batch_index_json(seq, old_size, committed);
-        create_new_durable(&batch_path, json_file_bytes(&batch).as_slice())?;
+        write_atomic(&batch_path, json_file_bytes(&batch).as_slice())?;
         let sth_path = self.dir.join(STH_DIR).join(seq_name(seq, ".json"));
-        if let Err(e) = create_new_durable(&sth_path, &json_file_bytes(&stored.to_json())) {
-            let _ = fs::remove_file(&batch_path);
-            return Err(e);
-        }
+        publish_new_durable(&sth_path, &json_file_bytes(&stored.to_json())).map_err(|e| {
+            if !e.published {
+                let _ = fs::remove_file(&batch_path);
+            }
+            CommitError {
+                error: e.error,
+                published: e.published,
+            }
+        })?;
         Ok(stored)
     }
 
@@ -899,6 +966,9 @@ impl AnchorLog {
     /// false if a valid result for this witness was already stored (the
     /// first one wins; the file is never overwritten).
     pub fn store_witness(&mut self, record: &WitnessRecord) -> Result<bool, AnchorError> {
+        if self.poisoned {
+            return Err(AnchorError::Poisoned);
+        }
         if self.checkpoint_meta(record.seq).is_none() {
             return Err(AnchorError::OutOfRange(format!(
                 "no checkpoint {}",
@@ -915,13 +985,15 @@ impl AnchorLog {
         ensure_dir(&dir)?;
         let path = dir.join(format!("{}.json", record.label));
         let bytes = json_file_bytes(&record.to_json());
-        match create_new_durable(&path, &bytes) {
+        match publish_new_durable(&path, &bytes).map_err(AnchorError::from) {
             Ok(()) => Ok(true),
             Err(AnchorError::Io { source, .. })
                 if source.kind() == io::ErrorKind::AlreadyExists =>
             {
-                // A valid earlier result stands. A torn one (a crash during
-                // its write) is replaced.
+                // A valid earlier result stands. One that does not parse
+                // (damaged, or written before results were published
+                // atomically) counts for nothing and is replaced by this
+                // verified one.
                 let valid = read_json(&path)
                     .and_then(|d| WitnessRecord::from_json(&d))
                     .is_ok();
@@ -958,6 +1030,22 @@ struct LeafFile {
 struct AppendError {
     source: io::Error,
     poisoned: bool,
+}
+
+/// A failed checkpoint commit, and whether the checkpoint file may exist
+/// (in which case the leaves under it must not be rolled back).
+struct CommitError {
+    error: AnchorError,
+    published: bool,
+}
+
+impl From<AnchorError> for CommitError {
+    fn from(error: AnchorError) -> CommitError {
+        CommitError {
+            error,
+            published: false,
+        }
+    }
 }
 
 impl LeafFile {
@@ -1086,9 +1174,9 @@ fn read_record(reader: &mut impl Read, buf: &mut Vec<u8>) -> Result<Leaf, String
 // Checkpoint and batch files
 // ---------------------------------------------------------------------
 
-/// Load every checkpoint file in sequence order. A latest file that is not
-/// JSON at all is a torn write and is moved aside; anything else wrong is
-/// corruption.
+/// Load every checkpoint file in sequence order. Checkpoint files are
+/// published atomically, so a crash never leaves a torn one: any file that
+/// does not parse, the latest included, is corruption.
 fn load_checkpoints(
     dir: &Path,
     report: &mut RecoveryReport,
@@ -1097,31 +1185,16 @@ fn load_checkpoints(
     let mut files = list_seq_entries(&sth, ".json")?;
     files.sort_by_key(|(seq, _)| *seq);
     let mut out: Vec<StoredCheckpoint> = Vec::with_capacity(files.len());
-    let last = files.len().saturating_sub(1);
-    for (i, (seq, path)) in files.iter().enumerate() {
+    for (seq, path) in &files {
         let bytes =
             fs::read(path).map_err(AnchorError::io(format!("reading {}", path.display())))?;
-        let doc = match Json::parse_bytes(&bytes) {
-            Ok(doc) => doc,
-            Err(_) if i == last => {
-                let aside = sth.join(format!(
-                    "{}.torn-{}",
-                    seq_name(*seq, ".json"),
-                    unix_millis()
-                ));
-                fs::rename(path, &aside)
-                    .map_err(AnchorError::io(format!("moving aside {}", path.display())))?;
-                sync_dir(&sth)?;
-                report.torn_checkpoint = Some(aside);
-                break;
-            }
-            Err(e) => {
-                return Err(AnchorError::Corrupt(format!(
-                    "{} is not JSON: {e}",
-                    path.display()
-                )))
-            }
-        };
+        let doc = Json::parse_bytes(&bytes).map_err(|e| {
+            AnchorError::Corrupt(format!(
+                "{} is not JSON ({e}); checkpoint files are published whole, so it was \
+                 damaged after it was written: restore it from a backup",
+                path.display()
+            ))
+        })?;
         let stored = StoredCheckpoint::from_json(&doc)
             .map_err(|e| AnchorError::Corrupt(format!("{}: {e}", path.display())))?;
         if stored.seq != *seq {
@@ -1145,6 +1218,47 @@ fn load_checkpoints(
         out.push(stored);
     }
     Ok(out)
+}
+
+/// Create the anchors directory and its subdirectories if missing, and
+/// fsync each one. Whatever recovery reads must be durable before anything
+/// is built on it: a checkpoint whose directory entry a failed fsync left
+/// only in the page cache is made durable here, or the open fails.
+fn prepare_layout(dir: &Path) -> Result<(), AnchorError> {
+    for sub in ["", STH_DIR, BATCH_DIR, WITNESS_DIR] {
+        ensure_dir(&dir.join(sub))?;
+        sync_dir(&dir.join(sub))?;
+    }
+    Ok(())
+}
+
+/// Refuse to recover past a checkpoint that witnesses have seen. Witness
+/// results are stored only for a checkpoint already durable, so results
+/// for `next_seq` or later mean its checkpoint file was committed and has
+/// since been lost or deleted. Treating its leaves as uncommitted would
+/// sign another tree under the same sequence number, a checkpoint
+/// inconsistent with one already signed and shown to third parties (C2SP
+/// `tlog-checkpoint` forbids that), and would throw their evidence away.
+fn refuse_orphaned_witness_results(dir: &Path, next_seq: u64) -> Result<(), AnchorError> {
+    let witness_dir = dir.join(WITNESS_DIR);
+    let mut orphaned: Vec<u64> = list_seq_entries(&witness_dir, "")?
+        .into_iter()
+        .map(|(seq, _)| seq)
+        .filter(|seq| *seq >= next_seq)
+        .collect();
+    orphaned.sort_unstable();
+    match orphaned.first() {
+        None => Ok(()),
+        Some(seq) => Err(AnchorError::Corrupt(format!(
+            "witness results exist for checkpoint {seq} but its checkpoint file is missing \
+             (the latest is {}): it was committed and witnessed, so recovering past it would \
+             sign a different tree under the same sequence number; restore {} from a backup",
+            next_seq
+                .checked_sub(1)
+                .map_or_else(|| "none".to_string(), |s| s.to_string()),
+            Path::new(STH_DIR).join(seq_name(*seq, ".json")).display()
+        ))),
+    }
 }
 
 /// The leaf indexes where batches start: every checkpoint's previous and

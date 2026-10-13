@@ -35,7 +35,10 @@
 //! Each origin is configured with the log's public key and bound to the
 //! `witness_client` token that may submit for it; the origin always comes
 //! from the configuration, never from the request (a checkpoint naming
-//! another origin is refused with 403). Every cosigned checkpoint is
+//! another origin is refused with 403). A witness keeps one cosigned tree
+//! per origin line, so no two configured logs may share an origin line
+//! (or a configuration name); [`WitnessService::open`] refuses such a
+//! configuration. Every cosigned checkpoint is
 //! appended, before the cosignature is returned, to the witness's own
 //! journal ([`JournalFile`]) as a `witness.cosign` note; the server
 //! anchors that journal like any run, so the witness's own history is
@@ -172,7 +175,8 @@ pub struct WitnessConfig {
     pub url: String,
     /// The witness's `cosignature/v1` verifier key (its vkey).
     pub key: VerifierKey,
-    /// Who runs it, canonicalized; defaults to the key name.
+    /// Who runs it, canonicalized; defaults to the key name. Never empty,
+    /// so a configured witness always counts towards independence.
     pub operator: String,
     /// A bearer token, if the witness requires one (a Pragmatic Server in
     /// witness mode does).
@@ -181,6 +185,12 @@ pub struct WitnessConfig {
 
 impl WitnessConfig {
     /// A witness config. Fails if the key is not a `cosignature/v1` key.
+    ///
+    /// The operator defaults to the key name (design 4.7) when it is
+    /// `None` or names nothing once canonicalized (`""`, blanks, dashes):
+    /// configuration files spell "not set" as `operator = ""`, and an empty
+    /// operator would otherwise be silently left out of the independence
+    /// count, so the witness could never make a checkpoint independent.
     pub fn new(
         url: &str,
         key: VerifierKey,
@@ -192,9 +202,19 @@ impl WitnessConfig {
                 "a witness key must be a cosignature/v1 (type 0x04) vkey".into(),
             ));
         }
+        let operator = operator
+            .map(canonical_operator)
+            .filter(|o| !o.is_empty())
+            .unwrap_or_else(|| canonical_operator(key.name()));
+        if operator.is_empty() {
+            return Err(AnchorError::Key(format!(
+                "witness key {:?} gives no operator name; set operator",
+                key.name()
+            )));
+        }
         Ok(WitnessConfig {
             url: url.trim_end_matches('/').to_string(),
-            operator: canonical_operator(operator.unwrap_or(key.name())),
+            operator,
             key,
             token,
         })
@@ -616,22 +636,20 @@ impl WitnessService {
     /// Open the witness journal at `journal_path` (creating it), recover
     /// every origin's latest cosigned checkpoint from it, and serve the
     /// configured `origins`.
+    ///
+    /// Fails if two origin entries share a configuration name or an origin
+    /// line. A witness's whole state (the size and root it last cosigned,
+    /// and the history it serves) is per origin line, as in every
+    /// `tlog-witness`, so two logs behind one origin line would block each
+    /// other forever, each one's honest checkpoints would be journaled as
+    /// fork attempts against the other, and each one's history would be
+    /// served to the other's auditors.
     pub fn open(
         journal_path: impl AsRef<Path>,
         cosigner: Cosigner,
         origins: Vec<WitnessOrigin>,
     ) -> Result<WitnessService, AnchorError> {
-        for o in &origins {
-            if o.log_keys
-                .iter()
-                .any(|k| k.signature_type() != SignatureType::Ed25519)
-            {
-                return Err(AnchorError::Key(format!(
-                    "origin {}: log keys must be Ed25519 note keys",
-                    o.name
-                )));
-            }
-        }
+        check_origins(&origins)?;
         let journal = JournalFile::open_or_create(journal_path, WITNESS_RUN_ID)?;
         let mut state = WitnessState {
             journal,
@@ -818,6 +836,53 @@ impl WitnessService {
             head,
         }
     }
+}
+
+/// The configured origins must be usable and must not share a name or an
+/// origin line (see [`WitnessService::open`]).
+fn check_origins(origins: &[WitnessOrigin]) -> Result<(), AnchorError> {
+    let mut names = std::collections::HashSet::new();
+    let mut lines = std::collections::HashSet::new();
+    for o in origins {
+        if o.name.is_empty() {
+            return Err(AnchorError::Key(format!(
+                "origin {:?}: the configuration name is empty",
+                o.origin
+            )));
+        }
+        if !note::is_valid_origin(&o.origin) {
+            return Err(AnchorError::Key(format!(
+                "origin {}: {:?} is not a valid origin line",
+                o.name, o.origin
+            )));
+        }
+        if o.log_keys.is_empty() {
+            return Err(AnchorError::Key(format!("origin {}: no log key", o.name)));
+        }
+        if o.log_keys
+            .iter()
+            .any(|k| k.signature_type() != SignatureType::Ed25519)
+        {
+            return Err(AnchorError::Key(format!(
+                "origin {}: log keys must be Ed25519 note keys",
+                o.name
+            )));
+        }
+        if !names.insert(o.name.as_str()) {
+            return Err(AnchorError::Key(format!(
+                "two origins are named {:?}",
+                o.name
+            )));
+        }
+        if !lines.insert(o.origin.as_str()) {
+            return Err(AnchorError::Key(format!(
+                "origins share the origin line {:?}: a witness keeps one cosigned tree per \
+                 origin line, so each log must have its own",
+                o.origin
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// tlog-witness checks 4 to 6: the empty tree, the consistency proof, and

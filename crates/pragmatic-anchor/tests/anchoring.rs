@@ -101,7 +101,7 @@ fn fast_tsa() -> TsaPolicy {
 
 fn tsa_witness(server: &TsaServer, operator: &str) -> ExternalWitness {
     ExternalWitness::Tsa(TsaClient::new(
-        TsaConfig::new(&server.server.url, operator, server.tsa.root_pem()),
+        TsaConfig::new(&server.server.url, operator, server.tsa.root_pem()).unwrap(),
         fast_tsa(),
         Arc::new(UreqTransport::new()),
         OpensslVerifier::default(),

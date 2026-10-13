@@ -148,6 +148,12 @@ impl LocalTsa {
         self.dir.path().join("root.pem")
     }
 
+    /// The TSA's own signing certificate, for pinning it directly (a
+    /// narrower trust anchor than the root).
+    pub fn signer_pem(&self) -> PathBuf {
+        self.dir.path().join("tsa.crt")
+    }
+
     /// `openssl ts -reply` for a DER `TimeStampReq`.
     pub fn reply(&self, query: &[u8]) -> Vec<u8> {
         // Requests may arrive concurrently; each gets its own files.

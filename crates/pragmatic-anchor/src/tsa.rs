@@ -28,7 +28,7 @@
 //! 2. The token's nonce equals the one sent and its imprint is SHA-256 of
 //!    exactly the anchor digest ([`tsp::parse_token`]).
 //! 3. The CMS signature verifies, through the signer certificate's chain,
-//!    to one of the TSA's configured pinned roots, with the
+//!    to one of the trust anchors pinned for the TSA's operator, with the
 //!    `id-kp-timeStamping` extended key usage that OpenSSL requires to be
 //!    critical. That is OpenSSL's job (X.509 path building and several
 //!    signature algorithms are not something to reimplement), invoked
@@ -36,15 +36,30 @@
 //!
 //!    ```text
 //!    openssl ts -verify -token_in -in <i>.der -digest <anchor_digest hex>
-//!                -CAfile <configured roots> -untrusted <i>.pem
+//!                -CAfile <pinned anchors> -partial_chain -untrusted <i>.pem
 //!    ```
 //!
 //!    where `<i>.pem` holds the certificates carried in the token itself.
 //!    The files live in a fresh 0700 temporary directory, are named by
 //!    index, and OpenSSL is run directly, never through a shell.
 //!
+//! # Operators are bound to trust anchors
+//!
+//! Independence is counted by operator, and the operator label is only
+//! configuration text. What makes it mean something is the anchor a token
+//! verifies against: each TSA is verified only against its own operator's
+//! anchors, and [`check_operator_anchors`] refuses a configuration in
+//! which two operators share an anchor, so a token can only ever be
+//! attributed to one operator. Anchors should be as narrow as the operator
+//! allows (the CA that issues its own time-stamping certificates, which
+//! `-partial_chain` accepts as an anchor), because anyone who can buy a
+//! time-stamping certificate under a pinned anchor can pass as its
+//! operator. An auditor's verifier attributes tokens the same way, from
+//! anchors it pins per operator, never from the label in the bundle
+//! (design 5.2).
+//!
 //! The stored witness object carries the token and that certificate chain,
-//! so an auditor can rerun the same check offline against roots they pin
+//! so an auditor can rerun the same check offline against anchors they pin
 //! themselves.
 
 use std::ffi::OsStr;
@@ -53,11 +68,12 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use pragmatic::encoding::{base64_encode, hex_encode};
+use pragmatic::encoding::{base64_decode, base64_encode, hex_encode};
 use pragmatic::json::Json;
-use pragmatic::sha256::Digest;
+use pragmatic::sha256::{sha256, Digest};
 use pragmatic::tsp::{self, TstInfo};
 
+use crate::error::AnchorError;
 use crate::operator::canonical_operator;
 
 /// `Content-Type` of a time-stamp request.
@@ -282,8 +298,14 @@ impl OpensslVerifier {
     }
 
     /// `openssl ts -verify -token_in -in <i>.der -digest <hex> -CAfile
-    /// <roots> -untrusted <i>.pem`. Succeeds only if OpenSSL exits 0 and
-    /// reports `Verification: OK`.
+    /// <anchors> -partial_chain -untrusted <i>.pem`. Succeeds only if
+    /// OpenSSL exits 0 and reports `Verification: OK`.
+    ///
+    /// `-partial_chain` makes every certificate in the anchors file a trust
+    /// anchor, root or not, so an operator can be pinned by the CA that
+    /// issues its own time-stamping certificates rather than by a
+    /// general-purpose root under which others can buy time-stamping
+    /// certificates too. A self-signed root in the file works as before.
     pub fn verify_token(
         &self,
         token: &[u8],
@@ -313,6 +335,7 @@ impl OpensslVerifier {
             OsStr::new(&digest_hex),
             OsStr::new("-CAfile"),
             roots_pem.as_os_str(),
+            OsStr::new("-partial_chain"),
             OsStr::new("-untrusted"),
             pem.as_os_str(),
         ])?;
@@ -423,20 +446,105 @@ pub fn validate_response(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TsaConfig {
     pub url: String,
-    /// Who runs it, canonicalized (see [`crate::operator`]).
+    /// Who runs it, canonicalized (see [`crate::operator`]). Never empty.
     pub operator: String,
-    /// PEM file with the root certificates pinned for this TSA.
+    /// PEM file with the trust anchors pinned for this operator: preferably
+    /// the CA that issues the operator's own time-stamping certificates
+    /// (verification accepts a chain that ends at any certificate in this
+    /// file, root or not), otherwise its root.
     pub roots_pem: PathBuf,
 }
 
 impl TsaConfig {
-    pub fn new(url: &str, operator: &str, roots_pem: impl Into<PathBuf>) -> TsaConfig {
-        TsaConfig {
+    /// A TSA config. The operator is required (design 4.7): independence
+    /// is counted by operator, and an empty one would silently never count.
+    pub fn new(
+        url: &str,
+        operator: &str,
+        roots_pem: impl Into<PathBuf>,
+    ) -> Result<TsaConfig, AnchorError> {
+        let canonical = canonical_operator(operator);
+        if canonical.is_empty() {
+            return Err(AnchorError::Key(format!(
+                "TSA {url}: operator is required (who runs it, for counting independence)"
+            )));
+        }
+        Ok(TsaConfig {
             url: url.to_string(),
-            operator: canonical_operator(operator),
+            operator: canonical,
             roots_pem: roots_pem.into(),
+        })
+    }
+}
+
+/// The SHA-256 fingerprints of the certificates (DER) in a PEM file of
+/// trust anchors. Fails if the file cannot be read or holds no
+/// certificate.
+pub fn anchor_fingerprints(roots_pem: &Path) -> Result<Vec<Digest>, AnchorError> {
+    let text = std::fs::read_to_string(roots_pem).map_err(AnchorError::io(format!(
+        "reading pinned TSA anchors {}",
+        roots_pem.display()
+    )))?;
+    let bad = |why: &str| AnchorError::Key(format!("{}: {why}", roots_pem.display()));
+    let mut out = Vec::new();
+    let mut body: Option<String> = None;
+    for line in text.lines().map(str::trim) {
+        match (line, body.as_mut()) {
+            ("-----BEGIN CERTIFICATE-----", None) => body = Some(String::new()),
+            ("-----END CERTIFICATE-----", Some(b64)) => {
+                let der =
+                    base64_decode(b64).map_err(|_| bad("a certificate is not valid base64"))?;
+                out.push(sha256(&der));
+                body = None;
+            }
+            (_, Some(b64)) => b64.push_str(line),
+            _ => {}
         }
     }
+    if out.is_empty() {
+        return Err(bad("holds no PEM certificate"));
+    }
+    Ok(out)
+}
+
+/// Refuse TSAs of different operators that share a trust anchor.
+///
+/// A token is attributed to an operator because it verifies against that
+/// operator's pinned anchors. If two operators' anchor files share a
+/// certificate, a token from either verifies as both, and the operator
+/// label (free configuration text) is all that tells them apart: one
+/// company's TSA could be counted twice, under two names, as two
+/// independent witnesses. Two TSAs of the same operator may share anchors.
+pub fn check_operator_anchors(configs: &[&TsaConfig]) -> Result<(), AnchorError> {
+    let mut owner: std::collections::HashMap<Digest, &TsaConfig> = Default::default();
+    for config in configs {
+        let anchors = anchor_fingerprints(&config.roots_pem).map_err(|e| match e {
+            AnchorError::Io { context, source } => AnchorError::Io {
+                context: format!("TSA {}: {context}", config.url),
+                source,
+            },
+            other => AnchorError::Key(format!("TSA {}: {other}", config.url)),
+        })?;
+        for fp in anchors {
+            match owner.get(&fp) {
+                Some(other) if other.operator != config.operator => {
+                    return Err(AnchorError::Key(format!(
+                        "TSAs {} (operator {}) and {} (operator {}) share the trust anchor \
+                         {}: tokens from either would verify as both operators",
+                        other.url,
+                        other.operator,
+                        config.url,
+                        config.operator,
+                        hex_encode(&fp)
+                    )));
+                }
+                _ => {
+                    owner.insert(fp, config);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Timing for one TSA. The defaults are the design's values; tests lower
@@ -488,7 +596,10 @@ impl TsaToken {
     }
 
     /// The witness object in evidence (design 5.1):
-    /// `{type: "rfc3161", tsa, operator, token, certs_pem}`.
+    /// `{type: "rfc3161", tsa, operator, token, certs_pem}`. The `operator`
+    /// is the configured label, for readers; a verifier attributes the
+    /// token to an operator from the anchors it pins itself, never from
+    /// this label (design 5.2).
     pub fn evidence_json(&self) -> Json {
         Json::Object(vec![
             ("type".into(), "rfc3161".into()),
@@ -646,7 +757,7 @@ mod tests {
     #[test]
     fn backoff_doubles_and_caps() {
         let client = TsaClient::new(
-            TsaConfig::new("http://x", "x", "/nonexistent"),
+            TsaConfig::new("http://x", "x", "/nonexistent").unwrap(),
             TsaPolicy::default(),
             Arc::new(UreqTransport::new()),
             OpensslVerifier::default(),
@@ -663,5 +774,80 @@ mod tests {
             validate_response(b"not der", &[0; 32], 1),
             Err(TsaError::Malformed(_))
         ));
+    }
+
+    /// Every TSA names its operator: an empty one would never count.
+    #[test]
+    fn a_tsa_needs_an_operator() {
+        for empty in ["", "  ", "-"] {
+            assert!(
+                TsaConfig::new("http://x", empty, "/r.pem").is_err(),
+                "{empty:?}"
+            );
+        }
+        let c = TsaConfig::new("http://x", "QuoVadis EU", "/r.pem").unwrap();
+        assert_eq!(c.operator, "digicert");
+    }
+
+    /// A PEM file of fake certificates: fingerprinting reads the PEM
+    /// blocks, not X.509.
+    fn pem(dir: &Path, name: &str, certs: &[&[u8]]) -> PathBuf {
+        let mut text = String::from("subject=CN=ignored\n");
+        for der in certs {
+            text.push_str("-----BEGIN CERTIFICATE-----\r\n");
+            let b64 = base64_encode(der);
+            for chunk in b64.as_bytes().chunks(64) {
+                text.push_str(std::str::from_utf8(chunk).unwrap());
+                text.push('\n');
+            }
+            text.push_str("-----END CERTIFICATE-----\n");
+        }
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    #[test]
+    fn anchors_are_fingerprinted_from_pem() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = vec![7u8; 200];
+        let p = pem(dir.path(), "a.pem", &[b"root one", &long]);
+        assert_eq!(
+            anchor_fingerprints(&p).unwrap(),
+            vec![sha256(b"root one"), sha256(&long)]
+        );
+        let empty = pem(dir.path(), "e.pem", &[]);
+        assert!(matches!(
+            anchor_fingerprints(&empty),
+            Err(AnchorError::Key(_))
+        ));
+        assert!(matches!(
+            anchor_fingerprints(&dir.path().join("missing.pem")),
+            Err(AnchorError::Io { .. })
+        ));
+    }
+
+    /// Two operators sharing a trust anchor could relabel one company's
+    /// TSA as two independent operators; the configuration is refused.
+    /// One operator may use the same anchors for several endpoints.
+    #[test]
+    fn operators_must_not_share_a_trust_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let g4 = pem(dir.path(), "g4.pem", &[b"digicert g4"]);
+        let usertrust = pem(dir.path(), "ut.pem", &[b"usertrust", b"sectigo r36"]);
+        let both = pem(dir.path(), "both.pem", &[b"other", b"digicert g4"]);
+        let cfg = |url: &str, op: &str, p: &PathBuf| TsaConfig::new(url, op, p).unwrap();
+        let digicert = cfg("http://timestamp.digicert.com", "digicert", &g4);
+        let digicert_slash = cfg("http://timestamp.digicert.com/", "digicert", &g4);
+        let sectigo = cfg("http://timestamp.sectigo.com", "sectigo", &usertrust);
+        let relabeled = cfg("http://timestamp.digicert.com/", "sectigo", &g4);
+        let overlapping = cfg("http://tsa.example", "example", &both);
+        assert!(check_operator_anchors(&[&digicert, &digicert_slash, &sectigo]).is_ok());
+        for bad in [[&digicert, &relabeled], [&digicert, &overlapping]] {
+            let err = check_operator_anchors(&bad).unwrap_err();
+            assert!(err.to_string().contains("share the trust anchor"), "{err}");
+        }
+        let missing = cfg("http://x", "x", &dir.path().join("missing.pem"));
+        assert!(check_operator_anchors(&[&missing]).is_err());
     }
 }

@@ -9,6 +9,18 @@
 //! before anything else is appended (design 2.14). The caller must be the
 //! only writer (the server holds `server.lock`).
 //!
+//! A new journal is published whole, its header and `run.start` note in
+//! one file that appears complete or not at all. An existing file that is
+//! too short for a header or holds no entries can then only be damage, and
+//! is refused rather than started afresh: a witness that started its
+//! journal afresh would have forgotten what it cosigned.
+//!
+//! The whole journal is held in memory (the core [`Journal`] keeps every
+//! entry, for deduplication and completion checks) and parsed in full at
+//! open. A witness cosigning for many logs at short intervals grows by
+//! about a kilobyte per cosignature; bounded memory needs a core API to
+//! append from a journal's tail state, deferred to 0.7 (design 10).
+//!
 //! Using the journal format, rather than a bespoke log, means these
 //! records get the same hash chain, the same verifier and the same
 //! anchoring as any run: the server anchors this journal as run
@@ -25,11 +37,12 @@ use pragmatic::sha256::{sha256, Digest};
 use pragmatic::{Event, Value};
 
 use crate::error::AnchorError;
-use crate::fsutil::{create_new_durable, unix_millis, write_atomic};
+use crate::fsutil::{create_new_durable, publish_new_durable, unix_millis};
 
 /// A journal file with one writer. See the module documentation.
 pub struct JournalFile {
     path: PathBuf,
+    run_id: String,
     file: File,
     journal: Journal,
     failed: bool,
@@ -47,14 +60,31 @@ impl std::fmt::Debug for JournalFile {
 impl JournalFile {
     /// Open the journal at `path`, creating it (with a `run.start` note for
     /// `run_id`) if it does not exist.
+    ///
+    /// A new journal is published whole, header and `run.start` together
+    /// (temporary file, fsync, link), so a crash leaves either no file or
+    /// one that starts with `run.start`. An existing file that is shorter
+    /// than a header, or holds no entries, was therefore damaged, and is
+    /// refused as [`AnchorError::Corrupt`] rather than started afresh: for
+    /// the witness journal a fresh start would forget every cosigned
+    /// checkpoint and let the witness cosign a fork of a log it has already
+    /// cosigned (design 4.8).
     pub fn open_or_create(
         path: impl AsRef<Path>,
         run_id: &str,
     ) -> Result<JournalFile, AnchorError> {
         let path = path.as_ref().to_path_buf();
-        let short = std::fs::metadata(&path).map_or(true, |m| m.len() < journal::HEADER_LEN as u64);
-        if short {
-            write_atomic(&path, &journal::header(0))?;
+        match std::fs::metadata(&path) {
+            Ok(m) if m.len() < journal::HEADER_LEN as u64 => {
+                return Err(AnchorError::Corrupt(format!(
+                    "{} is {} bytes, shorter than a journal header: it was damaged",
+                    path.display(),
+                    m.len()
+                )));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => create(&path, run_id)?,
+            Err(e) => return Err(AnchorError::io(format!("reading {}", path.display()))(e)),
         }
         let file = OpenOptions::new()
             .read(true)
@@ -64,30 +94,25 @@ impl JournalFile {
         let mut jf = JournalFile {
             journal: Journal::new(None),
             path,
+            run_id: run_id.to_string(),
             file,
             failed: false,
         };
-        let tail = jf.load()?;
+        let tail = jf.load(run_id)?;
         if let Some(torn) = tail {
             jf.journal
                 .append_torn_tail(journal::system_clock(), &torn)
                 .map_err(|f| AnchorError::Corrupt(f.to_string()))?;
             jf.persist()?;
         }
-        if jf.journal.is_empty() {
-            jf.start(run_id)?;
-        } else if jf.journal.run_start_id().as_deref() != Some(run_id) {
-            return Err(AnchorError::Corrupt(format!(
-                "{} is not the journal of {run_id}",
-                jf.path.display()
-            )));
-        }
         Ok(jf)
     }
 
     /// Read the file into memory. A torn tail is moved aside and cut off;
-    /// it is returned so the caller can note it.
-    fn load(&mut self) -> Result<Option<TornTail>, AnchorError> {
+    /// it is returned so the caller can note it. A file whose valid prefix
+    /// does not start with `run_id`'s `run.start` is refused before
+    /// anything is moved.
+    fn load(&mut self, run_id: &str) -> Result<Option<TornTail>, AnchorError> {
         let ctx = format!("reading {}", self.path.display());
         let bytes = std::fs::read(&self.path).map_err(AnchorError::io(&ctx))?;
         let parsed = Journal::parse(&bytes, None)
@@ -95,6 +120,18 @@ impl JournalFile {
         if parsed.journal.format() != journal::FORMAT {
             return Err(AnchorError::Corrupt(format!(
                 "{} is not journal format 2",
+                self.path.display()
+            )));
+        }
+        if parsed.journal.is_empty() {
+            return Err(AnchorError::Corrupt(format!(
+                "{} holds no entries, not even its run.start: it was damaged",
+                self.path.display()
+            )));
+        }
+        if parsed.journal.run_start_id().as_deref() != Some(run_id) {
+            return Err(AnchorError::Corrupt(format!(
+                "{} is not the journal of {run_id}",
                 self.path.display()
             )));
         }
@@ -121,22 +158,6 @@ impl JournalFile {
             moved_to,
             at_cursor: self.journal.len(),
         }))
-    }
-
-    /// The `run.start` note of a new journal.
-    fn start(&mut self, run_id: &str) -> Result<(), AnchorError> {
-        let mut nonce = [0u8; 16];
-        pragmatic::rand::fill(&mut nonce).map_err(AnchorError::io("reading the OS CSPRNG"))?;
-        let data = Json::Object(vec![
-            ("run_id".into(), run_id.into()),
-            ("nonce".into(), hex_encode(&nonce).into()),
-            ("sdk".into(), "pragmatic-anchor".into()),
-            ("sdk_version".into(), env!("CARGO_PKG_VERSION").into()),
-            ("format".into(), 2u32.into()),
-            ("labels".into(), Json::Object(Vec::new())),
-        ]);
-        self.append_note(note::RUN_START, &data, Vec::new())?;
-        Ok(())
     }
 
     /// The journal as persisted.
@@ -207,12 +228,13 @@ impl JournalFile {
                 Ok(())
             }
             Err(e) => {
+                let run_id = self.run_id.clone();
                 let restored = self
                     .file
                     .set_len(expected)
                     .and_then(|_| self.file.sync_all())
                     .is_ok()
-                    && self.load().is_ok();
+                    && self.load(&run_id).is_ok();
                 if !restored {
                     self.failed = true;
                 }
@@ -223,6 +245,34 @@ impl JournalFile {
             }
         }
     }
+}
+
+/// Publish a new journal at `path`: the header and the `run.start` note
+/// for `run_id`, in one file that appears whole or not at all.
+fn create(path: &Path, run_id: &str) -> Result<(), AnchorError> {
+    let mut nonce = [0u8; 16];
+    pragmatic::rand::fill(&mut nonce).map_err(AnchorError::io("reading the OS CSPRNG"))?;
+    let data = Json::Object(vec![
+        ("run_id".into(), run_id.into()),
+        ("nonce".into(), hex_encode(&nonce).into()),
+        ("sdk".into(), "pragmatic-anchor".into()),
+        ("sdk_version".into(), env!("CARGO_PKG_VERSION").into()),
+        ("format".into(), 2u32.into()),
+        ("labels".into(), Json::Object(Vec::new())),
+    ]);
+    let mut journal = Journal::new(None);
+    journal
+        .append(
+            META,
+            Event::Note {
+                kind: note::RUN_START.to_string(),
+                data: data.to_string(),
+                payload: Vec::new(),
+            },
+        )
+        .map_err(|f| AnchorError::Json(f.to_string()))?;
+    publish_new_durable(path, &journal.to_bytes())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -290,5 +340,38 @@ mod tests {
                 .tail_len
                 == 0
         );
+    }
+
+    /// A new journal appears whole: header and run.start in one file, with
+    /// no temporary name left behind.
+    #[test]
+    fn a_new_journal_is_published_with_its_run_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.journal");
+        JournalFile::open_or_create(&path, "pragmatic:witness").unwrap();
+        let parsed = Journal::parse(&std::fs::read(&path).unwrap(), None).unwrap();
+        assert_eq!(parsed.journal.len(), 1);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// A damaged journal is refused, never started afresh: for the witness
+    /// that would forget every cosigned checkpoint.
+    #[test]
+    fn a_damaged_journal_is_refused_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.journal");
+        let mut jf = JournalFile::open_or_create(&path, "pragmatic:witness").unwrap();
+        jf.append_note("witness.cosign", &Json::Object(vec![]), Vec::new())
+            .unwrap();
+        drop(jf);
+        let good = std::fs::read(&path).unwrap();
+        // Inside the header, at exactly a header, and inside the first
+        // frame (only a run.start-less prefix is left).
+        for keep in [0usize, 7, journal::HEADER_LEN, journal::HEADER_LEN + 9] {
+            std::fs::write(&path, &good[..keep]).unwrap();
+            let err = JournalFile::open_or_create(&path, "pragmatic:witness").unwrap_err();
+            assert!(matches!(err, AnchorError::Corrupt(_)), "{keep}: {err}");
+            assert_eq!(std::fs::read(&path).unwrap(), &good[..keep], "{keep}");
+        }
     }
 }

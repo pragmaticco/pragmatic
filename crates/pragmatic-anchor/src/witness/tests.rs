@@ -383,3 +383,121 @@ fn client_against_the_service() {
         Err(WitnessClientError::NoValidCosignature(_))
     ));
 }
+
+/// Two logs behind one origin line would share the witness's state: one
+/// would block the other forever, its honest checkpoints would be
+/// journaled as fork attempts, and each one's history would be served to
+/// the other. Such a configuration is refused, as are reused names.
+#[test]
+fn origins_must_not_share_an_origin_line_or_a_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let acme = LogSigner::from_seed("pragmatic/prod", [1u8; 32]).unwrap();
+    let globex = LogSigner::from_seed("pragmatic/prod", [2u8; 32]).unwrap();
+    let entry = |name: &str, origin: &str, key: &LogSigner| WitnessOrigin {
+        name: name.into(),
+        origin: origin.into(),
+        log_keys: vec![key.verifier_key()],
+    };
+    let open = |origins| WitnessService::open(dir.path().join("w.journal"), cosigner(), origins);
+    for bad in [
+        vec![
+            entry("acme", "pragmatic/prod", &acme),
+            entry("globex", "pragmatic/prod", &globex),
+        ],
+        vec![
+            entry("acme", "pragmatic/prod", &acme),
+            entry("acme", "pragmatic/other", &globex),
+        ],
+        vec![entry("", "pragmatic/prod", &acme)],
+        vec![entry("acme", "not an origin", &acme)],
+        vec![WitnessOrigin {
+            log_keys: Vec::new(),
+            ..entry("acme", "pragmatic/prod", &acme)
+        }],
+    ] {
+        assert!(matches!(open(bad), Err(AnchorError::Key(_))));
+    }
+
+    // With distinct origin lines, each log has its own tree and history.
+    let globex = LogSigner::from_seed("pragmatic/prod-globex", [2u8; 32]).unwrap();
+    let svc = open(vec![
+        entry("acme", "pragmatic/prod", &acme),
+        entry("globex", "pragmatic/prod-globex", &globex),
+    ])
+    .unwrap();
+    let g = leaves(3);
+    let g_note = globex.sign_checkpoint(3, root(&g)).unwrap().note;
+    svc.add_checkpoint(
+        "globex",
+        encode_add_checkpoint(0, &[], &g_note).unwrap().as_bytes(),
+        1,
+    )
+    .unwrap();
+    assert!(svc.log("acme", None, 100).unwrap().records.is_empty());
+    assert_eq!(svc.latest("acme"), None);
+    let a = leaves(5);
+    let a_note = acme.sign_checkpoint(5, root(&a)).unwrap().note;
+    svc.add_checkpoint(
+        "acme",
+        encode_add_checkpoint(0, &[], &a_note).unwrap().as_bytes(),
+        2,
+    )
+    .unwrap();
+    assert_eq!(svc.latest("acme"), Some((5, root(&a))));
+    assert_eq!(svc.latest("globex"), Some((3, root(&g))));
+    // Globex's token cannot submit acme's checkpoints.
+    assert_eq!(
+        svc.add_checkpoint(
+            "globex",
+            encode_add_checkpoint(5, &[], &a_note).unwrap().as_bytes(),
+            3
+        )
+        .unwrap_err()
+        .status(),
+        403
+    );
+}
+
+/// `operator = ""` in a configuration file means "not set": the operator
+/// defaults to the key name instead of an empty name that would never
+/// count towards independence.
+#[test]
+fn an_empty_operator_defaults_to_the_key_name() {
+    let c = Cosigner::from_seed("witness.example.com", [4u8; 32]).unwrap();
+    for operator in [None, Some(""), Some("   "), Some("--")] {
+        let cfg = WitnessConfig::new("https://w", c.verifier_key(), operator, None).unwrap();
+        assert_eq!(cfg.operator, "witness.example.com", "{operator:?}");
+        assert!(crate::IndependencePolicy::default()
+            .is_independent(["digicert", cfg.operator.as_str()]));
+    }
+    let named =
+        WitnessConfig::new("https://w", c.verifier_key(), Some("Acme Witness"), None).unwrap();
+    assert_eq!(named.operator, "acme-witness");
+}
+
+/// A damaged witness journal is refused, never started afresh: a fresh
+/// journal would forget what was cosigned, and the witness would cosign a
+/// fork of a log it had already cosigned.
+#[test]
+fn a_damaged_witness_journal_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let all = leaves(4);
+    service(dir.path())
+        .add_checkpoint("acme", &body(0, 2, &all), 1)
+        .unwrap();
+    let path = dir.path().join("witness.journal");
+    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.set_len(7).unwrap();
+    drop(f);
+    let err = WitnessService::open(
+        &path,
+        cosigner(),
+        vec![WitnessOrigin {
+            name: "acme".into(),
+            origin: ORIGIN.into(),
+            log_keys: vec![log_key().verifier_key()],
+        }],
+    )
+    .unwrap_err();
+    assert!(matches!(err, AnchorError::Corrupt(_)), "{err}");
+}

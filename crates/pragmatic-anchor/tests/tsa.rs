@@ -27,7 +27,7 @@ fn fast() -> TsaPolicy {
 
 fn client(url: &str, operator: &str, roots: std::path::PathBuf, policy: TsaPolicy) -> TsaClient {
     TsaClient::new(
-        TsaConfig::new(url, operator, roots),
+        TsaConfig::new(url, operator, roots).unwrap(),
         policy,
         Arc::new(UreqTransport::new()),
         OpensslVerifier::default(),
@@ -65,6 +65,33 @@ fn a_token_is_validated_and_verified_against_the_pinned_root() {
     OpensslVerifier::default()
         .verify_token(&der, &digest, &tsa.tsa.root_pem(), &token.certs_pem)
         .unwrap();
+}
+
+/// An operator can be pinned by a narrower anchor than its root (here the
+/// TSA's own certificate; in production the CA that issues the operator's
+/// time-stamping certificates), so time-stamping certificates others buy
+/// under the same root do not verify as that operator.
+#[test]
+fn an_operator_can_be_pinned_below_its_root() {
+    if !openssl_available() {
+        return;
+    }
+    let tsa = TsaServer::start("Alpha", 0);
+    let c = client(&tsa.server.url, "DigiCert", tsa.tsa.signer_pem(), fast());
+    let digest = sha256(b"pinned below the root");
+    let token = c.timestamp(&digest).unwrap();
+    OpensslVerifier::default()
+        .verify_token(
+            &token.token,
+            &digest,
+            &tsa.tsa.signer_pem(),
+            &token.certs_pem,
+        )
+        .unwrap();
+    // Another TSA, under its own root, does not verify against that pin.
+    let other = TsaServer::start("Beta", 0);
+    let c = client(&other.server.url, "DigiCert", tsa.tsa.signer_pem(), fast());
+    assert!(matches!(c.timestamp(&digest), Err(TsaError::Verify(_))));
 }
 
 #[test]

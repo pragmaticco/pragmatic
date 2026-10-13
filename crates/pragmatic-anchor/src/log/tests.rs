@@ -221,26 +221,219 @@ fn uncommitted_leaves_are_moved_aside() {
     assert_proofs_verify(&log);
 }
 
+/// A crash while the checkpoint file was still under its temporary name:
+/// the leaves and batch index exist, the checkpoint does not. That batch
+/// was never signed for anyone, so it is undone.
 #[test]
-fn a_torn_latest_checkpoint_is_moved_aside_with_its_leaves() {
+fn a_crash_before_the_checkpoint_is_published_undoes_the_batch() {
     let dir = tempfile::tempdir().unwrap();
     let (mut log, _) = open(dir.path());
     log.append_batch(vec![run("a", 1)], &signer(), 1).unwrap();
-    log.append_batch(vec![run("a", 2), run("b", 1)], &signer(), 2)
+    let b1 = log
+        .append_batch(vec![run("a", 2), run("b", 1)], &signer(), 2)
         .unwrap();
     drop(log);
     let sth = dir.path().join(STH_DIR).join(seq_name(1, ".json"));
     let bytes = fs::read(&sth).unwrap();
-    fs::write(&sth, &bytes[..bytes.len() / 2]).unwrap();
+    fs::remove_file(&sth).unwrap();
+    let temp = dir
+        .path()
+        .join(STH_DIR)
+        .join(format!(".{}.tmp-99999", seq_name(1, ".json")));
+    fs::write(&temp, &bytes[..bytes.len() / 2]).unwrap();
 
-    let (log, report) = open(dir.path());
-    assert!(report.torn_checkpoint.is_some());
-    assert!(!sth.exists());
+    let (mut log, report) = open(dir.path());
     assert_eq!(log.size(), 1);
     assert_eq!(log.next_seq(), 1);
     assert!(report.moved_aside.is_some());
-    assert_eq!(report.removed_stale.len(), 1, "batch index of seq 1");
+    let batch = dir.path().join(BATCH_DIR).join(seq_name(1, ".json"));
+    assert_eq!(report.removed_stale, vec![batch, temp.clone()]);
+    assert!(!temp.exists());
     assert_eq!(log.latest_leaf(LeafType::Run, b"a").unwrap().entries, 1);
+    // Sequence number 1 is free again: nothing signed under it survived.
+    let again = log.append_batch(vec![run("c", 1)], &signer(), 3).unwrap();
+    assert_eq!(again.checkpoint.seq, 1);
+    assert_ne!(again.checkpoint.root(), b1.checkpoint.root());
+}
+
+fn tsa_record(seq: u64) -> WitnessRecord {
+    WitnessRecord {
+        seq,
+        label: "tsa-0a0b0c0d".into(),
+        kind: WitnessKind::Rfc3161,
+        operator: "digicert".into(),
+        time: 1_760_000_000,
+        recorded_at: 1_760_000_001,
+        object: Json::Object(vec![("type".into(), "rfc3161".into())]),
+    }
+}
+
+/// Every file of the anchors directory with its bytes, to show that a
+/// refused open changed nothing.
+fn snapshot_files(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push((p.clone(), fs::read(&p).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A committed checkpoint file damaged later (bit rot, a bad restore, an
+/// editor) is never mistaken for a torn write: reusing its sequence number
+/// would sign a second tree of the same size under it, and its witness
+/// results (third-party evidence) would be thrown away.
+#[test]
+fn a_damaged_checkpoint_is_corruption_and_nothing_is_touched() {
+    for witnessed in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut log, _) = open(dir.path());
+        log.append_batch(vec![run("a", 1)], &signer(), 1).unwrap();
+        log.append_batch(vec![run("b", 1)], &signer(), 2).unwrap();
+        if witnessed {
+            assert!(log.store_witness(&tsa_record(1)).unwrap());
+        }
+        drop(log);
+        let sth = dir.path().join(STH_DIR).join(seq_name(1, ".json"));
+        for damage in [
+            fs::read(&sth).unwrap()[..40].to_vec(),
+            vec![0u8; 4],
+            Vec::new(),
+        ] {
+            fs::write(&sth, &damage).unwrap();
+            let before = snapshot_files(dir.path());
+            let err = AnchorLog::open_with_chunk_bits(dir.path(), 2).unwrap_err();
+            assert!(matches!(err, AnchorError::Corrupt(_)), "{err}");
+            assert_eq!(snapshot_files(dir.path()), before, "{err}");
+        }
+    }
+}
+
+/// Witness results for a checkpoint whose file is gone prove it was
+/// committed and published: recovery refuses to start rather than sign
+/// another tree under its sequence number, and keeps the results.
+#[test]
+fn witness_results_for_a_missing_checkpoint_refuse_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut log, _) = open(dir.path());
+    log.append_batch(vec![run("a", 1)], &signer(), 1).unwrap();
+    log.append_batch(vec![run("a", 2)], &signer(), 2).unwrap();
+    assert!(log.store_witness(&tsa_record(1)).unwrap());
+    let size = log.size();
+    drop(log);
+    let sth = dir.path().join(STH_DIR).join(seq_name(1, ".json"));
+    let saved = fs::read(&sth).unwrap();
+    fs::remove_file(&sth).unwrap();
+
+    let before = snapshot_files(dir.path());
+    let err = AnchorLog::open_with_chunk_bits(dir.path(), 2).unwrap_err();
+    assert!(
+        matches!(err, AnchorError::Corrupt(ref why) if why.contains("checkpoint 1")),
+        "{err}"
+    );
+    assert_eq!(snapshot_files(dir.path()), before);
+
+    // Restored from a backup, the log opens as it was.
+    fs::write(&sth, saved).unwrap();
+    let (log, report) = open(dir.path());
+    assert_eq!(log.size(), size);
+    assert_eq!(report.next_seq, 2);
+    assert_eq!(log.witnesses(1).unwrap(), vec![tsa_record(1)]);
+}
+
+/// A batch that fails before its checkpoint file exists is rolled back
+/// and the log carries on.
+#[cfg(unix)]
+#[test]
+fn a_failure_before_the_checkpoint_is_published_rolls_back() {
+    use std::os::unix::fs::PermissionsExt;
+    if crate::fsutil::is_root() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (mut log, _) = open(dir.path());
+    log.append_batch(vec![run("a", 1)], &signer(), 1).unwrap();
+    let leaves_len = fs::metadata(dir.path().join(LEAVES_FILE)).unwrap().len();
+    // Read and search but no write: the checkpoint cannot be created.
+    let sth = dir.path().join(STH_DIR);
+    fs::set_permissions(&sth, fs::Permissions::from_mode(0o500)).unwrap();
+    let failed = log.append_batch(vec![run("b", 1)], &signer(), 2);
+    fs::set_permissions(&sth, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(failed.is_err());
+    assert!(!log.is_poisoned());
+    assert_eq!(log.size(), 1);
+    assert_eq!(
+        fs::metadata(dir.path().join(LEAVES_FILE)).unwrap().len(),
+        leaves_len
+    );
+    let next = log.append_batch(vec![run("b", 1)], &signer(), 3).unwrap();
+    assert_eq!(next.checkpoint.seq, 1);
+    drop(log);
+    let (log, _) = open(dir.path());
+    assert_eq!(log.next_seq(), 2);
+    assert_proofs_verify(&log);
+}
+
+/// The checkpoint file was published but its directory fsync failed: it
+/// may or may not survive a crash. Rolling the leaves back under it would
+/// leave a log that can never open again, so the log keeps them and
+/// refuses writes until reopened, and reopening finds a consistent state.
+#[cfg(unix)]
+#[test]
+fn a_failed_directory_sync_poisons_the_log_without_rolling_back() {
+    use std::os::unix::fs::PermissionsExt;
+    if crate::fsutil::is_root() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (mut log, _) = open(dir.path());
+    log.append_batch(vec![run("a", 1)], &signer(), 1).unwrap();
+    // Write and search but no read: files can be created in sth/, but it
+    // cannot be opened to fsync it, exactly like EIO from fsync(dir).
+    let sth = dir.path().join(STH_DIR);
+    fs::set_permissions(&sth, fs::Permissions::from_mode(0o300)).unwrap();
+    let failed = log.append_batch(vec![run("b", 1)], &signer(), 2);
+    fs::set_permissions(&sth, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(failed.is_err());
+    assert!(log.is_poisoned());
+    assert!(sth.join(seq_name(1, ".json")).exists());
+    // Writes are refused until the log is reopened.
+    assert!(matches!(
+        log.append_batch(vec![run("c", 1)], &signer(), 3),
+        Err(AnchorError::Poisoned)
+    ));
+    assert!(matches!(
+        log.store_witness(&tsa_record(0)),
+        Err(AnchorError::Poisoned)
+    ));
+    // The checkpoint file survived (no crash), so reopening keeps batch 1.
+    let report = log.reopen().unwrap();
+    assert!(!log.is_poisoned());
+    assert_eq!(report.next_seq, 2);
+    assert_eq!(report.uncommitted_bytes, 0);
+    assert_eq!(log.latest_leaf(LeafType::Run, b"b").unwrap().entries, 1);
+    let next = log.append_batch(vec![run("c", 1)], &signer(), 3).unwrap();
+    assert_eq!(next.checkpoint.seq, 2);
+    drop(log);
+    let (log, _) = open(dir.path());
+    assert_eq!(log.size(), 3);
+    assert_proofs_verify(&log);
+
+    // Had a crash lost the checkpoint's directory entry instead, the
+    // leaves under it would be undone, consistently.
+    drop(log);
+    fs::remove_file(sth.join(seq_name(2, ".json"))).unwrap();
+    let (log, report) = open(dir.path());
+    assert_eq!((log.size(), report.next_seq), (2, 2));
+    assert!(report.moved_aside.is_some());
 }
 
 #[test]
