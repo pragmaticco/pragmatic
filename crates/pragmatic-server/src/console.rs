@@ -10,6 +10,16 @@
 //!
 //! Only the SHA-256 of a session id is kept, in memory: a restart signs
 //! everyone out.
+//!
+//! # Forms
+//!
+//! Every form that changes something carries the session's CSRF token, a
+//! random value kept with the session and compared in constant time, on
+//! top of the `SameSite=Strict` cookie and a check of the browser's
+//! `Origin` and `Sec-Fetch-Site` headers. The sign-in form, which has no
+//! session yet, carries the value of a short-lived `pragmatic_sign_in`
+//! cookie instead, so another site cannot sign a browser in to a session
+//! of its choosing.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -27,8 +37,34 @@ pub const COOKIE: &str = "pragmatic_session";
 
 struct Session {
     token_id: String,
+    csrf: String,
     created: Instant,
     last_seen: Instant,
+}
+
+/// A live session, as a request sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub token_id: String,
+    /// The value every state-changing form of this session must carry.
+    pub csrf: String,
+}
+
+/// The cookie of the sign-in form (see the module documentation).
+pub const SIGN_IN_COOKIE: &str = "pragmatic_sign_in";
+
+/// A fresh random value, hex.
+pub fn random_hex() -> std::io::Result<String> {
+    let mut b = [0u8; 32];
+    pragmatic::rand::fill(&mut b)?;
+    Ok(hex_encode(&b))
+}
+
+/// True if two secrets are equal, in time that does not depend on where
+/// they differ.
+pub fn secrets_match(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    !a.is_empty() && a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 
 impl Session {
@@ -50,14 +86,14 @@ fn key(value: &str) -> String {
 impl Sessions {
     /// Start a session for a token. Returns the cookie value.
     pub fn create(&self, token_id: &str) -> std::io::Result<String> {
-        let mut b = [0u8; 32];
-        pragmatic::rand::fill(&mut b)?;
-        let value = hex_encode(&b);
+        let value = random_hex()?;
+        let csrf = random_hex()?;
         let now = Instant::now();
         self.map.lock().expect("sessions").insert(
             key(&value),
             Session {
                 token_id: token_id.to_string(),
+                csrf,
                 created: now,
                 last_seen: now,
             },
@@ -67,6 +103,11 @@ impl Sessions {
 
     /// The token id behind a live session, refreshing its idle timer.
     pub fn get(&self, value: &str) -> Option<String> {
+        self.session(value).map(|s| s.token_id)
+    }
+
+    /// A live session, refreshing its idle timer.
+    pub fn session(&self, value: &str) -> Option<SessionInfo> {
         let now = Instant::now();
         let mut map = self.map.lock().expect("sessions");
         let k = key(value);
@@ -77,7 +118,10 @@ impl Sessions {
         }
         let s = map.get_mut(&k)?;
         s.last_seen = now;
-        Some(s.token_id.clone())
+        Some(SessionInfo {
+            token_id: s.token_id.clone(),
+            csrf: s.csrf.clone(),
+        })
     }
 
     /// End a session. Returns its token id.
@@ -127,11 +171,26 @@ pub fn clear_cookie(secure: bool) -> String {
 
 /// The session cookie's value in a `Cookie` header.
 pub fn cookie_value(header: &str) -> Option<&str> {
+    named_cookie(header, COOKIE)
+}
+
+/// The value of cookie `name` in a `Cookie` header.
+pub fn named_cookie<'a>(header: &'a str, name: &str) -> Option<&'a str> {
     header
         .split(';')
         .map(str::trim)
-        .find_map(|c| c.strip_prefix(COOKIE)?.strip_prefix('='))
+        .find_map(|c| c.strip_prefix(name)?.strip_prefix('='))
         .filter(|v| !v.is_empty())
+}
+
+/// The `Set-Cookie` value of the sign-in form's cookie: it lives as long
+/// as a sign-in takes, and only for the sign-in path.
+pub fn sign_in_cookie(value: &str, secure: bool) -> String {
+    format!(
+        "{SIGN_IN_COOKIE}={value}; Path=/console/sign-in; HttpOnly; SameSite=Strict; \
+         Max-Age=900{}",
+        if secure { "; Secure" } else { "" }
+    )
 }
 
 #[cfg(test)]
@@ -148,6 +207,24 @@ mod tests {
         let v = s.create("tok_2").unwrap();
         assert_eq!(s.remove(&v).as_deref(), Some("tok_2"));
         assert_eq!(s.get(&v), None);
+    }
+
+    #[test]
+    fn sessions_carry_their_own_csrf_token() {
+        let s = Sessions::default();
+        let a = s.create("tok_1").unwrap();
+        let b = s.create("tok_1").unwrap();
+        let (sa, sb) = (s.session(&a).unwrap(), s.session(&b).unwrap());
+        assert_eq!(sa.csrf.len(), 64);
+        assert_ne!(sa.csrf, sb.csrf);
+        assert!(secrets_match(&sa.csrf, &sa.csrf));
+        assert!(!secrets_match(&sa.csrf, &sb.csrf));
+        assert!(!secrets_match("", ""));
+        assert_eq!(
+            named_cookie("x=1; pragmatic_sign_in=abc", SIGN_IN_COOKIE),
+            Some("abc")
+        );
+        assert!(sign_in_cookie("v", false).contains("Path=/console/sign-in"));
     }
 
     #[test]

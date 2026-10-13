@@ -5,8 +5,11 @@
 # to a default. The full reference is docs/server.md.
 
 # The server's name. Anchoring checkpoints use the origin
-# "pragmatic/<name>/<log id>", the log id being fixed by the log's first
-# key. Empty means the host name.
+# "pragmatic/<name>/<log id>", fixed by the log's first key (`keygen`
+# writes it); the log id is 16 hex digits of that key, so two servers that
+# pick the same name never share an origin at a witness. Empty means the
+# name in the key (or, for `keygen`, the host name). A name the key does
+# not carry is refused at startup.
 name = ""
 
 # The address to listen on, as IP:port. A non-loopback address needs
@@ -33,10 +36,17 @@ public_url = ""
 verify_interval_hours = 24
 
 [keys]
-# Ed25519 key in PKCS#8 PEM, written by `pragmatic-server keygen` (or
-# `openssl genpkey -algorithm ed25519`). Refused inside data_dir.
+# The log key: an Ed25519 signed-note key named for the log's origin, in
+# the private key format of Go's sumdb/note, written by
+# `pragmatic-server keygen` (and replaced by `keygen --rotate`, server
+# stopped). It signs checkpoints, evidence bundles and backups. Auditors pin
+# its vkey, which keygen prints, with `--log-key`. Key files are refused
+# inside data_dir.
 signing_key_file = "/etc/pragmatic/server.ed25519"
 allow_key_in_data_dir = false
+# 32 random bytes behind HMAC run ids (anchor_run_ids = "hmac"), written by
+# `pragmatic-server keygen --anchor-key`. Required in that mode.
+anchor_key_file = ""
 
 [bootstrap]
 # SHA-256 (lowercase hex) of the first admin token. Generate one with
@@ -49,15 +59,24 @@ admin_token_sha256 = ""
 interval_secs = 600
 
 # Independent witnesses. At least one TSA or witness is required unless
-# allow_self_anchoring = true. Obtain written permission from TSA operators
-# before automated use; qualified (eIDAS) time-stamping providers are a paid
-# option. The pinned roots ship in deploy/tsa-roots/.
+# allow_self_anchoring = true. Each TSA names its operator (required: a
+# token counts for the operator whose pinned anchors verify it), and
+# roots_pem holds that operator's trust anchors; operators must not share
+# an anchor. The pinned anchors ship in deploy/tsa-roots/ (the container
+# image has them in /etc/pragmatic/tsa-roots/); check their fingerprints
+# against deploy/tsa-roots/README.md before you rely on them. Obtain
+# written permission from each TSA operator before automated use (the
+# server spaces its requests to one TSA at least 15 seconds apart);
+# qualified (eIDAS) time-stamping providers are a paid option. TSA tokens
+# are verified with OpenSSL, which must be on PATH.
 tsa = [
-  { url = "http://timestamp.digicert.com", roots_pem = "/etc/pragmatic/tsa-roots/digicert_g4.pem", operator = "digicert" },
-  { url = "http://timestamp.sectigo.com", roots_pem = "/etc/pragmatic/tsa-roots/usertrust_rsa.pem", operator = "sectigo" },
+  { url = "http://timestamp.digicert.com", operator = "digicert", roots_pem = "/etc/pragmatic/tsa-roots/digicert.pem" },
+  { url = "http://timestamp.sectigo.com", operator = "sectigo", roots_pem = "/etc/pragmatic/tsa-roots/sectigo.pem" },
 ]
-# C2SP tlog-witness cosigners, for example the hosted Pragmatic Witness:
-# witness = [ { url = "https://witness.example", public_key = "<64 hex>", token_file = "/etc/pragmatic/witness.token", name = "witness.example", operator = "example" } ]
+# C2SP tlog-witness cosigners, configured by their cosignature/v1 vkey, for
+# example another Pragmatic Server in witness mode or the hosted Pragmatic
+# Witness. operator = "" counts the witness under its key name.
+# witness = [ { url = "https://witness.example", vkey = "witness.example+<key id>+<base64>", operator = "example", token_file = "/etc/pragmatic/witness.token" } ]
 witness = []
 allow_self_anchoring = false
 # "plain" puts run ids in anchor leaves; "hmac" puts a keyed hash instead.
@@ -89,9 +108,16 @@ patterns = []
 # events = ["chain_broken", "anchor_failed", "regressed", "erasure", "retention", "dangling_effect", "clock_skew", "record_missing", "hold", "access_log_failed"]
 
 [witness_mode]
-# Cosign checkpoints of other logs (C2SP tlog-witness).
+# Cosign checkpoints of other logs (C2SP tlog-witness), at POST
+# /add-checkpoint. The witness signs with a key of its own, never the log
+# key: `pragmatic-server keygen --witness` writes it and prints the vkey
+# logs configure. Each origin entry names the log's origin line and keys,
+# and the SHA-256 of the witness_client token it submits with; its record
+# is the run pragmatic:witness:<name>, served at /v1/witness/log/<name>.
 enabled = false
-# origins = [ { name = "example.com/log", token_sha256 = "<64 hex>", public_key = "example.com/log+<key id>+<base64 key>" } ]
+name = ""
+key_file = ""
+# origins = [ { name = "acme", origin = "pragmatic/acme/0123456789abcdef", log_vkeys = ["pragmatic/acme/0123456789abcdef+<key id>+<base64>"], token_sha256 = "<64 hex>" } ]
 origins = []
 
 [license]

@@ -37,7 +37,7 @@ use std::collections::HashSet;
 
 use pragmatic::encoding::{base64_decode, hex_encode};
 use pragmatic::json::{self, Json};
-use pragmatic::redact::{self, Kind};
+use pragmatic::redact::{self, binary, Kind};
 use pragmatic::sha256::sha256;
 use regex::Regex;
 use serde::Serialize;
@@ -128,6 +128,50 @@ impl Redactor {
     pub fn patterns_sha256(&self) -> String {
         let patterns: Vec<&str> = self.patterns.iter().map(Regex::as_str).collect();
         hex_encode(&pragmatic::evidence::patterns_sha256(&patterns))
+    }
+
+    /// The SHA-256 of the canonical JSON array of the configured patterns
+    /// (an evidence bundle's `redaction.patterns_sha256`).
+    pub fn patterns_digest(&self) -> pragmatic::sha256::Digest {
+        let patterns: Vec<&str> = self.patterns.iter().map(Regex::as_str).collect();
+        pragmatic::evidence::patterns_sha256(&patterns)
+    }
+
+    /// Whether an evidence bundle redacted with `mode` (design 5.1:
+    /// `none`, `detectors`, `binary` or `all`) withholds a slot holding
+    /// `bytes`. Slots are withheld whole, never altered inside.
+    ///
+    /// - `binary` withholds every slot that holds or may hold binary
+    ///   content: the core scan's binary fields, a slot that starts like
+    ///   JSON but could not be read to its end (what was not read is never
+    ///   assumed free of attachments), and, in text that is not JSON, a
+    ///   `data:` URL or a run of 256 or more base64 characters, as the
+    ///   server's views treat them.
+    /// - `detectors` withholds those too (detectors cannot inspect
+    ///   attachments), and every slot whose text a configured detector or
+    ///   pattern matches, object keys and numbers included.
+    pub fn withholds(&self, mode: &str, bytes: &[u8]) -> bool {
+        match mode {
+            "none" => false,
+            "binary" | "detectors" => {
+                let scanned = binary::scan(bytes);
+                if scanned.may_hold_binary() {
+                    return true;
+                }
+                let Some(text) = scanned.text else {
+                    return true;
+                };
+                let json_like = text.trim_start().starts_with(['{', '[']);
+                if !json_like && (self.base64_run.is_match(&text) || self.data_url.is_match(&text))
+                {
+                    return true;
+                }
+                mode == "detectors"
+                    && (!redact::find(&text, &self.kinds).is_empty()
+                        || self.patterns.iter().any(|p| p.is_match(&text)))
+            }
+            _ => true,
+        }
     }
 
     /// Redact free text: embedded `data:` URLs, then the detectors, then
@@ -508,6 +552,47 @@ mod tests {
             hex_encode(&sha256(br#"["ACME-\\d{6}"]"#)),
             "patterns_sha256 is SHA-256 of the canonical JSON array"
         );
+    }
+
+    #[test]
+    fn evidence_modes_withhold_whole_slots() {
+        let r = redactor();
+        let plain = b"the weather is fine";
+        let email = b"write to jane.doe@example.com";
+        let pattern = b"order ACME-123456 shipped";
+        let image = format!(
+            r#"{{"source":{{"type":"base64","media_type":"image/png","data":"{}"}}}}"#,
+            base64_encode(b"png bytes")
+        );
+        let blob = format!("log: {}", base64_encode(&[1u8; 300]));
+        let unread = b"[1, 2";
+        for (mode, bytes, want) in [
+            ("none", image.as_bytes(), false),
+            ("all", plain.as_slice(), true),
+            ("binary", plain.as_slice(), false),
+            ("binary", email.as_slice(), false),
+            ("binary", image.as_bytes(), true),
+            ("binary", blob.as_bytes(), true),
+            ("binary", unread.as_slice(), true),
+            ("binary", &[0xff, 0xfe][..], true),
+            ("detectors", plain.as_slice(), false),
+            ("detectors", email.as_slice(), true),
+            ("detectors", pattern.as_slice(), true),
+            ("detectors", image.as_bytes(), true),
+            (
+                "detectors",
+                br#"{"jane.doe@example.com":1}"#.as_slice(),
+                true,
+            ),
+        ] {
+            assert_eq!(
+                r.withholds(mode, bytes),
+                want,
+                "{mode} {:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+        assert_eq!(hex_encode(&r.patterns_digest()), r.patterns_sha256());
     }
 
     #[test]

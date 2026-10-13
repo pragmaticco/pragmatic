@@ -62,7 +62,7 @@ async fn startup_records_config_loaded() {
     assert_eq!(records[0]["run_id"], "pragmatic:access-log");
     let loaded = &records[1];
     assert_eq!(loaded["kind"], "config.loaded");
-    assert_eq!(loaded["key_id"].as_str().unwrap().len(), 64);
+    assert_eq!(loaded["key_id"].as_str().unwrap().len(), 8);
     assert_eq!(loaded["token_ids"], json!(["bootstrap"]));
     assert_eq!(loaded["config_sha256"].as_str().unwrap().len(), 64);
 }

@@ -42,7 +42,8 @@ pub mod text;
 pub use evidence::{render_csv, render_evidence};
 pub use index::{render_index, render_index_of, RunRow};
 pub use run::{
-    render_run, render_run_page, AnchorStatus, RunPage, RunView, PAGE_BYTES, PAGE_ENTRIES,
+    render_run, render_run_page, AnchorStatus, RunPage, RunView, SlotFilter, PAGE_BYTES,
+    PAGE_ENTRIES,
 };
 
 #[cfg(test)]

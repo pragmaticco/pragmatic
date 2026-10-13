@@ -501,3 +501,55 @@ fn a_damaged_witness_journal_is_refused() {
     .unwrap_err();
     assert!(matches!(err, AnchorError::Corrupt(_)), "{err}");
 }
+
+/// The protocol's state checks run apart from any journal: a store that
+/// keeps the record elsewhere (Pragmatic Server's run store) gets the
+/// same answers, the fork attempt to record, and a cosigned note any
+/// auditor can verify with the witness's vkey.
+#[test]
+fn the_core_decides_without_a_journal() {
+    let core = WitnessCore::new(
+        cosigner(),
+        vec![WitnessOrigin {
+            name: "acme".into(),
+            origin: ORIGIN.into(),
+            log_keys: vec![log_key().verifier_key()],
+        }],
+    )
+    .unwrap();
+    let all = leaves(9);
+    assert_eq!(
+        core.check("nobody", &body(0, 3, &all)).unwrap_err(),
+        AddCheckpointError::UnknownOrigin
+    );
+    let first = core.check("acme", &body(0, 3, &all)).unwrap();
+    let record = core.decide(&first, None, 50).unwrap();
+    assert_eq!((record.old_size, record.tree_size), (0, 3));
+    let cosigned = Note::parse(&record.cosigned_note()).unwrap();
+    let verified = note::verify_note(
+        &cosigned,
+        &[log_key().verifier_key(), cosigner().verifier_key()],
+    )
+    .unwrap();
+    assert_eq!(verified.len(), 2);
+    // A stale old size is a conflict, with nothing to record.
+    let stale = core.check("acme", &body(0, 5, &all)).unwrap();
+    let refused = core
+        .decide(&stale, Some((3, root(&all[..3]))), 51)
+        .unwrap_err();
+    assert_eq!(refused.error, AddCheckpointError::Conflict { size: 3 });
+    assert!(refused.reject.is_none());
+    // A tree that does not extend the cosigned one is a fork to record.
+    let other: Vec<Digest> = (100..109u64).map(|i| leaf_hash(&i.to_le_bytes())).collect();
+    let fork_note = checkpoint(&other, 5);
+    let proof = consistency_proof(3, &other[..5]).unwrap();
+    let fork = encode_add_checkpoint(3, &proof, &fork_note).unwrap();
+    let sub = core.check("acme", fork.as_bytes()).unwrap();
+    let refused = core
+        .decide(&sub, Some((3, root(&all[..3]))), 52)
+        .unwrap_err();
+    assert_eq!(refused.error.status(), 422);
+    let reject = refused.reject.unwrap();
+    assert_eq!((reject.old_size, reject.tree_size), (3, 5));
+    assert_eq!(reject.checkpoint, fork_note);
+}

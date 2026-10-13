@@ -9,8 +9,9 @@
 #   cp pragmatic-server.service /etc/systemd/system/ && systemctl daemon-reload
 #   systemctl enable --now pragmatic-server
 #
-# The signing key lives in /etc/pragmatic (outside the data directory),
-# readable only by the service user.
+# The log key lives in /etc/pragmatic (outside the data directory),
+# readable only by the service user. keygen prints the log's origin and the
+# vkey auditors pin with `pragmatic verify-evidence --log-key`.
 
 [Unit]
 Description=Pragmatic Server

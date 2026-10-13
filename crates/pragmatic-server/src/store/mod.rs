@@ -121,6 +121,13 @@ pub struct Meta {
     /// (Unix seconds), for the anchoring lag (design 4.7).
     #[serde(default)]
     pub unanchored_since: Option<i64>,
+    /// An administrator accepted this run's journal as its history after
+    /// it contradicted its anchored leaf (`accept-regression`). The anchor
+    /// log keeps refusing the contradicting snapshots until the run grows
+    /// past its last leaf, so they are not reported again until a batch
+    /// places a new leaf for the run.
+    #[serde(default)]
+    pub regression_accepted: bool,
     pub summary: Summary,
 }
 

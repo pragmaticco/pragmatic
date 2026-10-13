@@ -492,7 +492,7 @@ async fn a_backup_signed_by_a_key_from_inside_the_backup_is_refused() {
     ts.app().access.flush().await.unwrap();
     ts.stop().await;
     let dir = TempDir::new("forge");
-    let attacker = ServerKey::generate().unwrap();
+    let attacker = ServerKey::generate("test.example").unwrap();
     for (n, replace_ring) in [(0, true), (1, false)] {
         let target = dir.path().join(format!("b{n}"));
         ops::backup(&ts.config, &target).unwrap();

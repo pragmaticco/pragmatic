@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod tsa;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -61,6 +63,9 @@ pub struct TestServer {
     pub url: String,
     pub client: reqwest::Client,
     pub anchoring: Option<Arc<InstantAnchoring>>,
+    /// Set for a server started with the integrated components, so a
+    /// restart starts it the same way.
+    pub integrated: Option<pragmatic_server::anchoring::Options>,
 }
 
 /// A config for a test server in `dir`.
@@ -75,6 +80,36 @@ pub fn test_config(dir: &Path) -> Config {
     c.keys.signing_key_file = dir.join("keys").join("server.ed25519");
     c.name = "test.example".into();
     c
+}
+
+/// The cosigner name of every test server in witness mode.
+pub const WITNESS_NAME: &str = "witness.test.example";
+
+/// The witness key of every test server in witness mode.
+pub fn witness_cosigner() -> pragmatic_anchor::Cosigner {
+    pragmatic_anchor::Cosigner::from_seed(WITNESS_NAME, [42; 32]).unwrap()
+}
+
+/// Turn on witness mode for `origins`, with the witness key written next
+/// to the signing key.
+pub fn enable_witness_mode(c: &mut Config, origins: Vec<pragmatic_server::config::WitnessOrigin>) {
+    let path = c
+        .keys
+        .signing_key_file
+        .parent()
+        .unwrap()
+        .join("witness.key");
+    if !path.exists() {
+        pragmatic_server::keys::write_secret(
+            &path,
+            format!("{}\n", witness_cosigner().encode_skey()).as_bytes(),
+        )
+        .unwrap();
+    }
+    c.witness_mode.enabled = true;
+    c.witness_mode.name = WITNESS_NAME.into();
+    c.witness_mode.key_file = path;
+    c.witness_mode.origins = origins;
 }
 
 /// The admin token value every test server accepts.
@@ -98,7 +133,7 @@ impl TestServer {
         config.bootstrap.admin_token_sha256 = tokens::token_sha256(&admin_token());
         customize(&mut config);
         if !config.keys.signing_key_file.exists() {
-            ServerKey::generate()
+            ServerKey::generate(&config.server_name())
                 .unwrap()
                 .write_new(&config.keys.signing_key_file)
                 .unwrap();
@@ -134,7 +169,7 @@ impl TestServer {
         let mut config = test_config(dir.path());
         config.bootstrap.admin_token_sha256 = tokens::token_sha256(&admin_token());
         customize(&mut config);
-        ServerKey::generate()
+        ServerKey::generate(&config.server_name())
             .unwrap()
             .write_new(&config.keys.signing_key_file)
             .unwrap();
@@ -151,7 +186,7 @@ impl TestServer {
         let mut config = test_config(dir.path());
         config.bootstrap.admin_token_sha256 = tokens::token_sha256(&admin_token());
         customize(&mut config);
-        ServerKey::generate()
+        ServerKey::generate(&config.server_name())
             .unwrap()
             .write_new(&config.keys.signing_key_file)
             .unwrap();
@@ -187,6 +222,49 @@ impl TestServer {
             admin: admin_token(),
             client: reqwest::Client::new(),
             anchoring,
+            integrated: None,
+        }
+    }
+
+    /// Start with the integrated components (the anchoring library with
+    /// the configured witnesses, evidence bundles and the console), as
+    /// `pragmatic-server serve` does, reaching witnesses with `options`.
+    pub async fn start_integrated(
+        customize: impl FnOnce(&mut Config),
+        options: pragmatic_server::anchoring::Options,
+    ) -> TestServer {
+        let dir = Arc::new(TempDir::new("srv"));
+        let mut config = test_config(dir.path());
+        config.bootstrap.admin_token_sha256 = tokens::token_sha256(&admin_token());
+        customize(&mut config);
+        if !config.keys.signing_key_file.exists() {
+            ServerKey::generate(&config.server_name())
+                .unwrap()
+                .write_new(&config.keys.signing_key_file)
+                .unwrap();
+        }
+        TestServer::boot_integrated(dir, config, options).await
+    }
+
+    async fn boot_integrated(
+        dir: Arc<TempDir>,
+        config: Config,
+        options: pragmatic_server::anchoring::Options,
+    ) -> TestServer {
+        let source = pragmatic_server::server::HooksSource::Integrated(options.clone());
+        let handle = server::start_with(config.clone(), [0u8; 32], source, Limits::default())
+            .await
+            .expect("server starts");
+        handle.wait_ready().await;
+        TestServer {
+            url: handle.url(),
+            handle: Some(handle),
+            dir,
+            config,
+            admin: admin_token(),
+            client: reqwest::Client::new(),
+            anchoring: None,
+            integrated: Some(options),
         }
     }
 
@@ -200,13 +278,17 @@ impl TestServer {
     /// Stop and start again on the same data.
     pub async fn restart(mut self) -> TestServer {
         self.stop().await;
-        let (dir, config, anchoring) = (
+        let (dir, config, anchoring, integrated) = (
             self.dir.clone(),
             self.config.clone(),
             self.anchoring.clone(),
+            self.integrated.clone(),
         );
         drop(self);
-        TestServer::boot(dir, config, anchoring).await
+        match integrated {
+            Some(options) => TestServer::boot_integrated(dir, config, options).await,
+            None => TestServer::boot(dir, config, anchoring).await,
+        }
     }
 
     pub fn app(&self) -> &pragmatic_server::server::App {
@@ -280,6 +362,47 @@ impl TestServer {
             }
         }
     }
+}
+
+/// Sign in to the console with `token` as a browser would (the sign-in
+/// form's anti-forgery value included); returns the session cookie pair.
+pub async fn console_session(ts: &TestServer, token: &str) -> String {
+    let browser = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let form = browser
+        .get(format!("{}/console/sign-in", ts.url))
+        .send()
+        .await
+        .unwrap();
+    let cookie = form.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let html = form.text().await.unwrap();
+    let marker = "name=\"csrf\" value=\"";
+    let at = html.find(marker).unwrap() + marker.len();
+    let csrf = &html[at..at + html[at..].find('"').unwrap()];
+    let resp = browser
+        .post(format!("{}/console/sign-in", ts.url))
+        .header("cookie", cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("token={token}&csrf={csrf}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    resp.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string()
 }
 
 /// `/v1/runs/{id}` with the id percent-encoded.

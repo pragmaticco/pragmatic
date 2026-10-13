@@ -7,7 +7,8 @@ These manifests run one Pragmatic Server per data volume:
   two pods must never share a volume; `OnDelete` means a new version starts
   only after you delete the old pod, never alongside it. The pod runs as a
   non-root user with a read-only root filesystem.
-- `secret.yaml`: the Ed25519 signing key, mounted at
+- `secret.yaml`: the log key (an Ed25519 signed-note key that
+  `pragmatic-server keygen` writes, named for the log's origin), mounted at
   `/etc/pragmatic/server.ed25519`, outside the data volume. Create it from a
   key file instead of committing one:
   `kubectl create secret generic pragmatic-signing-key --from-file=server.ed25519=./server.ed25519`.

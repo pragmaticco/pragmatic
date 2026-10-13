@@ -6,7 +6,6 @@ use axum::extract::rejection::PathRejection;
 use axum::extract::{Extension, Path, RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use serde_json::json;
 
 use super::{blocking, need, ok, query_pairs, query_u64, read_body, AppState, Caller};
 use crate::error::ApiError;
@@ -52,6 +51,12 @@ pub async fn add_checkpoint(
 
 /// `GET /v1/witness/log/{origin}?after=`: admins, and auditors whose
 /// scopes cover the origin's record (`pragmatic:witness:<origin>`).
+///
+/// The answer is `{origin, origin_line, witness, cosigned, next}`. An
+/// auditor turns the pages into the `--witness-log` file of design 5.3,
+/// `{"witness": witness, "origin": origin_line, "checkpoints": [every
+/// cosigned[].checkpoint, in order]}`: each checkpoint is the signed note
+/// with this witness's cosignature line.
 pub async fn log(
     State(app): State<AppState>,
     Extension(c): Extension<Caller>,
@@ -80,9 +85,6 @@ pub async fn log(
     let Some(witness) = app.witness.clone() else {
         return Err(ApiError::not_found());
     };
-    let o = origin.clone();
-    let (records, next) = blocking(move || witness.log(&app.store, &o, after)).await?;
-    Ok(ok(
-        json!({ "origin": origin, "cosigned": records, "next": next }),
-    ))
+    let page = blocking(move || witness.log(&app.store, &origin, after)).await?;
+    Ok(ok(page))
 }

@@ -134,6 +134,7 @@ impl Store {
             created_by: Some(who.token_id.clone()),
             regressed: false,
             unanchored_since: None,
+            regression_accepted: false,
             summary: Summary::default(),
         };
         let run = std::sync::Arc::new(Run::new(

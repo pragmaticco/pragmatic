@@ -107,16 +107,22 @@ impl Default for Config {
     }
 }
 
-/// `[keys]`: the server's Ed25519 signing key.
+/// `[keys]`: the server's log key and the anchor key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct KeysConfig {
-    /// A PKCS#8 PEM Ed25519 private key (`pragmatic-server keygen` writes
-    /// one; `openssl genpkey -algorithm ed25519` too).
+    /// The log key: an Ed25519 signed-note key in the Go `note` private
+    /// key format, named for the log's origin (`pragmatic-server keygen`
+    /// writes one). It signs checkpoints, evidence bundles and backups.
     pub signing_key_file: PathBuf,
-    /// Allow the key inside `data_dir`. Off by default: a backup of the
+    /// Allow key files inside `data_dir`. Off by default: a backup of the
     /// data directory would otherwise carry the key that signs it.
     pub allow_key_in_data_dir: bool,
+    /// 32 random bytes (raw, or 64 hex digits) from which each run's
+    /// anchor key is derived under `anchor_run_ids = "hmac"` (design 4.7).
+    /// Required in that mode; `pragmatic-server keygen --anchor-key`
+    /// writes one.
+    pub anchor_key_file: PathBuf,
 }
 
 impl Default for KeysConfig {
@@ -124,6 +130,7 @@ impl Default for KeysConfig {
         KeysConfig {
             signing_key_file: PathBuf::from("/etc/pragmatic/server.ed25519"),
             allow_key_in_data_dir: false,
+            anchor_key_file: PathBuf::new(),
         }
     }
 }
@@ -189,19 +196,20 @@ pub struct TsaConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WitnessConfig {
+    /// The witness's submission prefix: requests go to
+    /// `<url>/add-checkpoint`.
     pub url: String,
-    /// The witness's Ed25519 public key, 64 lowercase hex digits.
-    pub public_key: String,
+    /// The witness's `cosignature/v1` verifier key,
+    /// `<name>+<key id>+<base64>`. The vkey names the key and checks its
+    /// id, so a typo in the key cannot pass as another witness.
+    pub vkey: String,
+    /// Who runs it, for counting distinct operators. Empty means the key
+    /// name.
+    #[serde(default)]
+    pub operator: String,
     /// A file holding the bearer token for the witness, if it needs one.
     #[serde(default)]
     pub token_file: PathBuf,
-    /// The witness's cosigner name (its key name in signature lines).
-    /// Empty means the URL's host.
-    #[serde(default)]
-    pub name: String,
-    /// Who runs it. Empty means the cosigner name.
-    #[serde(default)]
-    pub operator: String,
 }
 
 /// `[[retention]]`: one retention policy.
@@ -323,11 +331,20 @@ impl Default for WebhookConfig {
     }
 }
 
-/// `[witness_mode]`.
+/// `[witness_mode]` (design 4.8).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct WitnessModeConfig {
     pub enabled: bool,
+    /// The cosigner name: the key name in this witness's cosignature
+    /// lines, which logs pin as `<name>+<key id>+<base64>`.
+    pub name: String,
+    /// The witness key: an Ed25519 `cosignature/v1` key in the Go `note`
+    /// private key format (`pragmatic-server keygen --witness` writes
+    /// one). Never the log key: a witness that signed with the key of its
+    /// own log would make its cosignatures and its checkpoints
+    /// interchangeable.
+    pub key_file: PathBuf,
     pub origins: Vec<WitnessOrigin>,
 }
 
@@ -335,12 +352,17 @@ pub struct WitnessModeConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WitnessOrigin {
-    /// The log's origin line.
+    /// The configuration name: bound to the log's `witness_client` token,
+    /// the `{origin}` of `GET /v1/witness/log/{origin}`, and the suffix of
+    /// the record run `pragmatic:witness:<name>`.
     pub name: String,
+    /// The checkpoint origin line the log signs.
+    pub origin: String,
+    /// The log's signed-note verifier keys (`<origin>+<key id>+<base64>`),
+    /// more than one while the log rotates its key.
+    pub log_vkeys: Vec<String>,
     /// SHA-256 of the `witness_client` token the log authenticates with.
     pub token_sha256: String,
-    /// The log's signed-note verifier key (`<name>+<key id>+<key>`).
-    pub public_key: String,
 }
 
 /// `[license]`.
@@ -508,11 +530,19 @@ impl Config {
                     "anchoring.witness[{i}].url: must be an http(s) URL"
                 ));
             }
-            if !is_sha256_hex(&w.public_key) {
+            let vkey = pragmatic::note::VerifierKey::parse(&w.vkey)
+                .map_err(|e| ConfigError(format!("anchoring.witness[{i}].vkey: {e}")))?;
+            if vkey.signature_type() != pragmatic::note::SignatureType::CosignatureV1 {
                 return err(format!(
-                    "anchoring.witness[{i}].public_key: must be 64 lowercase hex digits"
+                    "anchoring.witness[{i}].vkey: must be a cosignature/v1 key (type 0x04)"
                 ));
             }
+        }
+        if a.anchor_run_ids == "hmac" && self.keys.anchor_key_file.as_os_str().is_empty() {
+            return err(
+                "keys.anchor_key_file: required with anchoring.anchor_run_ids = \"hmac\" (create \
+                 one with `pragmatic-server keygen --anchor-key`)",
+            );
         }
         Ok(())
     }
@@ -559,24 +589,64 @@ impl Config {
     }
 
     fn validate_witness_mode(&self) -> Result<(), ConfigError> {
-        let mut seen = Vec::new();
-        for (i, o) in self.witness_mode.origins.iter().enumerate() {
-            if o.name.is_empty() || o.name.chars().any(|c| c < ' ') {
+        let w = &self.witness_mode;
+        if w.enabled {
+            if !pragmatic::note::is_valid_origin(&w.name) {
+                return err(
+                    "witness_mode.name: the cosigner name must be 1 to 255 bytes with no white \
+                     space, '+' or control characters",
+                );
+            }
+            if w.key_file.as_os_str().is_empty() {
+                return err("witness_mode.key_file: must not be empty");
+            }
+        }
+        let mut names = Vec::new();
+        let mut lines = Vec::new();
+        for (i, o) in w.origins.iter().enumerate() {
+            if !is_origin_name(&o.name) {
                 return err(format!(
-                    "witness_mode.origins[{i}].name: must be an origin line"
+                    "witness_mode.origins[{i}].name: 1 to 128 characters from A-Z, a-z, 0-9, \
+                     '.', '_', ':' and '-'"
                 ));
             }
-            if seen.contains(&&o.name) {
-                return err(format!("witness_mode.origins[{i}].name: duplicate origin"));
+            if names.contains(&&o.name) {
+                return err(format!("witness_mode.origins[{i}].name: duplicate name"));
             }
-            seen.push(&o.name);
+            names.push(&o.name);
+            if !pragmatic::note::is_valid_origin(&o.origin) {
+                return err(format!(
+                    "witness_mode.origins[{i}].origin: must be a checkpoint origin line"
+                ));
+            }
+            // A witness keeps its state per origin line: two entries for one
+            // line would block each other forever (design 4.8).
+            if lines.contains(&&o.origin) {
+                return err(format!(
+                    "witness_mode.origins[{i}].origin: another entry has this origin line"
+                ));
+            }
+            lines.push(&o.origin);
             if !is_sha256_hex(&o.token_sha256) {
                 return err(format!(
                     "witness_mode.origins[{i}].token_sha256: must be 64 lowercase hex digits"
                 ));
             }
-            pragmatic::note::VerifierKey::parse(&o.public_key)
-                .map_err(|e| ConfigError(format!("witness_mode.origins[{i}].public_key: {e}")))?;
+            if o.log_vkeys.is_empty() {
+                return err(format!(
+                    "witness_mode.origins[{i}].log_vkeys: name at least one of the log's keys"
+                ));
+            }
+            for (k, v) in o.log_vkeys.iter().enumerate() {
+                let key = pragmatic::note::VerifierKey::parse(v).map_err(|e| {
+                    ConfigError(format!("witness_mode.origins[{i}].log_vkeys[{k}]: {e}"))
+                })?;
+                if key.signature_type() != pragmatic::note::SignatureType::Ed25519 {
+                    return err(format!(
+                        "witness_mode.origins[{i}].log_vkeys[{k}]: must be an Ed25519 note key"
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -599,16 +669,34 @@ impl Config {
                  \"independent\": false)",
             );
         }
-        if !self.keys.allow_key_in_data_dir
-            && is_inside(&self.keys.signing_key_file, &self.data_dir)
-        {
-            return err(
-                "refusing to use a signing key inside data_dir: a backup of the data would carry \
-                 the key that signs it. Move it, or set keys.allow_key_in_data_dir = true",
-            );
+        if !self.keys.allow_key_in_data_dir {
+            let keys = [
+                ("keys.signing_key_file", &self.keys.signing_key_file),
+                ("keys.anchor_key_file", &self.keys.anchor_key_file),
+                ("witness_mode.key_file", &self.witness_mode.key_file),
+            ];
+            for (name, path) in keys {
+                if !path.as_os_str().is_empty() && is_inside(path, &self.data_dir) {
+                    return err(format!(
+                        "refusing to use {name} inside data_dir: a backup of the data would carry \
+                         the key. Move it, or set keys.allow_key_in_data_dir = true"
+                    ));
+                }
+            }
         }
         Ok(())
     }
+}
+
+/// True for a witness-mode origin name: 1 to 128 characters of
+/// `[A-Za-z0-9._:-]`. It becomes part of the record's run id
+/// (`pragmatic:witness:<name>`, which the anchor log accepts only in the
+/// run id alphabet) and of a URL path.
+pub fn is_origin_name(name: &str) -> bool {
+    (1..=128).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
 }
 
 /// True for a label key `[a-z0-9_.-]{1,64}` (design 2.11).
@@ -785,6 +873,13 @@ mod tests {
     fn the_signing_key_must_live_outside_the_data_dir() {
         let mut c = base();
         c.data_dir = "/var/lib/pragmatic".into();
+        c.keys.anchor_key_file = "/var/lib/pragmatic/anchor.key".into();
+        assert!(c
+            .check_startup_rules()
+            .unwrap_err()
+            .0
+            .contains("anchor_key_file"));
+        c.keys.anchor_key_file = PathBuf::new();
         c.keys.signing_key_file = "/var/lib/pragmatic/keys/server.ed25519".into();
         assert!(c.check_startup_rules().unwrap_err().0.contains("inside"));
         c.keys.allow_key_in_data_dir = true;
@@ -792,6 +887,71 @@ mod tests {
         c.keys.allow_key_in_data_dir = false;
         c.keys.signing_key_file = "/var/lib/pragmatic-keys/server.ed25519".into();
         c.check_startup_rules().unwrap();
+    }
+
+    #[test]
+    fn witnesses_are_configured_by_vkey() {
+        let cosigner = pragmatic_anchor::Cosigner::from_seed("witness.example", [3; 32]).unwrap();
+        let vkey = cosigner.verifier_key().encode();
+        let ok = format!(
+            "[anchoring]\nwitness = [ {{ url = \"https://w.example\", vkey = \"{vkey}\" }} ]"
+        );
+        let c = Config::parse(&ok).unwrap();
+        assert!(c.has_independent_witness());
+        assert_eq!(c.anchoring.witness[0].operator, "");
+        // A log key is not a witness key, and a bare public key is no vkey.
+        let log = crate::keys::ServerKey::from_seed("x", [4; 32]).unwrap();
+        for bad in [log.vkey(), "ab".repeat(32)] {
+            let text = format!(
+                "[anchoring]\nwitness = [ {{ url = \"https://w.example\", vkey = \"{bad}\" }} ]"
+            );
+            assert!(Config::parse(&text).is_err(), "{bad}");
+        }
+        // HMAC run ids need the anchor key.
+        let e = Config::parse("[anchoring]\nanchor_run_ids = \"hmac\"").unwrap_err();
+        assert!(e.0.contains("anchor_key_file"), "{e}");
+        Config::parse(
+            "[keys]\nanchor_key_file = \"/etc/k\"\n[anchoring]\nanchor_run_ids = \"hmac\"",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn witness_mode_names_its_key_and_each_logs_origin_and_keys() {
+        let log = crate::keys::ServerKey::from_seed("acme", [5; 32]).unwrap();
+        let entry = |name: &str, origin: &str| WitnessOrigin {
+            name: name.into(),
+            origin: origin.into(),
+            log_vkeys: vec![log.vkey()],
+            token_sha256: "a".repeat(64),
+        };
+        let mut c = base();
+        c.witness_mode.enabled = true;
+        c.witness_mode.name = "witness.example".into();
+        c.witness_mode.key_file = "/etc/pragmatic/witness.key".into();
+        c.witness_mode.origins = vec![entry("acme", log.origin())];
+        c.validate().unwrap();
+        c.witness_mode.origins.push(entry("globex", log.origin()));
+        assert!(c.validate().unwrap_err().0.contains("origin line"));
+        c.witness_mode.origins[1] = entry("acme", "pragmatic/globex/0011223344556677");
+        assert!(c.validate().unwrap_err().0.contains("duplicate name"));
+        c.witness_mode.origins.pop();
+        c.witness_mode.origins[0].log_vkeys.clear();
+        assert!(c.validate().unwrap_err().0.contains("log_vkeys"));
+        c.witness_mode.origins[0].log_vkeys =
+            vec![pragmatic_anchor::Cosigner::from_seed("w", [6; 32])
+                .unwrap()
+                .verifier_key()
+                .encode()];
+        assert!(c.validate().unwrap_err().0.contains("Ed25519"));
+        c.witness_mode.origins = vec![entry("acme/log", log.origin())];
+        assert!(
+            c.validate().unwrap_err().0.contains("name"),
+            "no '/' in a run id"
+        );
+        c.witness_mode.origins.clear();
+        c.witness_mode.key_file = PathBuf::new();
+        assert!(c.validate().unwrap_err().0.contains("key_file"));
     }
 
     #[test]

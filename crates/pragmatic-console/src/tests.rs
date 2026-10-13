@@ -305,3 +305,45 @@ fn index_lists_runs() {
     assert_eq!(rows[0].last_outcome.as_deref(), Some("ok"));
     assert!(render_index(&[]).contains("no runs yet"));
 }
+
+/// A live console frames the page with its own policy and navigation,
+/// shows its actions, and passes every slot's content through its filter:
+/// a viewer without `view_raw` never sees the raw text, in a row's summary
+/// or in its detail, while fields stay as they are.
+#[test]
+fn a_filtered_framed_page_shows_no_raw_content() {
+    let j = fixture_journal();
+    let report = j.audit();
+    let filter =
+        |bytes: &[u8]| -> Vec<u8> { format!("[filtered {} bytes]", bytes.len()).into_bytes() };
+    let frame = crate::html::Frame {
+        csp: crate::html::CONSOLE_POLICY,
+        nav: "<span class=\"nav\"><a href=\"/console\">runs</a></span>",
+        footer: "licensed to Example Corp",
+    };
+    let view = RunView {
+        frame: Some(&frame),
+        filter: Some(SlotFilter(&filter)),
+        actions: Some("<div class=\"forms\">actions here</div>"),
+        ..RunView::new("support-ticket-4127", &j, &report)
+    };
+    let html = render_run(&view);
+    assert!(html.contains("form-action 'self'"));
+    assert!(html.contains("licensed to Example Corp"));
+    assert!(html.contains("actions here"));
+    assert!(html.contains("Content is shown redacted"));
+    assert!(html.contains("[filtered "));
+    // Every present slot of the fixture is replaced, in rows and details.
+    for e in j.entries() {
+        for c in e.event.slot_contents() {
+            if let Some(v) = c.value() {
+                let text = String::from_utf8_lossy(v.as_bytes());
+                if text.len() >= 12 && !text.starts_with('{') && !text.starts_with('[') {
+                    assert!(!html.contains(&*crate::html::esc(&text)), "{text}");
+                }
+            }
+        }
+    }
+    // Structural fields are not slots, and stay.
+    assert!(html.contains("claude-sonnet-4-5, 1830 in / 42 out, 812 ms"));
+}

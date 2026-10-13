@@ -457,6 +457,10 @@ pub async fn evidence(
     build_evidence(app, p, id, redact, anchor_now).await
 }
 
+fn entries_of(d: &crate::store::Durable) -> u64 {
+    d.entries
+}
+
 /// Shared by the API and the console.
 pub async fn build_evidence(
     app: AppState,
@@ -497,9 +501,13 @@ pub async fn build_evidence(
     }
     let a = app.clone();
     let run = id.clone();
-    let durable = blocking(move || a.store.durable(&run)).await?;
+    // A bundle holds the journal again in base64 and decoded as records:
+    // its share of the byte budget for journals held whole is taken with
+    // the journal and kept until the bundle has been sent.
+    let durable = blocking(move || a.store.durable_scaled(&run, 4)).await?;
     let a = app.clone();
-    let built = blocking(move || {
+    let mode = redact.clone();
+    let (built, entries, room) = blocking(move || {
         let journal = Journal::parse(&durable.bytes, None)
             .map(|parsed| parsed.journal)
             .map_err(|e| ApiError::chain_broken(&e.to_string()))?;
@@ -509,23 +517,25 @@ pub async fn build_evidence(
             journal: &journal,
             journal_bytes: &durable.bytes,
             requested_by: &p.token_id,
-            redact: &redact,
+            redact: &mode,
             redactor: &a.redactor,
             anchoring: a.hooks.anchoring.as_ref(),
             key: &a.key,
             independent: a.hooks.anchoring.independent(),
             generator: &generator,
         };
-        a.hooks.evidence.build(req).map_err(|e| match e {
+        let built = a.hooks.evidence.build(req).map_err(|e| match e {
             EvidenceError::NotImplemented => ApiError::not_implemented(
                 "evidence bundles are built by the evidence module, which is not part of this build",
             ),
             EvidenceError::BadRequest(m) => ApiError::bad_request(m),
             EvidenceError::Internal(m) => ApiError::storage_unavailable(m),
-        })
+        })?;
+        drop(journal);
+        Ok((built, entries_of(&durable), durable.into_budget()))
     })
     .await?;
-    let mut resp = Response::new(Body::from(built.body));
+    let mut resp = Response::new(super::stream::bytes_body(built.body, room));
     let h = resp.headers_mut();
     if let Ok(v) = HeaderValue::from_str(&built.content_type) {
         h.insert(header::CONTENT_TYPE, v);
@@ -533,7 +543,23 @@ pub async fn build_evidence(
     if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename=\"{}\"", built.file_name)) {
         h.insert(header::CONTENT_DISPOSITION, v);
     }
-    Ok(resp)
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(noted(
+        resp,
+        AccessNote {
+            raw: redact == "none",
+            cursor_from: Some(0),
+            cursor_to: Some(entries),
+            extra: [
+                ("evidence".to_string(), JsonValue::from(true)),
+                ("redact".to_string(), JsonValue::from(redact)),
+                ("anchor_now".to_string(), JsonValue::from(anchor_now)),
+            ]
+            .into_iter()
+            .collect(),
+            ..AccessNote::default()
+        },
+    ))
 }
 
 #[derive(Deserialize)]
@@ -594,29 +620,56 @@ pub async fn erase(
     body: Body,
 ) -> Result<Response, ApiError> {
     let id = path(id)?;
-    let p = c.principal.clone();
-    need(&p, &[Role::Admin])?;
+    need(&c.principal, &[Role::Admin])?;
     let body: EraseBody = parse_json(&read_body(&app, &headers, body, JSON_LIMIT).await?)?;
-    let sel = selector(&body)?;
-    check_reason_code(&body.reason_code)?;
-    if body.reason.len() > 4096 {
-        return Err(ApiError::bad_request("reason: at most 4096 bytes"));
-    }
-    let params = EraseParams {
-        selector: sel,
-        reason_code: body.reason_code.clone(),
+    let request = EraseRequest {
+        selector: selector(&body)?,
+        reason_code: body.reason_code,
         reason: body.reason,
         force: body.force,
         allow_unfinished: body.allow_unfinished,
+    };
+    Ok(ok(erase_run(&app, &c.principal, id, request).await?))
+}
+
+/// An erasure, as the API and the console ask for it.
+pub struct EraseRequest {
+    pub selector: Selector,
+    pub reason_code: String,
+    pub reason: String,
+    pub force: bool,
+    pub allow_unfinished: bool,
+}
+
+/// Erase slots of a run (shared by the API and the console): checked,
+/// recorded in the access log and the erasure ledger, then committed.
+pub async fn erase_run(
+    app: &AppState,
+    p: &Principal,
+    id: String,
+    req: EraseRequest,
+) -> Result<JsonValue, ApiError> {
+    need(p, &[Role::Admin])?;
+    check_reason_code(&req.reason_code)?;
+    if req.reason.len() > 4096 {
+        return Err(ApiError::bad_request("reason: at most 4096 bytes"));
+    }
+    let params = EraseParams {
+        selector: req.selector,
+        reason_code: req.reason_code.clone(),
+        reason: req.reason,
+        force: req.force,
+        allow_unfinished: req.allow_unfinished,
         by: p.token_id.clone(),
         kind: LedgerKind::Erasure,
     };
     let rec = intent(
         "erase",
-        &p,
+        p,
         Some(&id),
-        json!({"reason_code": body.reason_code, "force": body.force}),
+        json!({"reason_code": req.reason_code, "force": req.force}),
     );
+    let app = app.clone();
     let done = blocking(move || {
         let cx = EraseContext {
             holds: &app.holds,
@@ -641,7 +694,7 @@ pub async fn erase(
         out["warning"] =
             "the run's last attempt did not end ok; it can no longer be resumed".into();
     }
-    Ok(ok(out))
+    Ok(out)
 }
 
 /// `POST /v1/runs/{id}/accept-regression`: accept a regressed run's

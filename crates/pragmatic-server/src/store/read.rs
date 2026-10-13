@@ -50,7 +50,15 @@ pub struct Durable {
     pub entries: u64,
     pub head: String,
     pub bytes: Vec<u8>,
-    _budget: BudgetGuard,
+    budget: BudgetGuard,
+}
+
+impl Durable {
+    /// Keep the budget share after the bytes are gone (for what was built
+    /// from them).
+    pub fn into_budget(self) -> BudgetGuard {
+        self.budget
+    }
 }
 
 /// `GET /v1/runs` filters.
@@ -167,9 +175,18 @@ impl Store {
 
     /// The run's durable prefix as bytes, taken from the byte budget first.
     pub fn durable(&self, run_id: &str) -> Result<Durable, ApiError> {
+        self.durable_scaled(run_id, 1)
+    }
+
+    /// [`Store::durable`], taking `factor` times the journal's size from
+    /// the byte budget, for a reader that builds more from it (an evidence
+    /// bundle holds the journal again as base64 and as records). One take,
+    /// never two: a reader holding part of the budget while waiting for
+    /// more could wait for itself.
+    pub fn durable_scaled(&self, run_id: &str, factor: u64) -> Result<Durable, ApiError> {
         let run = self.find(run_id)?;
         let size = run.lock().meta.byte_len;
-        let budget = self.budget.take(size);
+        let budget = self.budget.take(size.saturating_mul(factor.max(1)));
         let _file = run.file.read().unwrap_or_else(|p| p.into_inner());
         let s = self.read_state(&run)?;
         let file = File::open(self.layout.journal(&run.stem))?;
@@ -178,7 +195,7 @@ impl Store {
             entries: s.entries,
             head: s.head,
             bytes,
-            _budget: budget,
+            budget,
         })
     }
 

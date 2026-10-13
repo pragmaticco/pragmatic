@@ -44,7 +44,7 @@ pub fn render_evidence(bundle: &Bundle, report: &EvidenceReport) -> String {
     body.push_str("<h2>timeline</h2>");
     match Journal::parse_evidence(&bundle.journal.bytes) {
         Ok(p) if p.tail_len == 0 => {
-            let (rows, next) = timeline(&p.journal, 0, None);
+            let (rows, next) = timeline(&p.journal, 0, None, None);
             body.push_str(&rows);
             if next.is_some() {
                 body.push_str(

@@ -139,7 +139,7 @@ async fn load_meets_the_design_targets() {
 async fn startup_with(n: usize) {
     let dir = std::sync::Arc::new(TempDir::new("startup-load"));
     let config = test_config(dir.path());
-    pragmatic_server::keys::ServerKey::generate()
+    pragmatic_server::keys::ServerKey::generate(&config.server_name())
         .unwrap()
         .write_new(&config.keys.signing_key_file)
         .unwrap();
@@ -206,6 +206,7 @@ fn write_run(l: &layout::Layout, run: &str, index_key: &[u8]) {
         created_by: None,
         regressed: false,
         unanchored_since: None,
+        regression_accepted: false,
         summary: pragmatic_server::summary::Summary::rebuild(&j, index_key),
     };
     std::fs::write(l.meta(&stem), serde_json::to_vec(&meta).unwrap()).unwrap();

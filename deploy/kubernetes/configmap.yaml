@@ -17,6 +17,7 @@ data:
     public_url = "https://pragmatic.example.com"
 
     [keys]
+    # The log key from `pragmatic-server keygen`, mounted from the Secret.
     signing_key_file = "/etc/pragmatic/server.ed25519"
 
     [bootstrap]
@@ -25,9 +26,11 @@ data:
 
     [anchoring]
     interval_secs = 600
+    # The pinned anchors ship in the image (deploy/tsa-roots/). Obtain
+    # written permission from each TSA operator before automated use.
     tsa = [
-      { url = "http://timestamp.digicert.com", roots_pem = "/etc/pragmatic/tsa-roots/digicert_g4.pem", operator = "digicert" },
-      { url = "http://timestamp.sectigo.com", roots_pem = "/etc/pragmatic/tsa-roots/usertrust_rsa.pem", operator = "sectigo" },
+      { url = "http://timestamp.digicert.com", roots_pem = "/etc/pragmatic/tsa-roots/digicert.pem", operator = "digicert" },
+      { url = "http://timestamp.sectigo.com", roots_pem = "/etc/pragmatic/tsa-roots/sectigo.pem", operator = "sectigo" },
     ]
 
     [license]

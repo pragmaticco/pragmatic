@@ -23,6 +23,8 @@ path = "src/lib.rs"
 
 [dependencies]
 pragmatic = { version = "0.5.0", path = "../pragmatic", default-features = false }
+pragmatic-anchor = { path = "../pragmatic-anchor" }
+pragmatic-console = { version = "0.5.0", path = "../pragmatic-console" }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "matched-path", "original-uri"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "fs", "io-util"] }
 serde = { version = "1", features = ["derive"] }

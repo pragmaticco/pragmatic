@@ -214,6 +214,67 @@ async fn an_auditor_without_view_raw_never_sees_seeded_personal_data() {
         .contains("[binary media_type=image/png bytes=18 sha256="));
 }
 
+/// The same scan over the integrated surfaces: evidence bundles in every
+/// mode a viewer without `view_raw` may ask for (their journals decoded,
+/// since base64 would hide a seed from a text search) and the console's
+/// pages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bundles_and_the_console_never_show_seeded_personal_data_without_view_raw() {
+    let ts = TestServer::start_integrated(
+        |c| c.redaction.patterns = vec![r"AKIA[0-9A-Z]{16}".into()],
+        pragmatic_server::anchoring::Options::default(),
+    )
+    .await;
+    let (agent, _) = ts.issue("agent", &["*"], false).await;
+    seeded_run(&ts, &agent, "support:1").await;
+    let (auditor, _) = ts.issue("auditor", &["support:"], false).await;
+    for mode in ["", "?redact=detectors", "?redact=binary", "?redact=all"] {
+        let resp = ts
+            .get(
+                &run_path("support:1", &format!("/evidence{mode}")),
+                &auditor,
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK, "{mode}");
+        let text = resp.text().await.unwrap();
+        let bundle = pragmatic::evidence::Bundle::from_json(text.as_bytes()).unwrap();
+        let journal = String::from_utf8_lossy(&bundle.journal.bytes).into_owned();
+        if mode != "?redact=binary" {
+            assert!(leaks(&text).is_empty(), "{mode}: {:?}", leaks(&text));
+            assert!(
+                leaks(&journal).is_empty(),
+                "{mode} journal: {:?}",
+                leaks(&journal)
+            );
+        } else {
+            // Binary mode withholds attachments only, which it does.
+            assert!(!text.contains(&image()) && !journal.contains(&image()));
+        }
+    }
+    let resp = ts
+        .get(&run_path("support:1", "/evidence?redact=none"), &auditor)
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let cookie = console_session(&ts, &auditor).await;
+    for path in [
+        "/console",
+        "/console/runs/support:1",
+        "/console/runs/support:1?from=4",
+        "/console/access",
+    ] {
+        let resp = ts
+            .client
+            .get(format!("{}{path}", ts.url))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let body = resp.text().await.unwrap();
+        assert!(leaks(&body).is_empty(), "{path} leaks {:?}", leaks(&body));
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn salts_are_never_served_in_any_view() {
     let ts = TestServer::start(|_| {}).await;

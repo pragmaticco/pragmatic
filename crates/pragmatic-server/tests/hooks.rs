@@ -43,11 +43,16 @@ struct JsonConsole;
 impl ConsoleRenderer for JsonConsole {
     fn render(&self, page: &ConsolePage<'_>) -> Result<String, ConsoleError> {
         Ok(match page {
-            ConsolePage::SignIn { error, .. } => json!({"page": "sign_in", "error": error}),
-            ConsolePage::Runs { viewer, runs, .. } => {
-                json!({"page": "runs", "viewer": viewer.token_id, "licensee": viewer.licensee, "runs": runs})
+            ConsolePage::SignIn { error, csrf, .. } => {
+                json!({"page": "sign_in", "error": error, "csrf": csrf})
             }
-            ConsolePage::Run { summary, entries, .. } => json!({"page": "run", "summary": summary, "entries": entries}),
+            ConsolePage::Runs { viewer, runs, .. } => {
+                json!({"page": "runs", "viewer": viewer.token_id, "licensee": viewer.licensee,
+                       "csrf": viewer.csrf, "runs": runs})
+            }
+            ConsolePage::Run {
+                summary, journal, ..
+            } => json!({"page": "run", "summary": summary, "entries": journal.len()}),
             ConsolePage::AccessLog { records, .. } => json!({"page": "access", "records": records}),
             ConsolePage::Holds { holds, .. } => json!({"page": "holds", "holds": holds}),
             ConsolePage::Tokens { tokens, .. } => json!({"page": "tokens", "tokens": tokens}),
@@ -202,11 +207,36 @@ async fn console_sessions_sign_in_expire_and_end_with_their_token() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     assert_eq!(resp.headers()["location"], "/console/sign-in");
-    // A wrong token: 401, no cookie.
+    // The sign-in form carries an anti-forgery value, also in a cookie.
+    let form = browser
+        .get(format!("{}/console/sign-in", ts.url))
+        .send()
+        .await
+        .unwrap();
+    let form_cookie = form.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let page: Value = form.json().await.unwrap();
+    let form_csrf = page["csrf"].as_str().unwrap().to_string();
+    // Without it, a sign-in is refused whatever the token.
     let resp = browser
         .post(format!("{}/console/sign-in", ts.url))
         .header("content-type", "application/x-www-form-urlencoded")
-        .body("token=prag_nope")
+        .body(format!("token={auditor}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // A wrong token: 401, no session cookie.
+    let resp = browser
+        .post(format!("{}/console/sign-in", ts.url))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("cookie", &form_cookie)
+        .body(format!("token=prag_nope&csrf={form_csrf}"))
         .send()
         .await
         .unwrap();
@@ -216,7 +246,8 @@ async fn console_sessions_sign_in_expire_and_end_with_their_token() {
     let resp = browser
         .post(format!("{}/console/sign-in", ts.url))
         .header("content-type", "application/x-www-form-urlencoded")
-        .body(format!("token={auditor}"))
+        .header("cookie", &form_cookie)
+        .body(format!("token={auditor}&csrf={form_csrf}"))
         .send()
         .await
         .unwrap();
@@ -262,7 +293,7 @@ async fn console_sessions_sign_in_expire_and_end_with_their_token() {
         .json()
         .await
         .unwrap();
-    assert_eq!(page["entries"].as_array().unwrap().len(), 4);
+    assert_eq!(page["entries"], 4);
     let resp = browser
         .get(format!("{}/console/tokens", ts.url))
         .header("cookie", &session)
@@ -289,7 +320,8 @@ async fn console_sessions_sign_in_expire_and_end_with_their_token() {
         browser
             .post(format!("{}/console/sign-in", ts.url))
             .header("content-type", "application/x-www-form-urlencoded")
-            .body(format!("token={token}"))
+            .header("cookie", &form_cookie)
+            .body(format!("token={token}&csrf={form_csrf}"))
             .send()
     };
     let c2 = sign_in(admin2.clone()).await.unwrap().headers()["set-cookie"]
@@ -328,9 +360,28 @@ async fn console_sessions_sign_in_expire_and_end_with_their_token() {
         .next()
         .unwrap()
         .to_string();
+    // Signing out a live session needs its CSRF token.
     let resp = browser
         .post(format!("{}/console/sign-out", ts.url))
         .header("cookie", &c3)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let page: Value = browser
+        .get(format!("{}/console", ts.url))
+        .header("cookie", &c3)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resp = browser
+        .post(format!("{}/console/sign-out", ts.url))
+        .header("cookie", &c3)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("csrf={}", page["csrf"].as_str().unwrap()))
         .send()
         .await
         .unwrap();

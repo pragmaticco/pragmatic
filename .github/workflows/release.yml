@@ -9,11 +9,17 @@ name: Release
 #     publish = false, and the job below checks that before publishing
 #     anything. The server ships as a container image and binaries instead.
 #   - abi3 wheels + sdist for `pragmatic-runtime` to PyPI
+#   - the Pragmatic Server container image, built for every tag and pushed
+#     only when a registry is configured (secrets below); never on its own
+#     from a branch
 #
 # One-time setup (see RELEASING.md):
 #   - repo secret CARGO_REGISTRY_TOKEN: crates.io API token (publish scope)
 #   - PyPI trusted publisher for `pragmatic-runtime` pointing at this repo,
 #     workflow `release.yml`, environment `pypi` (no token needed)
+#   - optional repo secrets CONTAINER_REGISTRY_IMAGE,
+#     CONTAINER_REGISTRY_USERNAME and CONTAINER_REGISTRY_TOKEN to push the
+#     server image
 on:
   push:
     tags: ["v*"]
@@ -47,7 +53,11 @@ jobs:
               assert found[0]["license"] == "BUSL-1.1", f"{name} must be BUSL-1.1"
           '
       - name: Publish workspace crates
-        run: cargo publish --workspace --no-verify
+        # The exclusions repeat publish = false on purpose: the commercial
+        # crates must not reach crates.io even if a manifest is edited.
+        run: >-
+          cargo publish --workspace --no-verify
+          --exclude pragmatic-server --exclude pragmatic-anchor
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -106,3 +116,36 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           skip-existing: true
+
+  container:
+    name: server container image
+    runs-on: ubuntu-latest
+    # Only for a release tag; the push step also needs the registry secrets.
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          docker build -t "pragmatic-server:$VERSION" .
+      - name: Smoke test the image
+        # Read-only root filesystem and an unprivileged user, as deployed.
+        run: |
+          docker run --rm --read-only --user 10001:10001 "pragmatic-server:$VERSION" --version
+          docker run --rm --read-only --entrypoint openssl "pragmatic-server:$VERSION" version
+          docker run --rm --entrypoint ls "pragmatic-server:$VERSION" /etc/pragmatic/tsa-roots
+      - name: Push to the configured registry
+        env:
+          IMAGE: ${{ secrets.CONTAINER_REGISTRY_IMAGE }}
+          REGISTRY_USERNAME: ${{ secrets.CONTAINER_REGISTRY_USERNAME }}
+          REGISTRY_TOKEN: ${{ secrets.CONTAINER_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$IMAGE" ] || [ -z "$REGISTRY_USERNAME" ] || [ -z "$REGISTRY_TOKEN" ]; then
+            echo "no container registry configured (see RELEASING.md); the image was built and not pushed"
+            exit 0
+          fi
+          REGISTRY="${IMAGE%%/*}"
+          echo "$REGISTRY_TOKEN" | docker login "$REGISTRY" --username "$REGISTRY_USERNAME" --password-stdin
+          docker tag "pragmatic-server:$VERSION" "$IMAGE:$VERSION"
+          docker push "$IMAGE:$VERSION"

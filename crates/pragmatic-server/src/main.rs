@@ -21,8 +21,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use pragmatic_server::anchoring::{self, OfflineAnchoring};
 use pragmatic_server::config::Config;
-use pragmatic_server::server::{self, Hooks};
+use pragmatic_server::server::{self, HooksSource};
 use pragmatic_server::{ops, tokens};
 use serde_json::{json, Value as JsonValue};
 
@@ -49,11 +50,18 @@ struct Cli {
 enum Command {
     /// Run the server.
     Serve,
-    /// Write a new signing key (refuses to overwrite), or rotate it.
+    /// Write a new key (never over an existing file): the log key by
+    /// default, or rotate it, or the witness-mode key, or the anchor key.
     Keygen {
-        /// Replace the current key; the server must be stopped.
-        #[arg(long)]
+        /// Replace the current log key; the server must be stopped.
+        #[arg(long, conflicts_with_all = ["witness", "anchor_key"])]
         rotate: bool,
+        /// Write the witness-mode key ([witness_mode] key_file).
+        #[arg(long, conflicts_with = "anchor_key")]
+        witness: bool,
+        /// Write the anchor key for HMAC run ids ([keys] anchor_key_file).
+        #[arg(long)]
+        anchor_key: bool,
     },
     /// Issue, revoke and list tokens on a running server.
     Token {
@@ -177,7 +185,19 @@ fn run(cli: Cli) -> Result<String, String> {
             ..
         } => bootstrap_token(),
         Command::Serve => serve(&cli.config),
-        Command::Keygen { rotate } => ops::keygen(&load(&cli.config)?.0, rotate),
+        Command::Keygen {
+            rotate,
+            witness,
+            anchor_key,
+        } => {
+            let kind = match (rotate, witness, anchor_key) {
+                (true, _, _) => ops::KeygenKind::Rotate,
+                (_, true, _) => ops::KeygenKind::Witness,
+                (_, _, true) => ops::KeygenKind::AnchorKey,
+                _ => ops::KeygenKind::Log,
+            };
+            ops::keygen(&load(&cli.config)?.0, kind)
+        }
         Command::Backup { to } => {
             let r = ops::backup(&load(&cli.config)?.0, &to)?;
             Ok(format!(
@@ -194,31 +214,33 @@ fn run(cli: Cli) -> Result<String, String> {
             trust_keys,
         } => {
             let config = load(&cli.config)?.0;
-            let hooks = Hooks::stubs(&config);
+            let anchoring = OfflineAnchoring {
+                config: config.clone(),
+            };
             let report = ops::restore_trusting(
                 &config,
                 &from,
                 erasure_ledger.as_deref(),
-                hooks.anchoring.as_ref(),
+                &anchoring,
                 &trust_keys,
             )?;
             Ok(pretty(&report))
         }
         Command::VerifyData { offline: true, .. } => {
             let config = load(&cli.config)?.0;
-            let hooks = Hooks::stubs(&config);
-            Ok(pretty(&ops::verify_data_offline(
-                &config,
-                hooks.anchoring.as_ref(),
-            )?))
+            let anchoring = OfflineAnchoring {
+                config: config.clone(),
+            };
+            Ok(pretty(&ops::verify_data_offline(&config, &anchoring)?))
         }
         Command::VerifyData { conn, .. } => {
             let config = load(&cli.config)?.0;
             call(&config, &conn, "POST", "/v1/verify-data", None)
         }
         Command::VerifyEvidence { file } => Err(format!(
-            "verify-evidence ({}) is provided by the evidence module, which is not part of this \
-             build yet; use `pragmatic verify-evidence` from the CLI",
+            "verify {} with `pragmatic verify-evidence` from the Pragmatic CLI (Apache-2.0), \
+             pinning trust roots of your own choosing: an auditor should not have to trust the \
+             operator's server to check its bundles",
             file.display()
         )),
         Command::Migrate => ops::migrate(&load(&cli.config)?.0).map(|s| format!("{s}\n")),
@@ -242,7 +264,7 @@ fn bootstrap_token() -> Result<String, String> {
 
 fn serve(config_path: &Path) -> Result<String, String> {
     let (config, sha) = load(config_path)?;
-    let hooks = Hooks::stubs(&config);
+    let hooks = HooksSource::Integrated(anchoring::Options::default());
     runtime()?.block_on(async move {
         let handle = server::start(config, sha, hooks).await.map_err(|e| e.0)?;
         eprintln!("pragmatic-server: listening on {}", handle.url());

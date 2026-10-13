@@ -1,63 +1,77 @@
 //! Witness mode (design 4.8): cosigning other logs' checkpoints under the
 //! C2SP `tlog-witness` protocol.
 //!
-//! A log submits `old <size>`, the consistency proof from that size, a
-//! blank line and its signed checkpoint. The witness checks, in order:
+//! The protocol's checks and the cosigning key are the anchoring library's
+//! ([`WitnessCore`]), so this server cosigns exactly as the library's own
+//! witness does. A log submits `old <size>`, the consistency proof from
+//! that size, a blank line and its signed checkpoint, and the checks run in
+//! the protocol's order:
 //!
-//! 1. the body is well formed (400);
-//! 2. the checkpoint's origin is the one the caller's `witness_client`
-//!    token is bound to: the origin always comes from the configuration,
-//!    never from the body (403);
-//! 3. the log's signature, against the key configured for that origin
-//!    (403);
+//! 1. the origin bound to the caller's `witness_client` token is
+//!    configured (404) and the body is well formed (400);
+//! 2. the checkpoint names that origin line: the origin always comes from
+//!    the configuration, never from the body (403);
+//! 3. the log's signature, against the log keys configured for it (403);
 //! 4. `old` is not larger than the checkpoint's size (400);
-//! 5. `old` equals the size this witness last cosigned for the origin,
-//!    otherwise 409 with the witness's size as a `text/x.tlog.size` body,
-//!    so the log can retry with the right proof;
+//! 5. under the lock of the origin's record, `old` equals the size this
+//!    witness last cosigned for the origin, otherwise 409 with the
+//!    witness's size as a `text/x.tlog.size` body, so the log can retry
+//!    with the right proof;
 //! 6. the consistency proof from the last cosigned tree to the new one
-//!    (RFC 9162), which is what rejects a fork (422).
+//!    (RFC 9162), which is what refuses a fork (422).
 //!
-//! It then answers with a `cosignature/v1` line: an Ed25519 signature over
-//! `"cosignature/v1\ntime <unix>\n"` and the checkpoint body.
+//! It then answers with a `cosignature/v1` line, signed with the witness's
+//! own key (`[witness_mode] key_file`), never the log key.
 //!
-//! Every cosigned checkpoint is appended to the witness's own record, the
-//! server-written run `pragmatic:witness:<origin>`. That run is anchored
-//! like any other, so the witness's own history is timestamped by its own
-//! TSAs, and `GET /v1/witness/log/{origin}` serves it for audits. The last
-//! cosigned size is read back from that record under the run's lock, so
-//! the record and the witness's state can never disagree.
+//! # The record
 //!
-//! A correctly signed checkpoint that fails the consistency check is a
-//! fork attempt by the log, and the refusal is evidence: it is recorded
-//! as a `witness.reject` note with the submitted checkpoint, as the
-//! anchoring library's witness does.
+//! Every cosigned checkpoint is appended to the witness's own record for
+//! its origin, the server-written run `pragmatic:witness:<name>`, as a
+//! `witness.cosign` note `{origin, old_size, tree_size, root, timestamp}`
+//! whose payload slot holds the cosigned checkpoint (the signed note with
+//! this witness's cosignature line). The note is durable before the line
+//! is returned, and the size check reads the record under the same lock as
+//! the append, so a crash can never make the witness forget a cosignature
+//! and sign a fork. A correctly signed checkpoint that fails the
+//! consistency checks is a fork attempt by the log, and the refusal is
+//! evidence: it is recorded, in the same append, as a `witness.reject`
+//! note `{origin, old_size, tree_size, root, reason}` with the submitted
+//! note as its payload. A damaged record refuses writes, so the witness
+//! stops cosigning for that origin rather than start a record that has
+//! forgotten what it cosigned.
+//!
+//! The record is anchored in the server's own log like any run, so the
+//! witness's history is time-stamped by its own TSAs, and
+//! `GET /v1/witness/log/{origin}` serves it for audits.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::cell::Cell;
 
-use pragmatic::encoding::base64_decode_exact;
-use pragmatic::note::{self, Checkpoint, Note, NoteSignature, SignatureType, VerifierKey};
-use pragmatic::{merkle, Event, Value};
+use pragmatic::encoding::{hex_decode_exact, hex_encode};
+use pragmatic::sha256::Digest;
+use pragmatic::{Event, Value};
+use pragmatic_anchor::witness::AddCheckpointError;
+use pragmatic_anchor::{WitnessCore, WitnessOrigin};
 use serde_json::{json, Value as JsonValue};
 
 use crate::config::Config;
 use crate::error::ApiError;
-use crate::keys::ServerKey;
+use crate::keys;
 use crate::store::Store;
 use crate::timefmt;
 
 /// The note kind of a cosigned checkpoint in the witness record.
-pub const COSIGN_KIND: &str = "witness.cosign";
+pub const COSIGN_KIND: &str = pragmatic_anchor::witness::COSIGN_NOTE;
 
 /// The note kind of a refused fork attempt in the witness record.
-pub const REJECT_KIND: &str = "witness.reject";
+pub const REJECT_KIND: &str = pragmatic_anchor::witness::REJECT_NOTE;
 
 /// The most record entries one `GET /v1/witness/log/{origin}` reads.
 pub const LOG_PAGE: u64 = 1000;
 
-/// The run that records what the witness cosigned for an origin.
-pub fn record_run_id(origin: &str) -> String {
-    format!("pragmatic:witness:{origin}")
+/// The run that records what the witness cosigned for the origin entry
+/// named `name`.
+pub fn record_run_id(name: &str) -> String {
+    format!("pragmatic:witness:{name}")
 }
 
 /// A refusal in the protocol's terms.
@@ -68,72 +82,25 @@ pub struct WitnessError {
     pub body: String,
 }
 
-impl WitnessError {
-    fn text(status: u16, body: impl Into<String>) -> WitnessError {
+impl From<AddCheckpointError> for WitnessError {
+    fn from(e: AddCheckpointError) -> WitnessError {
         WitnessError {
-            status,
-            content_type: "text/plain; charset=utf-8",
-            body: body.into(),
+            status: e.status(),
+            content_type: e.content_type(),
+            body: e.body(),
         }
     }
 }
 
-/// The witness: its cosigner name, key and the logs it witnesses.
+/// The witness: the anchoring library's checks and key, over records in
+/// the run store.
 pub struct Witness {
-    name: String,
-    key: Arc<ServerKey>,
-    origins: HashMap<String, VerifierKey>,
+    core: WitnessCore,
 }
 
-/// A parsed `add-checkpoint` body.
-struct Submission {
-    old: u64,
-    proof: Vec<[u8; 32]>,
-    note_text: String,
-    note: Note,
-    checkpoint: Checkpoint,
-}
-
-fn parse_body(body: &[u8]) -> Result<Submission, WitnessError> {
-    let bad = |m: &str| WitnessError::text(400, m);
-    let text = std::str::from_utf8(body).map_err(|_| bad("body is not UTF-8"))?;
-    let (head, note_text) = text.split_once("\n\n").ok_or_else(|| {
-        bad("expected an old size line, proof lines, a blank line and a checkpoint")
-    })?;
-    let mut lines = head.split('\n');
-    let old = lines
-        .next()
-        .and_then(|l| l.strip_prefix("old "))
-        .and_then(|n| {
-            let canonical =
-                n == "0" || (!n.starts_with('0') && n.bytes().all(|b| b.is_ascii_digit()));
-            canonical.then(|| n.parse::<u64>().ok()).flatten()
-        })
-        .ok_or_else(|| bad("the first line must be \"old <size>\""))?;
-    let mut proof = Vec::new();
-    for line in lines {
-        proof.push(
-            base64_decode_exact::<32>(line)
-                .map_err(|_| bad("a proof line is not base64 of 32 bytes"))?,
-        );
-        if proof.len() > 63 {
-            return Err(bad("the consistency proof is too long"));
-        }
-    }
-    let note = Note::parse(note_text).map_err(|e| bad(&format!("checkpoint note: {e}")))?;
-    let checkpoint = Checkpoint::parse(&note.body).map_err(|e| bad(&format!("checkpoint: {e}")))?;
-    Ok(Submission {
-        old,
-        proof,
-        note_text: note_text.to_string(),
-        note,
-        checkpoint,
-    })
-}
-
-/// The last cosigned `(size, root)` in a witness record: `(0, empty root)`
-/// before the first.
-fn last_cosigned(journal: &pragmatic::Journal) -> (u64, [u8; 32]) {
+/// The last cosigned `(size, root)` for `origin` in a witness record, or
+/// `None` before the first.
+fn last_cosigned(journal: &pragmatic::Journal, origin: &str) -> Option<(u64, Digest)> {
     for e in journal.entries().iter().rev() {
         let Event::Note { kind, data, .. } = &e.event else {
             continue;
@@ -144,222 +111,185 @@ fn last_cosigned(journal: &pragmatic::Journal) -> (u64, [u8; 32]) {
         let Ok(doc) = serde_json::from_str::<JsonValue>(data) else {
             continue;
         };
+        if doc["origin"].as_str() != Some(origin) {
+            continue;
+        }
         let size = doc["tree_size"].as_u64();
         let root = doc["root"]
             .as_str()
-            .and_then(|r| base64_decode_exact::<32>(r).ok());
+            .and_then(|r| hex_decode_exact::<32>(r).ok());
         if let (Some(size), Some(root)) = (size, root) {
-            return (size, root);
+            return Some((size, root));
         }
     }
-    (0, merkle::empty_root())
+    None
 }
 
 impl Witness {
-    /// The witness for `[witness_mode]`, or `None` when it is off.
-    pub fn from_config(
-        config: &Config,
-        name: &str,
-        key: Arc<ServerKey>,
-    ) -> Result<Option<Witness>, String> {
-        if !config.witness_mode.enabled {
+    /// The witness for `[witness_mode]`, or `None` when it is off. Reads
+    /// the witness key.
+    pub fn from_config(config: &Config) -> Result<Option<Witness>, String> {
+        let w = &config.witness_mode;
+        if !w.enabled {
             return Ok(None);
         }
-        if !note::is_valid_origin(name) {
+        let cosigner = keys::load_cosigner(&w.key_file).map_err(|e| {
+            format!("witness_mode: {e} (create one with `pragmatic-server keygen --witness`)")
+        })?;
+        if cosigner.name() != w.name {
             return Err(format!(
-                "witness_mode: the server name '{name}' is not a valid cosigner name"
+                "witness_mode: the key in {} is named {:?}, but witness_mode.name is {:?}",
+                w.key_file.display(),
+                cosigner.name(),
+                w.name
             ));
         }
-        let mut origins = HashMap::new();
-        for o in &config.witness_mode.origins {
-            let vkey = VerifierKey::parse(&o.public_key)
+        let mut origins = Vec::new();
+        for o in &w.origins {
+            let log_keys = o
+                .log_vkeys
+                .iter()
+                .map(|v| pragmatic::note::VerifierKey::parse(v))
+                .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| format!("witness_mode origin {}: {e}", o.name))?;
-            origins.insert(o.name.clone(), vkey);
+            origins.push(WitnessOrigin {
+                name: o.name.clone(),
+                origin: o.origin.clone(),
+                log_keys,
+            });
         }
-        Ok(Some(Witness {
-            name: name.to_string(),
-            key,
-            origins,
-        }))
+        let core = WitnessCore::new(cosigner, origins).map_err(|e| format!("witness_mode: {e}"))?;
+        Ok(Some(Witness { core }))
     }
 
     /// The witness's verifier key (`cosignature/v1`), for logs to pin.
-    pub fn vkey(&self) -> Result<String, String> {
-        VerifierKey::new(
-            &self.name,
-            SignatureType::CosignatureV1,
-            self.key.public_key(),
-        )
-        .map(|k| k.encode())
-        .map_err(|e| e.to_string())
+    pub fn vkey(&self) -> String {
+        self.core.cosigner().verifier_key().encode()
     }
 
-    /// Handle one `add-checkpoint` for `origin` (the caller's bound
-    /// origin). Returns the cosignature line, newline-terminated.
+    /// The cosigner name.
+    pub fn name(&self) -> &str {
+        self.core.cosigner().name()
+    }
+
+    /// Handle one `add-checkpoint` for the origin entry named `name` (the
+    /// caller's bound origin). Returns the cosignature line,
+    /// newline-terminated.
     pub fn add_checkpoint(
         &self,
         store: &Store,
-        origin: &str,
+        name: &str,
         body: &[u8],
     ) -> Result<String, WitnessError> {
-        let sub = parse_body(body)?;
-        if sub.checkpoint.origin != origin {
-            return Err(WitnessError::text(
-                403,
-                "the checkpoint is for another origin than this token's",
-            ));
-        }
-        let vkey = self
-            .origins
-            .get(origin)
-            .ok_or_else(|| WitnessError::text(404, "unknown origin"))?;
-        note::verify_note(&sub.note, std::slice::from_ref(vkey))
-            .map_err(|e| WitnessError::text(403, format!("log signature: {e}")))?;
-        if sub.old > sub.checkpoint.tree_size {
-            return Err(WitnessError::text(
-                400,
-                "old size is larger than the checkpoint's size",
-            ));
-        }
-        let decided = store.internal_append(&record_run_id(origin), |journal| {
-            let (size, root) = last_cosigned(journal);
-            if sub.old != size {
-                return Err(ApiError::new(409, "witness_size", size.to_string()));
+        let sub = self.core.check(name, body)?;
+        // What decide refused with nothing to record (a conflict, or a
+        // failure to sign): nothing is appended, and the refusal is
+        // answered.
+        let unrecorded: Cell<Option<AddCheckpointError>> = Cell::new(None);
+        let decided = store.internal_append(&record_run_id(name), |journal| {
+            let latest = last_cosigned(journal, &sub.origin.origin);
+            let now = timefmt::now_unix_secs().max(0) as u64;
+            match self.core.decide(&sub, latest, now) {
+                Ok(record) => {
+                    let data = json!({
+                        "origin": record.origin,
+                        "old_size": record.old_size,
+                        "tree_size": record.tree_size,
+                        "root": hex_encode(&record.root),
+                        "timestamp": record.timestamp,
+                    })
+                    .to_string();
+                    let payload = vec![Value::from(record.cosigned_note())];
+                    Ok((
+                        COSIGN_KIND.to_string(),
+                        data,
+                        payload,
+                        Ok(record.cosignature),
+                    ))
+                }
+                Err(refused) => match refused.reject {
+                    Some(reject) => {
+                        let data = json!({
+                            "origin": reject.origin,
+                            "old_size": reject.old_size,
+                            "tree_size": reject.tree_size,
+                            "root": hex_encode(&reject.root),
+                            "reason": reject.reason,
+                        })
+                        .to_string();
+                        let payload = vec![Value::from(reject.checkpoint)];
+                        Ok((REJECT_KIND.to_string(), data, payload, Err(refused.error)))
+                    }
+                    None => {
+                        unrecorded.set(Some(refused.error));
+                        Err(ApiError::bad_request("refused"))
+                    }
+                },
             }
-            if !merkle::verify_consistency(
-                size,
-                sub.checkpoint.tree_size,
-                &root,
-                &sub.checkpoint.root,
-                &sub.proof,
-            ) {
-                return Err(ApiError::new(
-                    422,
-                    "witness_proof",
-                    "the consistency proof does not verify",
-                ));
-            }
-            let line = self.cosign(&sub.note.body).map_err(ApiError::bad_request)?;
-            let data = json!({
-                "origin": origin,
-                "old_size": sub.old,
-                "tree_size": sub.checkpoint.tree_size,
-                "root": pragmatic::encoding::base64_encode(&sub.checkpoint.root),
-                "timestamp": line.1,
-            })
-            .to_string();
-            let record = format!("{}{}\n", sub.note_text, line.0);
-            Ok((
-                COSIGN_KIND.to_string(),
-                data,
-                vec![Value::from(record)],
-                line.0,
-            ))
         });
         match decided {
-            Ok((line, _)) => Ok(format!("{line}\n")),
-            Err(e) if e.code == "witness_size" => Err(WitnessError {
-                status: 409,
-                content_type: "text/x.tlog.size",
-                body: format!("{}\n", e.message),
-            }),
-            Err(e) if e.code == "witness_proof" => {
-                self.record_reject(store, origin, &sub, &e.message);
-                Err(WitnessError::text(422, e.message))
-            }
-            Err(e) => Err(WitnessError::text(e.status, e.message)),
+            Ok((Ok(line), _)) => Ok(format!("{line}\n")),
+            Ok((Err(refusal), _)) => Err(refusal.into()),
+            Err(e) => match unrecorded.take() {
+                Some(refusal) => Err(refusal.into()),
+                // The record could not be read or written: nothing was
+                // cosigned.
+                None => Err(AddCheckpointError::Unavailable(e.message).into()),
+            },
         }
     }
 
-    /// Record a fork attempt: a checkpoint the log signed that does not
-    /// extend what this witness cosigned. Best effort: the refusal stands
-    /// whether or not the record could be written, and a record that
-    /// cannot be written refuses every later cosignature too.
-    fn record_reject(&self, store: &Store, origin: &str, sub: &Submission, reason: &str) {
-        let data = json!({
-            "origin": origin,
-            "old_size": sub.old,
-            "tree_size": sub.checkpoint.tree_size,
-            "root": pragmatic::encoding::base64_encode(&sub.checkpoint.root),
-            "reason": reason,
-        })
-        .to_string();
-        let note_text = sub.note_text.clone();
-        let _ = store.internal_append(&record_run_id(origin), |_| {
-            Ok((
-                REJECT_KIND.to_string(),
-                data,
-                vec![Value::from(note_text)],
-                (),
-            ))
-        });
-    }
-
-    /// A `cosignature/v1` line for a checkpoint body, and its timestamp.
-    fn cosign(&self, body: &str) -> Result<(String, u64), String> {
-        let ts = timefmt::now_unix_secs().max(0) as u64;
-        let sig = self
-            .key
-            .sign(note::cosignature_v1_message(ts, body).as_bytes());
-        let mut signature = ts.to_be_bytes().to_vec();
-        signature.extend_from_slice(&sig);
-        let line = NoteSignature {
-            name: self.name.clone(),
-            key_id: note::key_id(
-                &self.name,
-                SignatureType::CosignatureV1,
-                &self.key.public_key(),
-            ),
-            signature,
-        }
-        .to_line()
-        .map_err(|e| e.to_string())?;
-        Ok((line, ts))
-    }
-
-    /// The cosigned history of an origin after cursor `after`: at most
-    /// [`LOG_PAGE`] entries of the record, read from disk, and the cursor
-    /// to continue after when more follow.
+    /// The cosigned history of the origin entry `name` after cursor
+    /// `after`: at most [`LOG_PAGE`] entries of the record, read from disk,
+    /// and the cursor to continue after when more follow. Each record's
+    /// `checkpoint` is the cosigned note, which verifies with this
+    /// witness's vkey; the `checkpoint`s of every page, in order, are the
+    /// `checkpoints` of a `--witness-log` file (design 5.3).
     pub fn log(
         &self,
         store: &Store,
-        origin: &str,
+        name: &str,
         after: Option<u64>,
-    ) -> Result<(Vec<JsonValue>, Option<u64>), ApiError> {
-        if !self.origins.contains_key(origin) {
+    ) -> Result<JsonValue, ApiError> {
+        let Some(entry) = self.core.origin(name) else {
             return Err(ApiError::not_found());
-        }
+        };
         let from = after.map_or(0, |a| a.saturating_add(1));
-        let page = match store.entries_page(&record_run_id(origin), from, LOG_PAGE) {
-            Ok(p) => p,
-            Err(e) if e.code == "not_found" => return Ok((Vec::new(), None)),
+        let page = match store.entries_page(&record_run_id(name), from, LOG_PAGE) {
+            Ok(p) => Some(p),
+            Err(e) if e.code == "not_found" => None,
             Err(e) => return Err(e),
         };
-        let mut out = Vec::new();
-        for read in &page.entries {
-            let e = &read.entry;
-            let Event::Note {
-                kind,
-                data,
-                payload,
-            } = &e.event
-            else {
-                continue;
-            };
-            if kind != COSIGN_KIND {
-                continue;
+        let mut cosigned = Vec::new();
+        let mut next = None;
+        if let Some(page) = page {
+            for read in &page.entries {
+                let e = &read.entry;
+                let Event::Note { kind, data, .. } = &e.event else {
+                    continue;
+                };
+                if kind != COSIGN_KIND {
+                    continue;
+                }
+                let mut doc: JsonValue = serde_json::from_str(data).unwrap_or(JsonValue::Null);
+                doc["cursor"] = e.cursor.into();
+                doc["at"] = timefmt::rfc3339_ns(e.at).into();
+                doc["checkpoint"] = read
+                    .contents()
+                    .first()
+                    .and_then(|c| c.value())
+                    .map_or(JsonValue::Null, |v| v.as_str().into_owned().into());
+                cosigned.push(doc);
             }
-            let mut doc: JsonValue = serde_json::from_str(data).unwrap_or(JsonValue::Null);
-            doc["cursor"] = e.cursor.into();
-            doc["at"] = timefmt::rfc3339_ns(e.at).into();
-            doc["checkpoint"] = payload
-                .first()
-                .and_then(|c| c.value())
-                .map_or(JsonValue::Null, |v| v.as_str().into_owned().into());
-            out.push(doc);
+            next = page.next.map(|n| n - 1);
         }
-        let next = page.next.map(|n| n - 1);
-        Ok((out, next))
+        Ok(json!({
+            "origin": name,
+            "origin_line": entry.origin,
+            "witness": self.name(),
+            "cosigned": cosigned,
+            "next": next,
+        }))
     }
 }
 
@@ -368,13 +298,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bodies_are_parsed_strictly() {
-        assert_eq!(parse_body(b"old 01\n\nx").err().unwrap().status, 400);
-        assert_eq!(parse_body(b"new 1\n\nx").err().unwrap().status, 400);
-        assert_eq!(
-            parse_body(b"old 1\nnot-base64\n\nx").err().unwrap().status,
-            400
-        );
-        assert_eq!(parse_body(b"old 1").err().unwrap().status, 400);
+    fn the_last_cosigned_size_is_read_from_the_record() {
+        let mut j = pragmatic::Journal::new(None);
+        assert_eq!(last_cosigned(&j, "pragmatic/acme/00"), None);
+        for (origin, size) in [("pragmatic/acme/00", 3u64), ("pragmatic/other/00", 9)] {
+            j.append(
+                pragmatic::journal::META,
+                Event::Note {
+                    kind: COSIGN_KIND.into(),
+                    data: json!({
+                        "origin": origin, "old_size": 0, "tree_size": size,
+                        "root": hex_encode(&[size as u8; 32]), "timestamp": 1,
+                    })
+                    .to_string(),
+                    payload: vec![],
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(last_cosigned(&j, "pragmatic/acme/00"), Some((3, [3; 32])));
+        assert_eq!(last_cosigned(&j, "pragmatic/other/00"), Some((9, [9; 32])));
     }
 }

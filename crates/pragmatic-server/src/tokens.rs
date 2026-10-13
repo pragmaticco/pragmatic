@@ -686,8 +686,9 @@ mod tests {
         c.witness_mode.enabled = true;
         c.witness_mode.origins.push(WitnessOrigin {
             name: "example.com/log".into(),
+            origin: "example.com/log".into(),
+            log_vkeys: Vec::new(),
             token_sha256: token_sha256("prag_w"),
-            public_key: String::new(),
         });
         let s = TokenStore::open(&d, &c).unwrap();
         let p = s.authenticate("prag_w", 0).unwrap();

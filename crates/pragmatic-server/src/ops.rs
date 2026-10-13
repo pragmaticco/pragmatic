@@ -455,7 +455,9 @@ pub fn verify_backup(dir: &Path, trusted: &[[u8; 32]]) -> Result<Manifest, Strin
     let public: [u8; 32] =
         hex_decode_exact(&sig.public_key).map_err(|_| "bad manifest public key")?;
     let value: [u8; 64] = hex_decode_exact(&sig.value).map_err(|_| "bad manifest signature")?;
-    if keys::key_id(&public) != sig.key_id || !keys::verify(&public, &signed_digest(&m)?, &value) {
+    // The key id is a 4-byte hint; the signature and the public key, which
+    // must be trusted from outside the backup, are what count.
+    if !keys::verify(&public, &signed_digest(&m)?, &value) {
         return Err("the manifest signature does not verify".into());
     }
     if !trusted.contains(&public) {
@@ -748,31 +750,91 @@ pub fn migrate(config: &Config) -> Result<String, String> {
     }
 }
 
-/// `keygen`: write a new signing key. With `rotate`, replace the current
-/// key: the old key's window closes, a `key.rotate` record signed by both
-/// keys goes into the access log, the old key file is kept beside the new
-/// one with a `.retired-<unix>` suffix. Rotation needs the server stopped.
-pub fn keygen(config: &Config, rotate: bool) -> Result<String, String> {
-    let path = config.keys.signing_key_file.as_path();
-    let new = ServerKey::generate().map_err(|e| e.to_string())?;
-    if !rotate {
-        if path.exists() {
-            return Err(format!(
-                "{} exists; use --rotate to replace it",
-                path.display()
-            ));
+/// What `keygen` writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeygenKind {
+    /// The log key (`[keys] signing_key_file`): the first key of a new log,
+    /// whose name fixes the origin `pragmatic/<name>/<log id>`.
+    Log,
+    /// A new log key replacing the current one (server stopped).
+    Rotate,
+    /// The witness-mode key (`[witness_mode] key_file`), named
+    /// `[witness_mode] name`.
+    Witness,
+    /// The anchor key for HMAC run ids (`[keys] anchor_key_file`).
+    AnchorKey,
+}
+
+/// `keygen`: write a new key, never over an existing file.
+///
+/// The first log key is made with [`ServerKey::generate`], which derives
+/// the log's origin from the server name and the key itself (design 4.7).
+/// With `--rotate`, the current key is replaced: a new key for the same
+/// origin is staged, the old key's window closes in the key ring, a
+/// `key.rotate` record signed by both keys goes into the access log, and
+/// the old key file is kept beside the new one with a `.retired-<unix>`
+/// suffix (restore trusts it). Rotation needs the server stopped.
+pub fn keygen(config: &Config, kind: KeygenKind) -> Result<String, String> {
+    match kind {
+        KeygenKind::Log => {
+            let path = config.keys.signing_key_file.as_path();
+            if path.exists() {
+                return Err(format!(
+                    "{} exists; use --rotate to replace it",
+                    path.display()
+                ));
+            }
+            let key = ServerKey::generate(&config.server_name())?;
+            key.write_new(path)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            Ok(describe(&key, path))
         }
-        new.write_new(path)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        return Ok(describe(&new, path));
+        KeygenKind::Rotate => rotate_key(config),
+        KeygenKind::Witness => {
+            let w = &config.witness_mode;
+            if w.key_file.as_os_str().is_empty() || w.name.is_empty() {
+                return Err("set [witness_mode] name and key_file first".into());
+            }
+            let cosigner =
+                pragmatic_anchor::Cosigner::generate(&w.name).map_err(|e| e.to_string())?;
+            keys::write_secret(
+                &w.key_file,
+                format!("{}\n", cosigner.encode_skey()).as_bytes(),
+            )
+            .map_err(|e| format!("{}: {e}", w.key_file.display()))?;
+            Ok(format!(
+                "wrote {}\nwitness vkey {}\n",
+                w.key_file.display(),
+                cosigner.verifier_key().encode()
+            ))
+        }
+        KeygenKind::AnchorKey => {
+            let path = &config.keys.anchor_key_file;
+            if path.as_os_str().is_empty() {
+                return Err("set [keys] anchor_key_file first".into());
+            }
+            let mut key = [0u8; 32];
+            pragmatic::rand::fill(&mut key).map_err(|e| e.to_string())?;
+            keys::write_secret(path, &key).map_err(|e| format!("{}: {e}", path.display()))?;
+            Ok(format!(
+                "wrote {} (32 random bytes; keep it secret and back it up off the host: \
+                 without it, HMAC run ids cannot be matched to runs)\n",
+                path.display()
+            ))
+        }
     }
+}
+
+fn rotate_key(config: &Config) -> Result<String, String> {
+    let path = config.keys.signing_key_file.as_path();
     let old = ServerKey::load(path).map_err(|e| e.to_string())?;
+    let new = ServerKey::generate_for_origin(old.origin())?;
     let layout = Layout::new(config.data_dir.clone());
     let _lock = lock_data_dir(&layout).map_err(|e| e.0)?;
     let staged = path.with_extension(format!("new-{}", timefmt::now_unix_secs()));
     new.write_new(&staged)
         .map_err(|e| format!("{}: {e}", staged.display()))?;
-    let record = keys::rotate(&layout.data_dir, &old, &new).map_err(|e| e.to_string())?;
+    let record = keys::rotate(&layout.data_dir, &old, &new)?;
     let access = AccessLog::open(&access_log::path(&layout.data_dir)).map_err(|e| e.to_string())?;
     access
         .durable_blocking(AccessRecord::new("key.rotate", record))
@@ -792,10 +854,12 @@ pub fn keygen(config: &Config, rotate: bool) -> Result<String, String> {
 
 fn describe(key: &ServerKey, path: &Path) -> String {
     format!(
-        "wrote {}\nkey_id {}\npublic_key {}\n",
+        "wrote {}\norigin {}\nkey_id {}\npublic_key {}\nvkey {}\n",
         path.display(),
+        key.origin(),
         key.key_id(),
-        hex_encode(&key.public_key())
+        hex_encode(&key.public_key()),
+        key.vkey()
     )
 }
 

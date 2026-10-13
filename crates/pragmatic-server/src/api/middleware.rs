@@ -178,7 +178,7 @@ fn needs_index(route: &str) -> bool {
 }
 
 enum Auth {
-    Ok(Principal),
+    Ok(Principal, Option<String>),
     /// No credential needed (the console's sign-in and sign-out).
     Anonymous,
     Failed {
@@ -202,7 +202,7 @@ fn bearer_auth(app: &App, headers: &HeaderMap) -> Auth {
         };
     };
     match app.tokens.authenticate(token, timefmt::now_unix_secs()) {
-        Ok(p) => Auth::Ok(p),
+        Ok(p) => Auth::Ok(p, None),
         Err(f) => Auth::Failed {
             fingerprint: Some(f.fingerprint),
             reason: f.reason,
@@ -225,13 +225,17 @@ fn console_auth(app: &App, headers: &HeaderMap, route: &str) -> Auth {
             reason: "not signed in",
         };
     };
-    let principal = app
-        .sessions
-        .get(value)
-        .and_then(|id| app.tokens.principal_by_id(&id, timefmt::now_unix_secs()));
+    let session = app.sessions.session(value);
+    let principal = session.as_ref().and_then(|s| {
+        app.tokens
+            .principal_by_id(&s.token_id, timefmt::now_unix_secs())
+    });
     match principal {
-        Some(p) => Auth::Ok(p),
-        None => Auth::Failed {
+        // A witness client's token never opens a console session.
+        Some(p) if p.role != crate::tokens::Role::WitnessClient => {
+            Auth::Ok(p, session.map(|s| s.csrf))
+        }
+        _ => Auth::Failed {
             fingerprint: Some(fingerprint(value.as_bytes())),
             reason: "the session expired or its token was revoked",
         },
@@ -282,7 +286,7 @@ pub async fn access(State(app): State<AppState>, mut req: Request, next: Next) -
             };
             (resp, None, fingerprint)
         }
-        Auth::Anonymous | Auth::Ok(_) if app.access.is_failed() => {
+        Auth::Anonymous | Auth::Ok(..) if app.access.is_failed() => {
             let why = app.access.failure().unwrap_or_default();
             return ApiError::storage_unavailable(format!(
                 "the access log cannot be written ({why}); requests are refused until it can"
@@ -290,12 +294,13 @@ pub async fn access(State(app): State<AppState>, mut req: Request, next: Next) -
             .into_response();
         }
         Auth::Anonymous => (next.run(req).await, None, None),
-        Auth::Ok(p) => {
+        Auth::Ok(p, csrf) => {
             if needs_index(&cx.route) && !app.is_ready() {
                 (ApiError::starting().into_response(), Some(p), None)
             } else {
                 req.extensions_mut().insert(Caller {
                     principal: p.clone(),
+                    csrf,
                 });
                 (next.run(req).await, Some(p), None)
             }
@@ -402,7 +407,7 @@ pub async fn fallback(State(app): State<AppState>, req: Request) -> Response {
     }
     let cx = Context::of(&app, &req, "<unknown>".into());
     let (resp, principal, fp) = match bearer_auth(&app, req.headers()) {
-        Auth::Ok(p) => {
+        Auth::Ok(p, _) => {
             if app.access.is_failed() {
                 return ApiError::storage_unavailable("the access log cannot be written")
                     .into_response();

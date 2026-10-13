@@ -326,7 +326,7 @@ async fn a_second_server_on_the_same_data_exits() {
 async fn startup_rules_are_enforced() {
     let dir = Arc::new(TempDir::new("rules"));
     let base = test_config(dir.path());
-    pragmatic_server::keys::ServerKey::generate()
+    pragmatic_server::keys::ServerKey::generate(&base.server_name())
         .unwrap()
         .write_new(&base.keys.signing_key_file)
         .unwrap();

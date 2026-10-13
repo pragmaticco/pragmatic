@@ -6,7 +6,7 @@ mod common;
 use common::*;
 use pragmatic::encoding::base64_encode;
 use pragmatic::merkle;
-use pragmatic::note::{self, Checkpoint, Note, NoteSignature, SignatureType, VerifierKey};
+use pragmatic::note::{self, Checkpoint, Note, NoteSignature, SignatureType};
 use pragmatic::sha256::Digest;
 use pragmatic_server::config::WitnessOrigin;
 use pragmatic_server::keys::ServerKey;
@@ -15,6 +15,7 @@ use reqwest::{Method, StatusCode};
 use serde_json::Value;
 
 const ORIGIN: &str = "example.com/log";
+const NAME: &str = "example-log";
 const CLIENT: &str = "prag_witness_client_token";
 
 fn leaves(prefix: &str, n: usize) -> Vec<Digest> {
@@ -74,17 +75,17 @@ async fn submit(ts: &TestServer, path: &str, text: String) -> (StatusCode, Strin
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn checkpoints_are_cosigned_consistently_and_forks_refused() {
-    let log = ServerKey::generate().unwrap();
-    let vkey = VerifierKey::new(ORIGIN, SignatureType::Ed25519, log.public_key())
-        .unwrap()
-        .encode();
+    let log = ServerKey::generate_for_origin(ORIGIN).unwrap();
     let ts = TestServer::start(|c| {
-        c.witness_mode.enabled = true;
-        c.witness_mode.origins.push(WitnessOrigin {
-            name: ORIGIN.into(),
-            token_sha256: token_sha256(CLIENT),
-            public_key: vkey,
-        });
+        enable_witness_mode(
+            c,
+            vec![WitnessOrigin {
+                name: NAME.into(),
+                origin: ORIGIN.into(),
+                log_vkeys: vec![log.vkey()],
+                token_sha256: token_sha256(CLIENT),
+            }],
+        );
     })
     .await;
     let tree = leaves("leaf-", 5);
@@ -94,10 +95,10 @@ async fn checkpoints_are_cosigned_consistently_and_forks_refused() {
     let (status, ctype, line) = submit(&ts, "/add-checkpoint", body(0, &[], &cp3)).await;
     assert_eq!(status, StatusCode::OK, "{line}");
     assert!(ctype.starts_with("text/plain"));
-    // The cosignature verifies against the server key as a cosigner.
-    let server_key = ts.app().key.public_key();
-    let witness =
-        VerifierKey::new("test.example", SignatureType::CosignatureV1, server_key).unwrap();
+    // The cosignature verifies with the witness key, never the log key.
+    let witness = witness_cosigner().verifier_key();
+    assert_eq!(ts.app().witness.as_ref().unwrap().vkey(), witness.encode());
+    assert_ne!(witness.public_key(), &ts.app().key.public_key());
     let mut note = Note::parse(&cp3).unwrap();
     note.signatures
         .push(NoteSignature::parse_line(line.trim_end()).unwrap());
@@ -124,7 +125,7 @@ async fn checkpoints_are_cosigned_consistently_and_forks_refused() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
     // A checkpoint not signed by the log's key.
-    let impostor = ServerKey::generate().unwrap();
+    let impostor = ServerKey::generate_for_origin(ORIGIN).unwrap();
     let bad = signed(&impostor, ORIGIN, &tree);
     let (status, _, _) = submit(&ts, "/add-checkpoint", body(5, &[], &bad)).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -142,7 +143,7 @@ async fn checkpoints_are_cosigned_consistently_and_forks_refused() {
 
     // The witness's own record: two cosigned checkpoints.
     let v: Value = ts
-        .get("/v1/witness/log/example.com%2Flog", &ts.admin)
+        .get("/v1/witness/log/example-log", &ts.admin)
         .await
         .json()
         .await
@@ -151,21 +152,34 @@ async fn checkpoints_are_cosigned_consistently_and_forks_refused() {
     assert_eq!(cosigned.len(), 2);
     assert_eq!(cosigned[1]["tree_size"], 5);
     assert_eq!(cosigned[1]["old_size"], 3);
-    assert!(cosigned[1]["checkpoint"]
-        .as_str()
-        .unwrap()
-        .contains("\u{2014} test.example "));
+    assert_eq!(v["witness"], WITNESS_NAME);
+    assert_eq!(v["origin_line"], ORIGIN);
+    assert_eq!(v["next"], Value::Null);
+    // Each record's checkpoint is the cosigned note: it verifies with the
+    // witness's vkey, so the pages assemble into a --witness-log file.
+    for c in cosigned {
+        let note = Note::parse(c["checkpoint"].as_str().unwrap()).unwrap();
+        let verified = note::verify_note(&note, std::slice::from_ref(&witness)).unwrap();
+        assert!(verified[0].timestamp.is_some());
+    }
+    let file = serde_json::json!({
+        "witness": v["witness"],
+        "origin": v["origin_line"],
+        "checkpoints": cosigned.iter().map(|c| c["checkpoint"].clone()).collect::<Vec<_>>(),
+    });
+    let history = pragmatic::evidence::WitnessLog::from_json(file.to_string().as_bytes()).unwrap();
+    assert_eq!(history.checkpoints.len(), 2);
     // The record is a server-written run that clients cannot write to.
     let (agent, _) = ts.issue("agent", &["*"], false).await;
     let resp = ts
         .post_json(
-            &run_path("pragmatic:witness:example.com/log", "/lease"),
+            &run_path("pragmatic:witness:example-log", "/lease"),
             &agent,
             serde_json::json!({"holder": "h"}),
         )
         .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let j = stored(&ts, "pragmatic:witness:example.com/log");
+    let j = stored(&ts, "pragmatic:witness:example-log");
     assert!(j.audit().is_ok());
     // The fork attempt is on record as well, with the checkpoint the log
     // signed: the refusal is evidence against the log.
@@ -182,9 +196,10 @@ async fn checkpoints_are_cosigned_consistently_and_forks_refused() {
     assert_eq!(rejects.len(), 1, "{rejects:?}");
     assert_eq!(rejects[0]["tree_size"], 6);
     assert_eq!(rejects[0]["old_size"], 5);
+    assert_eq!(rejects[0]["origin"], ORIGIN);
     assert_eq!(
         j.run_start_id().as_deref(),
-        Some("pragmatic:witness:example.com/log")
+        Some("pragmatic:witness:example-log")
     );
     // And it survives a restart: the next checkpoint still needs old 5.
     let ts = ts.restart().await;

@@ -46,6 +46,11 @@
 //! checkpoint (a fork attempt) are recorded as `witness.reject` notes.
 //! [`WitnessService::log`] serves the cosigned history
 //! (`GET /v1/witness/log/{origin}`).
+//!
+//! The checks and the cosigning key live in [`WitnessCore`], apart from
+//! the journal, so a store that keeps the record elsewhere runs exactly
+//! the same protocol: Pragmatic Server keeps one record per origin in its
+//! run store, under that run's lock (design 4.8).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -547,7 +552,9 @@ pub struct CosignedRecord {
 }
 
 impl CosignedRecord {
-    fn note_data(&self) -> Json {
+    /// The note data the anchoring library's own witness journal stores
+    /// for this record (every field, the checkpoint and line included).
+    pub fn note_data(&self) -> Json {
         Json::Object(vec![
             ("origin".into(), self.origin.as_str().into()),
             ("old_size".into(), self.old_size.into()),
@@ -571,6 +578,19 @@ impl CosignedRecord {
             checkpoint: json_str(&doc, "checkpoint")?.to_string(),
             cosignature: json_str(&doc, "cosignature")?.to_string(),
         })
+    }
+
+    /// The cosigned checkpoint: the submitted signed note with this
+    /// witness's cosignature line added, verifiable with the witness's
+    /// vkey alone.
+    pub fn cosigned_note(&self) -> String {
+        let mut out = self.checkpoint.clone();
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&self.cosignature);
+        out.push('\n');
+        out
     }
 
     /// The record in a witness log response.
@@ -606,6 +626,192 @@ impl WitnessLogPage {
     }
 }
 
+/// A correctly signed checkpoint that does not extend what the witness
+/// cosigned for its origin: a fork attempt by the log. The refusal is
+/// evidence against the log, so it is recorded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejectRecord {
+    pub origin: String,
+    pub old_size: u64,
+    pub tree_size: u64,
+    pub root: Digest,
+    /// The signed checkpoint note as submitted.
+    pub checkpoint: String,
+    /// Why the consistency checks failed.
+    pub reason: String,
+}
+
+impl RejectRecord {
+    /// The note data the anchoring library's own witness journal stores.
+    pub fn note_data(&self) -> Json {
+        Json::Object(vec![
+            ("origin".into(), self.origin.as_str().into()),
+            ("old_size".into(), self.old_size.into()),
+            ("tree_size".into(), self.tree_size.into()),
+            ("root".into(), hex_encode(&self.root).into()),
+            ("checkpoint".into(), self.checkpoint.as_str().into()),
+            ("reason".into(), self.reason.as_str().into()),
+        ])
+    }
+}
+
+/// An `add-checkpoint` request that passed every check that needs no
+/// witness state: the body parses, the origin is configured and is the
+/// checkpoint's, the log's signature verifies and the old size does not
+/// exceed the new one.
+#[derive(Clone, Debug)]
+pub struct Submission {
+    /// The configuration entry the caller is bound to.
+    pub origin: WitnessOrigin,
+    pub request: AddCheckpointRequest,
+    pub checkpoint: Checkpoint,
+    /// The checkpoint body the log signed (what a cosignature covers).
+    pub body: String,
+}
+
+/// Why [`WitnessCore::decide`] refused a submission, and the fork
+/// attempt to record when there was one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refused {
+    pub error: AddCheckpointError,
+    /// Set when the refusal is evidence of a fork; record it before
+    /// answering.
+    pub reject: Option<Box<RejectRecord>>,
+}
+
+/// The protocol checks and the cosigning key of witness mode, apart from
+/// where the witness keeps its record.
+///
+/// The anchoring library's own [`WitnessService`] keeps every origin's
+/// record in one journal file; Pragmatic Server keeps one record per
+/// origin in its run store (design 4.8). Both run the same checks in the
+/// same order through this type:
+///
+/// 1. [`WitnessCore::check`], with no lock held: the body, the origin
+///    bound to the caller, the log's signature and the sizes;
+/// 2. [`WitnessCore::decide`], under the lock that guards the record,
+///    given the size and root last cosigned for the origin as the record
+///    says: the conflict check and the consistency proof, then the
+///    cosignature. The caller makes the returned record durable before it
+///    returns the cosignature line, so a crash can never make the witness
+///    forget a cosignature and sign a fork.
+#[derive(Debug)]
+pub struct WitnessCore {
+    cosigner: Cosigner,
+    origins: Vec<WitnessOrigin>,
+}
+
+impl WitnessCore {
+    /// A witness for `origins`. Fails if two entries share a
+    /// configuration name or an origin line (see [`WitnessService::open`]),
+    /// or an entry is unusable.
+    pub fn new(
+        cosigner: Cosigner,
+        origins: Vec<WitnessOrigin>,
+    ) -> Result<WitnessCore, AnchorError> {
+        check_origins(&origins)?;
+        Ok(WitnessCore { cosigner, origins })
+    }
+
+    pub fn cosigner(&self) -> &Cosigner {
+        &self.cosigner
+    }
+
+    pub fn origins(&self) -> &[WitnessOrigin] {
+        &self.origins
+    }
+
+    /// The configuration entry named `name`.
+    pub fn origin(&self, name: &str) -> Option<&WitnessOrigin> {
+        self.origins.iter().find(|o| o.name == name)
+    }
+
+    /// The checks that need no witness state, in the protocol's order: the
+    /// origin is configured (404), the body parses (400), the checkpoint
+    /// is for the origin bound to the caller (403) and signed by one of its
+    /// log keys (403), and its size is not below the old size (400).
+    pub fn check(&self, origin_name: &str, body: &[u8]) -> Result<Submission, AddCheckpointError> {
+        let origin = self
+            .origin(origin_name)
+            .ok_or(AddCheckpointError::UnknownOrigin)?;
+        let request = parse_add_checkpoint(body).map_err(AddCheckpointError::BadRequest)?;
+        let signed = Note::parse(&request.note)
+            .map_err(|e| AddCheckpointError::BadRequest(e.to_string()))?;
+        let checkpoint = Checkpoint::parse(&signed.body)
+            .map_err(|e| AddCheckpointError::BadRequest(e.to_string()))?;
+        if checkpoint.origin != origin.origin {
+            return Err(AddCheckpointError::Forbidden(
+                "the checkpoint's origin is not the origin bound to this token".into(),
+            ));
+        }
+        note::verify_note(&signed, &origin.log_keys)
+            .map_err(|e| AddCheckpointError::Forbidden(e.to_string()))?;
+        if request.old_size > checkpoint.tree_size {
+            return Err(AddCheckpointError::BadRequest(
+                "old size exceeds the checkpoint's size".into(),
+            ));
+        }
+        Ok(Submission {
+            origin: origin.clone(),
+            request,
+            checkpoint,
+            body: signed.body,
+        })
+    }
+
+    /// The checks that need the witness's state, given the size and root
+    /// it last cosigned for the submission's origin (`None` before the
+    /// first): the old size must be that size (409 with the current size),
+    /// and the checkpoint must extend that tree (422, a fork attempt to
+    /// record). On success, the cosigned record at `now_unix`; its
+    /// `cursor` is 0 until the caller stores it.
+    pub fn decide(
+        &self,
+        sub: &Submission,
+        latest: Option<(u64, Digest)>,
+        now_unix: u64,
+    ) -> Result<CosignedRecord, Refused> {
+        let (latest_size, latest_root) = latest.unwrap_or((0, merkle::empty_root()));
+        if sub.request.old_size != latest_size {
+            return Err(Refused {
+                error: AddCheckpointError::Conflict { size: latest_size },
+                reject: None,
+            });
+        }
+        if let Err(why) = check_consistency(&sub.request, &sub.checkpoint, &latest_root) {
+            return Err(Refused {
+                error: AddCheckpointError::Unprocessable(why.clone()),
+                reject: Some(Box::new(RejectRecord {
+                    origin: sub.origin.origin.clone(),
+                    old_size: sub.request.old_size,
+                    tree_size: sub.checkpoint.tree_size,
+                    root: sub.checkpoint.root,
+                    checkpoint: sub.request.note.clone(),
+                    reason: why,
+                })),
+            });
+        }
+        let line = self
+            .cosigner
+            .cosign(&sub.body, now_unix)
+            .to_line()
+            .map_err(|e| Refused {
+                error: AddCheckpointError::Unavailable(e.to_string()),
+                reject: None,
+            })?;
+        Ok(CosignedRecord {
+            cursor: 0,
+            origin: sub.origin.origin.clone(),
+            old_size: sub.request.old_size,
+            tree_size: sub.checkpoint.tree_size,
+            root: sub.checkpoint.root,
+            timestamp: now_unix,
+            checkpoint: sub.request.note.clone(),
+            cosignature: line,
+        })
+    }
+}
+
 struct WitnessState {
     journal: JournalFile,
     /// Latest cosigned (size, root) per origin line.
@@ -618,16 +824,15 @@ struct WitnessState {
 /// serialized on one lock, which also makes each origin's size check and
 /// journal append atomic.
 pub struct WitnessService {
-    cosigner: Cosigner,
-    origins: Vec<WitnessOrigin>,
+    core: WitnessCore,
     state: Mutex<WitnessState>,
 }
 
 impl std::fmt::Debug for WitnessService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WitnessService")
-            .field("cosigner", &self.cosigner)
-            .field("origins", &self.origins.len())
+            .field("cosigner", &self.core.cosigner)
+            .field("origins", &self.core.origins.len())
             .finish()
     }
 }
@@ -649,7 +854,7 @@ impl WitnessService {
         cosigner: Cosigner,
         origins: Vec<WitnessOrigin>,
     ) -> Result<WitnessService, AnchorError> {
-        check_origins(&origins)?;
+        let core = WitnessCore::new(cosigner, origins)?;
         let journal = JournalFile::open_or_create(journal_path, WITNESS_RUN_ID)?;
         let mut state = WitnessState {
             journal,
@@ -673,18 +878,23 @@ impl WitnessService {
             state.history.entry(r.origin).or_default().push(r.cursor);
         }
         Ok(WitnessService {
-            cosigner,
-            origins,
+            core,
             state: Mutex::new(state),
         })
     }
 
     pub fn cosigner(&self) -> &Cosigner {
-        &self.cosigner
+        self.core.cosigner()
+    }
+
+    /// The checks and the key, shared with stores that keep the record
+    /// elsewhere.
+    pub fn core(&self) -> &WitnessCore {
+        &self.core
     }
 
     fn origin(&self, name: &str) -> Option<&WitnessOrigin> {
-        self.origins.iter().find(|o| o.name == name)
+        self.core.origin(name)
     }
 
     /// Handle `POST /add-checkpoint` for the origin bound to the caller's
@@ -696,64 +906,21 @@ impl WitnessService {
         body: &[u8],
         now_unix: u64,
     ) -> Result<String, AddCheckpointError> {
-        let origin = self
-            .origin(origin_name)
-            .ok_or(AddCheckpointError::UnknownOrigin)?;
-        let req = parse_add_checkpoint(body).map_err(AddCheckpointError::BadRequest)?;
-        let signed =
-            Note::parse(&req.note).map_err(|e| AddCheckpointError::BadRequest(e.to_string()))?;
-        let checkpoint = Checkpoint::parse(&signed.body)
-            .map_err(|e| AddCheckpointError::BadRequest(e.to_string()))?;
-        if checkpoint.origin != origin.origin {
-            return Err(AddCheckpointError::Forbidden(
-                "the checkpoint's origin is not the origin bound to this token".into(),
-            ));
-        }
-        note::verify_note(&signed, &origin.log_keys)
-            .map_err(|e| AddCheckpointError::Forbidden(e.to_string()))?;
-        if req.old_size > checkpoint.tree_size {
-            return Err(AddCheckpointError::BadRequest(
-                "old size exceeds the checkpoint's size".into(),
-            ));
-        }
-
+        let sub = self.core.check(origin_name, body)?;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let (latest_size, latest_root) = state
-            .latest
-            .get(&origin.origin)
-            .copied()
-            .unwrap_or((0, merkle::empty_root()));
-        if req.old_size != latest_size {
-            return Err(AddCheckpointError::Conflict { size: latest_size });
-        }
-        if let Err(why) = check_consistency(&req, &checkpoint, &latest_root) {
-            // A correctly signed checkpoint that does not extend what was
-            // cosigned is evidence of a fork: record it.
-            let reject = Json::Object(vec![
-                ("origin".into(), origin.origin.as_str().into()),
-                ("old_size".into(), req.old_size.into()),
-                ("tree_size".into(), checkpoint.tree_size.into()),
-                ("root".into(), hex_encode(&checkpoint.root).into()),
-                ("checkpoint".into(), req.note.as_str().into()),
-                ("reason".into(), why.as_str().into()),
-            ]);
-            let _ = state.journal.append_note(REJECT_NOTE, &reject, Vec::new());
-            return Err(AddCheckpointError::Unprocessable(why));
-        }
-
-        let sig = self.cosigner.cosign(&signed.body, now_unix);
-        let line = sig
-            .to_line()
-            .map_err(|e| AddCheckpointError::Unavailable(e.to_string()))?;
-        let record = CosignedRecord {
-            cursor: 0,
-            origin: origin.origin.clone(),
-            old_size: req.old_size,
-            tree_size: checkpoint.tree_size,
-            root: checkpoint.root,
-            timestamp: now_unix,
-            checkpoint: req.note.clone(),
-            cosignature: line.clone(),
+        let latest = state.latest.get(&sub.origin.origin).copied();
+        let mut record = match self.core.decide(&sub, latest, now_unix) {
+            Ok(record) => record,
+            Err(refused) => {
+                // A correctly signed checkpoint that does not extend what
+                // was cosigned is evidence of a fork: record it.
+                if let Some(reject) = &refused.reject {
+                    let _ = state
+                        .journal
+                        .append_note(REJECT_NOTE, &reject.note_data(), Vec::new());
+                }
+                return Err(refused.error);
+            }
         };
         // Durable before the cosignature leaves: a witness that forgot a
         // cosignature after a crash could be talked into signing a fork.
@@ -761,16 +928,16 @@ impl WitnessService {
             .journal
             .append_note(COSIGN_NOTE, &record.note_data(), Vec::new())
             .map_err(|e| AddCheckpointError::Unavailable(e.to_string()))?;
-        state.latest.insert(
-            origin.origin.clone(),
-            (checkpoint.tree_size, checkpoint.root),
-        );
+        record.cursor = cursor;
+        state
+            .latest
+            .insert(record.origin.clone(), (record.tree_size, record.root));
         state
             .history
-            .entry(origin.origin.clone())
+            .entry(record.origin.clone())
             .or_default()
             .push(cursor);
-        Ok(format!("{line}\n"))
+        Ok(format!("{}\n", record.cosignature))
     }
 
     /// The latest checkpoint cosigned for the origin named `origin_name`.

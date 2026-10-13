@@ -26,7 +26,7 @@ use crate::holds::{Hold, Holds, NewHold};
 use crate::ledger::{LedgerKind, LedgerRecord};
 use crate::summary::subject_hash;
 use crate::timefmt;
-use crate::tokens::{IssueRequest, Role, TokenError};
+use crate::tokens::{IssueRequest, Principal, Role, TokenError, TokenView};
 use crate::webhooks::WebhookEvent;
 
 const ADMIN: &[Role] = &[Role::Admin];
@@ -46,8 +46,18 @@ pub async fn add_hold(
     let p = c.principal.clone();
     need(&p, ADMIN)?;
     let new: NewHold = parse_json(&read_body(&app, &headers, body, JSON_LIMIT).await?)?;
+    let hold = place_hold(&app, &p, new).await?;
+    Ok(json_response(StatusCode::CREATED, &json!(hold)))
+}
+
+/// Place a hold (shared by the API and the console): recorded durably in
+/// the access log and the erasure ledger before it acts.
+pub async fn place_hold(app: &AppState, p: &Principal, new: NewHold) -> Result<Hold, ApiError> {
+    need(p, ADMIN)?;
     new.check().map_err(ApiError::bad_request)?;
     let hold = Holds::prepare(new, &p.token_id)?;
+    let app = app.clone();
+    let p = p.clone();
     let cursor = durable_intent(
         &app,
         intent(
@@ -58,7 +68,7 @@ pub async fn add_hold(
         ),
     )
     .await?;
-    let hold = blocking(move || {
+    blocking(move || {
         let record = LedgerRecord::hold(LedgerKind::HoldAdd, hold.clone(), &p.token_id, cursor);
         let record = app.ledger.append(record)?;
         let hold = app.holds.insert(hold)?;
@@ -72,8 +82,7 @@ pub async fn add_hold(
         }
         Ok(hold)
     })
-    .await?;
-    Ok(json_response(StatusCode::CREATED, &json!(hold)))
+    .await
 }
 
 /// The `hold` webhook: the action, the hold's id and scope, and its ledger
@@ -93,21 +102,26 @@ pub async fn remove_hold(
     id: Result<Path<String>, PathRejection>,
 ) -> Result<Response, ApiError> {
     let id = path(id)?;
-    let p = c.principal.clone();
-    need(&p, ADMIN)?;
+    let removed = lift_hold(&app, &c.principal, id).await?;
+    Ok(ok(json!(removed)))
+}
+
+/// Remove a hold (shared by the API and the console).
+pub async fn lift_hold(app: &AppState, p: &Principal, id: String) -> Result<Hold, ApiError> {
+    need(p, ADMIN)?;
     let Some(hold) = app.holds.get(&id) else {
         return Err(ApiError::not_found());
     };
-    let cursor = durable_intent(&app, intent("hold.remove", &p, None, json!({"hold": id}))).await?;
-    let removed = blocking(move || {
+    let cursor = durable_intent(app, intent("hold.remove", p, None, json!({"hold": id}))).await?;
+    let (app, p) = (app.clone(), p.clone());
+    blocking(move || {
         let record = LedgerRecord::hold(LedgerKind::HoldRemove, hold, &p.token_id, cursor);
         let record = app.ledger.append(record)?;
         let removed = app.holds.remove(&id)?.ok_or_else(ApiError::not_found)?;
         hold_webhook(&app, "remove", &removed, record.seq);
         Ok(removed)
     })
-    .await?;
-    Ok(ok(json!(removed)))
+    .await
 }
 
 /// `GET /v1/holds`.
@@ -148,11 +162,15 @@ pub async fn retention(
     State(app): State<AppState>,
     Extension(c): Extension<Caller>,
 ) -> Result<Response, ApiError> {
-    let p = c.principal.clone();
-    need(&p, ADMIN)?;
-    durable_intent(&app, intent("retention.run", &p, None, json!({}))).await?;
-    let report = blocking(move || Ok(crate::retention::run(&app))).await?;
-    Ok(ok(report))
+    Ok(ok(run_retention(&app, &c.principal).await?))
+}
+
+/// Run retention now (shared by the API and the console), recorded first.
+pub async fn run_retention(app: &AppState, p: &Principal) -> Result<JsonValue, ApiError> {
+    need(p, ADMIN)?;
+    durable_intent(app, intent("retention.run", p, None, json!({}))).await?;
+    let app = app.clone();
+    blocking(move || Ok(crate::retention::run(&app))).await
 }
 
 /// `POST /v1/verify-data`: verify everything now (also what the
@@ -255,9 +273,23 @@ pub async fn issue_token(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
-    let p = c.principal.clone();
-    need(&p, ADMIN)?;
+    need(&c.principal, ADMIN)?;
     let req: IssueRequest = parse_json(&read_body(&app, &headers, body, JSON_LIMIT).await?)?;
+    let (value, view) = issue(&app, &c.principal, req).await?;
+    Ok(json_response(
+        StatusCode::CREATED,
+        &json!({ "token": value, "record": view }),
+    ))
+}
+
+/// Issue a token (shared by the API and the console). Returns its value,
+/// to be shown once, and its record.
+pub async fn issue(
+    app: &AppState,
+    p: &Principal,
+    req: IssueRequest,
+) -> Result<(String, TokenView), ApiError> {
+    need(p, ADMIN)?;
     let (value, record) = app
         .tokens
         .prepare(req, &p.token_id, timefmt::now_unix_secs())
@@ -266,7 +298,7 @@ pub async fn issue_token(
     // token is never lost with the records queued after it.
     let mut rec = intent(
         "token.issue",
-        &p,
+        p,
         None,
         json!({"issued": record.id, "issued_role": record.role.as_str(),
                "scopes": record.scopes, "view_raw": record.view_raw}),
@@ -275,14 +307,11 @@ pub async fn issue_token(
         .insert("token_name".into(), record.name.clone().into());
     rec.personal
         .insert("token_principal".into(), record.principal.clone().into());
-    durable_intent(&app, rec).await?;
+    durable_intent(app, rec).await?;
     let a = app.clone();
     let view = blocking(move || a.tokens.add(record).map_err(token_error)).await?;
     app.metrics.token_issued();
-    Ok(json_response(
-        StatusCode::CREATED,
-        &json!({ "token": value, "record": view }),
-    ))
+    Ok((value, view))
 }
 
 fn token_error(e: TokenError) -> ApiError {
@@ -300,13 +329,14 @@ pub async fn revoke_token(
     id: Result<Path<String>, PathRejection>,
 ) -> Result<Response, ApiError> {
     let id = path(id)?;
-    let p = c.principal.clone();
-    need(&p, ADMIN)?;
-    durable_intent(
-        &app,
-        intent("token.revoke", &p, None, json!({"revoked": id})),
-    )
-    .await?;
+    let view = revoke(&app, &c.principal, id).await?;
+    Ok(ok(json!(view)))
+}
+
+/// Revoke a token (shared by the API and the console), recorded first.
+pub async fn revoke(app: &AppState, p: &Principal, id: String) -> Result<TokenView, ApiError> {
+    need(p, ADMIN)?;
+    durable_intent(app, intent("token.revoke", p, None, json!({"revoked": id}))).await?;
     let a = app.clone();
     let view = blocking(move || {
         a.tokens
@@ -315,7 +345,7 @@ pub async fn revoke_token(
     })
     .await?;
     app.metrics.token_revoked();
-    Ok(ok(json!(view)))
+    Ok(view)
 }
 
 /// `GET /v1/tokens`.

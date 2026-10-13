@@ -15,7 +15,7 @@ use std::task::{Context, Poll};
 use axum::body::{Body, Bytes};
 use tokio::sync::mpsc;
 
-use crate::store::DurableFile;
+use crate::store::{BudgetGuard, DurableFile};
 
 /// Bytes read per chunk.
 const CHUNK: u64 = 1 << 20;
@@ -51,6 +51,26 @@ pub fn file_body(durable: DurableFile) -> Body {
                 return;
             }
             offset += n;
+        }
+    });
+    Body::from_stream(Chunks(rx))
+}
+
+/// A body of bytes already in memory (an evidence bundle), sent in 1 MiB
+/// chunks. `room` is the share of the store's byte budget the bytes were
+/// built under; it is released when the body is dropped, sent or not.
+pub fn bytes_body(bytes: Vec<u8>, room: BudgetGuard) -> Body {
+    let (tx, rx) = mpsc::channel(AHEAD);
+    tokio::spawn(async move {
+        let _room = room;
+        let bytes = Bytes::from(bytes);
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let end = (offset + CHUNK as usize).min(bytes.len());
+            if tx.send(Ok(bytes.slice(offset..end))).await.is_err() {
+                return;
+            }
+            offset = end;
         }
     });
     Body::from_stream(Chunks(rx))

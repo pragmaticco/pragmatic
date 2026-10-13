@@ -23,7 +23,11 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Core is zero-dependency
         run: cargo tree -p pragmatic --no-default-features --edges normal | tail -n +2 | grep -q . && exit 1 || echo "core has no runtime deps"
-      - name: Test (debug)
+      - name: OpenSSL for the time-stamp tests
+        run: openssl version && openssl ts -help 2>&1 | grep -q -- -partial_chain
+      - name: Build every crate
+        run: cargo build --workspace --all-targets
+      - name: Test (debug), every crate
         run: cargo test --workspace
       - name: Test (release, headline numbers)
         run: cargo test --workspace --release -- --nocapture
@@ -64,13 +68,61 @@ jobs:
       - name: Build and install the package
         run: |
           python -m venv .venv
-          .venv/bin/pip install maturin pytest anthropic openai
+          .venv/bin/pip install maturin pytest anthropic openai httpx2
           cd crates/pragmatic-python
           VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv PATH=$GITHUB_WORKSPACE/.venv/bin:$PATH maturin develop
+      - name: Framework packages, where they install
+        # The framework tests skip any framework that is not installed, so
+        # one that does not install on this Python is reported, not fatal.
+        run: |
+          for pkg in openai-agents pydantic-ai langchain-anthropic langchain-openai langgraph; do
+            .venv/bin/pip install "$pkg" || echo "::warning::$pkg did not install on Python ${{ matrix.python }}; its tests skip"
+          done
       - name: Smoke test
         run: .venv/bin/python crates/pragmatic-python/tests/smoke.py
-      - name: SDK end-to-end tests (Anthropic + OpenAI clients, mock transport)
-        run: .venv/bin/python -m pytest crates/pragmatic-python/tests -q
+      - name: SDK tests (runtime, server store, HTTP layer, frameworks)
+        run: .venv/bin/python -m pytest crates/pragmatic-python/tests -q -rs
+      - name: Reference verifier and evidence attacks
+        run: |
+          cargo build -p pragmatic-cli
+          python -I tools/test_verify_evidence.py
+          python -I tools/test_evidence_attacks.py
+
+  no-network:
+    name: server and SDK tests with outbound network blocked
+    # Proves there is no telemetry and no hidden network dependency: the
+    # server, anchoring, console and SDK tests run in a network namespace
+    # whose only interface is loopback, after everything is built.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build everything while the network is open
+        run: |
+          cargo build --workspace --all-targets
+          cargo test --no-run -p pragmatic-server -p pragmatic-anchor -p pragmatic-console
+          python -m venv .venv
+          .venv/bin/pip install maturin pytest anthropic openai httpx2
+          cd crates/pragmatic-python
+          VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv PATH=$GITHUB_WORKSPACE/.venv/bin:$PATH maturin develop
+      - name: Allow network namespaces for the runner user
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Tests in a namespace with loopback only
+        run: |
+          unshare --map-root-user --net bash -euo pipefail -c '
+            ip link set lo up
+            if curl -sS --max-time 5 -o /dev/null https://example.com; then
+              echo "outbound network is reachable; refusing to run" >&2
+              exit 1
+            fi
+            cargo test --offline -p pragmatic-server -p pragmatic-anchor -p pragmatic-console
+            .venv/bin/python -m pytest crates/pragmatic-python/tests -q -rs
+            python -I tools/test_verify_evidence.py
+          '
 
   bindings:
     name: C++ / Java / Go / Node bindings smoke tests
@@ -142,4 +194,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p pragmatic --lib rand::
+      - run: cargo test -p pragmatic --lib "rand::"

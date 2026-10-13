@@ -44,6 +44,7 @@ use serde_json::{json, Value as JsonValue};
 use tokio::sync::watch;
 
 use crate::access_log::{self, AccessLeaf, AccessLog, AccessRecord};
+use crate::anchoring;
 use crate::config::Config;
 use crate::console::Sessions;
 use crate::holds::Holds;
@@ -80,6 +81,41 @@ impl Hooks {
             console: Arc::new(ConsoleStub),
         }
     }
+
+    /// The integrated components: anchoring with the anchoring library
+    /// over the configured witnesses, evidence bundles from the core
+    /// evidence module, and the console rendered with `pragmatic-console`.
+    /// Opens (and recovers) the anchor log, so it runs with the data
+    /// directory's lock held. Returns notes from the recovery to print.
+    pub fn integrated(
+        config: &Config,
+        key: &ServerKey,
+        ring: &[KeyEntry],
+        options: anchoring::Options,
+    ) -> Result<(Hooks, Vec<String>), String> {
+        let (anchoring, notes) = anchoring::LibraryAnchoring::open(config, key, ring, options)?;
+        Ok((
+            Hooks {
+                anchoring: Arc::new(anchoring),
+                evidence: Arc::new(crate::evidence::BundleBuilder),
+                console: Arc::new(crate::console_ui::ConsoleUi),
+            },
+            notes,
+        ))
+    }
+}
+
+/// Where a starting server gets its components: given (tests, and the
+/// stubs), or built once the data directory is locked (a real server).
+pub enum HooksSource {
+    Given(Hooks),
+    Integrated(anchoring::Options),
+}
+
+impl From<Hooks> for HooksSource {
+    fn from(h: Hooks) -> HooksSource {
+        HooksSource::Given(h)
+    }
 }
 
 /// What one client may hold of the server (see the module documentation).
@@ -113,6 +149,10 @@ impl Default for Limits {
         }
     }
 }
+
+/// How often witnesses that still owe results are retried between
+/// batches.
+pub const RETRY_TICK: Duration = Duration::from_secs(30);
 
 /// Request body bytes per permit of the body budget.
 pub const BODY_UNIT: u64 = 64 << 10;
@@ -177,6 +217,13 @@ impl App {
             anchor_lag_seconds: self.metrics.anchor_lag_seconds(),
             tokens_active: self.tokens.ids().len() as u64,
         }
+    }
+
+    /// Retry the witnesses that still owe results (blocking; never at the
+    /// same time as a batch).
+    pub fn anchor_retry(&self) {
+        let _one = self.anchor_lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.hooks.anchoring.retry(&Host { app: self });
     }
 
     /// Run one anchoring batch now (blocking; one batch at a time). Only
@@ -283,11 +330,37 @@ impl AnchorHost for Host<'_> {
     fn alert(&self, alert: AnchorAlert) {
         match alert {
             AnchorAlert::Failed { reason } => {
+                eprintln!("pragmatic-server: anchoring: {reason}");
                 self.app.metrics.anchor_failed();
                 self.app.webhooks.send(WebhookEvent::new(
                     "anchor_failed",
                     None,
                     json!({"reason": reason}),
+                ));
+            }
+            AnchorAlert::WitnessFailed { .. } => self.app.metrics.anchor_failed(),
+            AnchorAlert::Contradicted {
+                run_id: Some(run_id),
+                anchored_entries,
+                reason,
+            } => {
+                eprintln!("pragmatic-server: anchoring refused {run_id}: {reason}");
+                self.app
+                    .store
+                    .mark_contradicted(&run_id, anchored_entries, &reason);
+            }
+            AnchorAlert::Contradicted {
+                run_id: None,
+                reason,
+                ..
+            } => {
+                let why = format!("the access log contradicts its anchor: {reason}");
+                eprintln!("pragmatic-server: {why}");
+                self.app.metrics.chain_broken();
+                self.app.webhooks.send(WebhookEvent::new(
+                    "chain_broken",
+                    Some(access_log::ACCESS_LOG_RUN_ID),
+                    json!({"reason": why}),
                 ));
             }
         }
@@ -379,7 +452,7 @@ pub fn lock_data_dir(layout: &Layout) -> Result<File, StartError> {
 pub async fn start(
     config: Config,
     config_sha256: [u8; 32],
-    hooks: Hooks,
+    hooks: impl Into<HooksSource>,
 ) -> Result<ServerHandle, StartError> {
     start_with(config, config_sha256, hooks, Limits::default()).await
 }
@@ -388,9 +461,10 @@ pub async fn start(
 pub async fn start_with(
     config: Config,
     config_sha256: [u8; 32],
-    hooks: Hooks,
+    hooks: impl Into<HooksSource>,
     limits: Limits,
 ) -> Result<ServerHandle, StartError> {
+    let source = hooks.into();
     if let Err(e) = config.check_startup_rules() {
         return Err(StartError(e.0));
     }
@@ -407,8 +481,32 @@ pub async fn start_with(
             )))
         }
     };
+    // The origin is fixed by the first key (design 4.7). A configured name
+    // that disagrees with it is a mistake to stop at, not to paper over: a
+    // renamed server would otherwise sign checkpoints for an origin its
+    // configuration does not mention.
+    if !config.name.is_empty() && key.server_name() != Some(config.name.as_str()) {
+        return Err(StartError(format!(
+            "the signing key is for the origin {}, but name = {:?}: the origin is fixed by the \
+             log's first key. Set name = {:?}, or leave it empty",
+            key.origin(),
+            config.name,
+            key.server_name().unwrap_or("")
+        )));
+    }
     let key_ring =
         keys::ensure_current(&layout.data_dir, &key).or_else(|e| fail("keys.json", e))?;
+    let hooks = match source {
+        HooksSource::Given(h) => h,
+        HooksSource::Integrated(options) => {
+            let (hooks, notes) =
+                Hooks::integrated(&config, &key, &key_ring, options).map_err(StartError)?;
+            for n in notes {
+                eprintln!("pragmatic-server: {n}");
+            }
+            hooks
+        }
+    };
     let index_key = layout::index_key(&layout).or_else(|e| fail("index.key", e))?;
     let tokens = TokenStore::open(&layout.data_dir, &config).or_else(|e| fail("tokens.json", e))?;
     let holds = Holds::open(&layout.data_dir).or_else(|e| fail("holds.json", e))?;
@@ -446,9 +544,13 @@ pub async fn start_with(
             anchor_soon: anchor_soon.clone(),
         },
     ));
-    let server_name = config.server_name();
+    // The name the log's origin was made for, which may differ from the
+    // host name a container gets when `name` is left empty.
+    let server_name = key
+        .server_name()
+        .map_or_else(|| config.server_name(), str::to_string);
     let key = Arc::new(key);
-    let witness = Witness::from_config(&config, &server_name, key.clone())
+    let witness = Witness::from_config(&config)
         .map_err(StartError)?
         .map(Arc::new);
     let addr = config.listen_addr().map_err(|e| StartError(e.0))?;
@@ -513,6 +615,8 @@ async fn record_config_loaded(app: &App) -> Result<(), StartError> {
             "config_sha256": hex_encode(&app.config_sha256),
             "token_ids": app.tokens.ids(),
             "key_id": app.key.key_id(),
+            "public_key": hex_encode(&app.key.public_key()),
+            "origin": app.key.origin(),
             "server_version": env!("CARGO_PKG_VERSION"),
         }),
     );
@@ -741,6 +845,14 @@ fn spawn_background(app: Arc<App>, shutdown: watch::Receiver<bool>) {
     every(app.clone(), shutdown.clone(), interval, |app| {
         if app.is_ready() {
             let _ = app.anchor_batch(BatchReason::Interval);
+        }
+    });
+    // Witnesses that failed are retried between batches; each one backs
+    // off on its own schedule (30 s doubling to an hour), so a short tick
+    // asks nothing of a witness that is backing off.
+    every(app.clone(), shutdown.clone(), RETRY_TICK, |app| {
+        if app.is_ready() {
+            app.anchor_retry();
         }
     });
     // Within 30 s of an attempt ending ok: wait a few seconds to gather

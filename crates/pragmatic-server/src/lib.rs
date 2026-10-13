@@ -12,10 +12,13 @@
 //! Apache-2.0 four years after its release.
 
 pub mod access_log;
+pub mod anchoring;
 pub mod api;
 pub mod config;
 pub mod console;
+pub mod console_ui;
 pub mod error;
+pub mod evidence;
 pub mod fsutil;
 pub mod holds;
 pub mod hooks;

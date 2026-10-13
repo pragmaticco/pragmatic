@@ -565,6 +565,7 @@ pub(super) fn empty_meta(run_id: &str) -> Meta {
         created_by: None,
         regressed: false,
         unanchored_since: None,
+        regression_accepted: false,
         summary: Summary::default(),
     }
 }

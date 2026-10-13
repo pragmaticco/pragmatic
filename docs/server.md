@@ -13,7 +13,7 @@ Apache-2.0 four years after its release. The SDKs, the CLI and the journal
 format are Apache-2.0.
 
 Contents: [How it works](#how-it-works) ·
-[Not in this build](#not-in-this-build) ·
+[Anchoring and evidence](#anchoring-and-evidence) · [The console](#the-console) ·
 [Install](#install) · [First start](#first-start) ·
 [Configuration reference](#configuration-reference) ·
 [Tokens, roles and scopes](#tokens-roles-and-scopes) ·
@@ -38,8 +38,9 @@ Contents: [How it works](#how-it-works) ·
   itself a hash-chained journal.
 - **Anchoring** records the state of every run in a Merkle log whose
   checkpoints are timestamped by independent witnesses, so changes to
-  anchored history can be detected. Anchoring is not part of this build
-  yet: see [Not in this build](#not-in-this-build).
+  anchored history can be detected. **Evidence bundles** package a run's
+  journal with its anchors, signed by the server, for an auditor to verify
+  offline against trust roots of their own choosing.
 - **Erasure** removes the content of chosen slots while the chain still
   verifies. **Holds** stop erasure and retention for runs under legal hold.
   **Retention** policies shred or delete runs after a set time.
@@ -47,29 +48,64 @@ Contents: [How it works](#how-it-works) ·
 No component makes network connections except the server to the TSAs,
 witnesses and webhook URLs you configure. There is no telemetry.
 
-## Not in this build
+## Anchoring and evidence
 
-Three components plug into the server and are not integrated in this
-build. The server says so rather than pretend: `GET /v1/info` reports each
-under `components` as `"integrated"` or `"not_integrated"`.
+Every `interval_secs` (and within 30 seconds of an agent finishing
+successfully, and when an auditor asks for `anchor=now`), the server
+appends a leaf to its anchor log for every run, and for the access log,
+that changed since its last leaf: the journal's length and chain head,
+linked to the run's previous leaf. The batch ends in a checkpoint, a C2SP
+signed note over the log's root signed with the log key, and every
+configured witness is asked for its signature over it: each TSA for an
+RFC 3161 token, each `tlog-witness` cosigner for a cosignature.
 
-- **Anchoring.** Nothing is anchored. `anchored_entries` stays 0 for every
-  run, `/v1/anchors` lists nothing, regression detection (which compares
-  runs with what was anchored) has nothing to compare against, and an
-  administrator with root can rewrite any part of a journal without the
-  anchor log showing it. `/v1/info` reports `independent_witness: false`
-  whatever `[anchoring]` names, and `pragmatic_anchor_lag_seconds` grows
-  from the first append, so the alert below fires. A TSA or witness in the
-  configuration satisfies the startup rule but witnesses nothing yet.
-- **Evidence bundles.** `GET /v1/runs/{id}/evidence` answers
-  `501 not_implemented`; `pragmatic-server verify-evidence` defers to the
-  CLI's `pragmatic verify-evidence`.
-- **The console.** Sign-in and sign-out work; every page answers
-  `501 not_implemented`. The API under `/v1` serves the same data.
+- A checkpoint is **independently anchored** once witnesses of
+  `min_independent_operators` distinct operators have verified. A run's
+  `anchored_entries` advances only then; the server's own signature never
+  counts. Until then `/v1/runs/{id}` shows the run as unanchored, the
+  console shows an operator-only anchor, and
+  `pragmatic_anchor_lag_seconds` grows.
+- Witnesses that fail are retried every 30 seconds with exponential
+  backoff (to an hour) per witness, oldest checkpoint first, until each
+  succeeds. A witness failure counts in `pragmatic_anchor_failures_total`;
+  three batches in a row that end short of the policy fire the
+  `anchor_failed` webhook.
+- A run whose journal holds fewer entries than its latest leaf, or the
+  same entries under another head, was rolled back or rewritten after it
+  was anchored. The anchor log refuses it, the server marks the run
+  `regressed` (appends answer `409 regressed`) and fires `regressed`. An
+  administrator who accepts the journal runs
+  `pragmatic-server accept-regression RUN`.
+- TSA tokens are verified with OpenSSL (`openssl ts -verify -partial_chain`
+  against the operator's pinned anchors) before they are stored, so
+  `openssl` (OpenSSL, not LibreSSL) must be on `PATH` when TSAs are
+  configured; the server refuses to start otherwise.
+- `GET /v1/anchors`, `GET /v1/anchors/{seq}` and `GET /v1/anchors/log`
+  serve checkpoints, witness results and leaves, filtered by scope for
+  auditors. The `--log` file of `pragmatic verify-evidence` is
+  `{"leaves": [...]}` with each leaf's `leaf` hex, in order from index 0,
+  from an administrator's `GET /v1/anchors/log` pages.
 
-Everything else in this guide is in this build: access control,
-redaction, the access log, leases and appends, erasure, holds, retention,
-backups and witness mode.
+**Evidence bundles.** `GET /v1/runs/{id}/evidence?redact=&anchor=now`
+(auditors and administrators) answers a bundle (design section 5): the
+durable journal, its decoded records, its whole leaf chain with inclusion
+proofs, checkpoints, consistency proofs to the latest checkpoint and every
+stored witness result, signed with the log key. `redact` is `none` (needs
+`view_raw`, and is logged as a raw read), `detectors` (the default without
+`view_raw`), `binary` or `all`; a redacted slot is withheld whole, so the
+chain still verifies. `anchor=now` runs a batch, and its first witness
+pass, before the bundle is built. An auditor verifies the bundle offline:
+
+```sh
+pragmatic verify-evidence case-1.evidence.json \
+  --tsa-roots digicert=deploy/tsa-roots/digicert.pem \
+  --tsa-roots sectigo=deploy/tsa-roots/sectigo.pem \
+  --log-key "$(cat log.vkey)"
+```
+
+where `log.vkey` is the vkey `keygen` printed, obtained from the operator
+out of band. `pragmatic-server verify-evidence` points to that command:
+an auditor should not need the operator's server to check its bundles.
 
 ## Install
 
@@ -96,12 +132,18 @@ proxy or ingress that terminates TLS (then set `allow_plain_http = true`).
 1. **Write a configuration.** Copy `deploy/pragmatic.example.toml` to
    `/etc/pragmatic/pragmatic.toml` and edit it. Every key is described
    below.
-2. **Create the signing key**, outside the data directory:
+2. **Create the log key**, outside the data directory:
    ```sh
    pragmatic-server --config /etc/pragmatic/pragmatic.toml keygen
    ```
-   (`openssl genpkey -algorithm ed25519 -out /etc/pragmatic/server.ed25519`
-   works too.) Keep it readable only by the server's user.
+   It is an Ed25519 signed-note key, in the private key format of Go's
+   `sumdb/note`, named for the log's origin `pragmatic/<name>/<log id>`.
+   keygen prints the origin and the **vkey**, which auditors pin with
+   `--log-key` and witnesses configure; publish it out of band. Keep the
+   key readable only by the server's user. The origin never changes:
+   `keygen --rotate` (server stopped) makes a new key for the same origin
+   and records a `key.rotate` record, signed by both keys, in the access
+   log.
 3. **Create the first admin token:**
    ```sh
    pragmatic-server token bootstrap
@@ -119,8 +161,16 @@ At startup the server refuses to run when:
 - no independent witness (a `[anchoring] tsa` or `witness`) is configured
   and `allow_self_anchoring` is false. With self-anchoring, evidence
   bundles say `"independent": false`;
-- the signing key is inside `data_dir` (a backup of the data would then
-  carry the key that signs it) and `allow_key_in_data_dir` is false;
+- a key file (the log key, the anchor key or the witness key) is inside
+  `data_dir` (a backup of the data would then carry it) and
+  `allow_key_in_data_dir` is false;
+- `name` is set and is not the name in the log key's origin;
+- TSAs are configured and `openssl` on `PATH` is not an OpenSSL that
+  verifies with `-partial_chain`, or two operators' anchor files share a
+  certificate;
+- the anchor log is damaged (a checkpoint root the leaves do not
+  reproduce, a broken leaf chain, witness results for a checkpoint that is
+  gone): it is never repaired automatically;
 - the data directory has a data format this build does not know;
 - the access log is damaged (the server will not append to a log whose
   history it cannot vouch for). A log that holds fewer records than its
@@ -145,7 +195,7 @@ setting cannot silently fall back to its default.
 
 | key | default | meaning |
 |---|---|---|
-| `name` | host name | The server's name. Anchoring checkpoints use the origin `pragmatic/<name>/<log id>`, where the log id is 16 hex digits of the SHA-256 of the log's first public key, fixed when that key is made. |
+| `name` | host name | The server's name. Anchoring checkpoints use the origin `pragmatic/<name>/<log id>`, where the log id is 16 hex digits of the SHA-256 of the log's first public key, fixed when `keygen` makes that key. Empty means the name in the key; a name the key does not carry is refused. |
 | `listen` | `"127.0.0.1:7272"` | IP address and port to listen on. |
 | `data_dir` | `"/var/lib/pragmatic"` | Where runs, the access log, tokens and anchors live. |
 | `allow_plain_http` | `false` | Allow a non-loopback `listen`. TLS must then terminate in front of the server. |
@@ -160,8 +210,9 @@ setting cannot silently fall back to its default.
 
 | key | default | meaning |
 |---|---|---|
-| `signing_key_file` | `"/etc/pragmatic/server.ed25519"` | The Ed25519 key (PKCS#8 PEM) that signs checkpoints, backup manifests and key rotations. |
-| `allow_key_in_data_dir` | `false` | Allow the key inside `data_dir`. |
+| `signing_key_file` | `"/etc/pragmatic/server.ed25519"` | The log key (an Ed25519 signed-note key, written by `keygen`) that signs checkpoints, evidence bundles, backup manifests and key rotations. |
+| `allow_key_in_data_dir` | `false` | Allow key files inside `data_dir`. |
+| `anchor_key_file` | `""` | 32 random bytes (raw, or 64 hex digits) from which each run's anchor key is derived under `anchor_run_ids = "hmac"`. Required in that mode; `keygen --anchor-key` writes one. |
 
 ### `[bootstrap]`
 
@@ -174,16 +225,19 @@ setting cannot silently fall back to its default.
 | key | default | meaning |
 |---|---|---|
 | `interval_secs` | `600` | Seconds between anchoring batches (60 to 3600). A batch also runs within 30 seconds after an agent finishes successfully. |
-| `tsa` | `[]` | RFC 3161 time-stamping authorities: `{ url, roots_pem, operator }`. `roots_pem` holds that operator's pinned trust anchors (a root, or better the CA that issues its time-stamping certificates); `operator` names who runs it and is required. |
-| `witness` | `[]` | C2SP tlog-witness cosigners: `{ url, public_key, token_file, name, operator }`. |
+| `tsa` | `[]` | RFC 3161 time-stamping authorities: `{ url, operator, roots_pem }`. `roots_pem` holds that operator's pinned trust anchors (a root, or better the CA that issues its time-stamping certificates); `operator` names who runs it and is required. Operators must not share an anchor. |
+| `witness` | `[]` | C2SP tlog-witness cosigners: `{ url, vkey, operator, token_file }`. Requests go to `<url>/add-checkpoint`; `vkey` is the witness's `cosignature/v1` verifier key; `operator` defaults to the key name. |
 | `allow_self_anchoring` | `false` | Start without an independent witness. |
 | `anchor_run_ids` | `"plain"` | `"plain"` puts run ids in anchor leaves; `"hmac"` puts a keyed hash, so the anchor log reveals no run ids. |
 | `min_independent_operators` | `2` | Distinct witness operators a checkpoint needs before runs count as independently anchored. |
 
-The example configuration uses DigiCert and Sectigo, whose roots ship in
-`deploy/tsa-roots/`. Ask TSA operators for written permission before
-automated use. Qualified (eIDAS) time-stamping providers are available as a
-paid option.
+The example configuration uses DigiCert and Sectigo, whose pinned anchors
+ship in `deploy/tsa-roots/` (DigiCert by the CA that issues its
+time-stamping certificates, Sectigo by its root), with their fingerprints
+and how to obtain each independently in `deploy/tsa-roots/README.md`.
+Obtain written permission from each TSA operator before automated use; the
+server spaces its requests to one TSA at least 15 seconds apart. Qualified
+(eIDAS) time-stamping providers are available as a paid option.
 
 ### `[[retention]]`
 
@@ -221,7 +275,9 @@ for how several matching policies combine.
 | key | default | meaning |
 |---|---|---|
 | `enabled` | `false` | Cosign other logs' checkpoints. |
-| `origins` | `[]` | `{ name, token_sha256, public_key }`: the log's origin line, the SHA-256 of the token it authenticates with, and its signed-note verifier key. |
+| `name` | `""` | The cosigner name in this witness's signature lines. |
+| `key_file` | `""` | The witness key (`keygen --witness` writes it), never the log key. |
+| `origins` | `[]` | `{ name, origin, log_vkeys, token_sha256 }`: the configuration name (bound to the log's `witness_client` token, and the `{origin}` of the log endpoint), the checkpoint origin line, the log's verifier keys, and the SHA-256 of the token it authenticates with. No two entries share a name or an origin line. |
 
 ### `[license]`
 
@@ -276,7 +332,40 @@ token's id, and each token records the token that issued it
 **Console.** Signing in to the console exchanges a token for a session
 cookie (HTTP-only, `SameSite=Strict`, `Secure` over HTTPS). Sessions end
 after 15 minutes without a request or 12 hours after sign-in. Revoking a
-token ends its sessions at once.
+token ends its sessions at once. See [The console](#the-console).
+
+## The console
+
+The console is at `/console`, rendered by the server with
+`pragmatic-console`, the renderer the CLI's `export` and `serve` use, so a
+run looks the same wherever it is read.
+
+- **Runs**, filtered by run id prefix, run id or label value, a label,
+  program, status and update dates, a page at a time.
+- **A run**: its facts, attempts, the timeline (branches and parallel
+  regions as nested lanes, intents with their results, erased, withheld and
+  ref slots, notes, custody) a page at a time, its verification, and its
+  anchoring: independently anchored (with the operators and the time they
+  vouch for), anchored by the operator's signature only, or unanchored.
+  Without `view_raw`, content is shown through the same redaction as the
+  API. Auditors and administrators download evidence bundles from it;
+  administrators erase slots from it.
+- **The access log**: every record for administrators, the records of
+  in-scope runs for auditors, personal fields withheld without `view_raw`.
+- **Holds and retention** (administrators): place and remove holds, see
+  the retention policies, run retention now.
+- **Tokens** (administrators): issue (the value is shown once) and revoke.
+- The footer names the viewer and the licensee (`[license] licensee`).
+
+Every page carries a Content-Security-Policy that loads and runs nothing
+(no script at all, styles inline, the one image a data URI) and lets forms
+submit only to the console itself; pages are never cached or framed. Every
+form that changes something carries the session's CSRF token, is refused
+when a browser marks it as sent from another site, and acts through the
+same operations as the API, so the access log and the erasure ledger
+record it the same way. The sign-in form carries an anti-forgery value of
+its own. Sign-in and sign-out are recorded in the access log. Console
+sessions live in memory: a restart signs everyone out.
 
 ## Leases and appends
 
@@ -456,12 +545,22 @@ that hold content again can be repaired by erasing them again.
 
 With `[witness_mode] enabled`, the server cosigns other logs' checkpoints
 under the C2SP tlog-witness protocol (`POST /add-checkpoint`, also at
-`POST /v1/witness`). Each log authenticates with a `witness_client` token
-bound to its origin, and the server checks the log's signature and the
-consistency proof from the last checkpoint it cosigned, refusing forks.
-Every cosigned checkpoint is recorded in the server-written run
-`pragmatic:witness:<origin>`, which is anchored like any other run;
-`GET /v1/witness/log/{origin}` serves the history.
+`POST /v1/witness`), with the same checks as the anchoring library's
+witness. Create the witness key with `keygen --witness`; it prints the
+vkey logs configure in their `[anchoring] witness`. Each log authenticates
+with a `witness_client` token bound to its origin entry, and the server
+checks the log's signature and the consistency proof from the last
+checkpoint it cosigned, refusing forks.
+
+Every cosigned checkpoint is recorded, before the cosignature is returned,
+in the server-written run `pragmatic:witness:<name>`, which is anchored
+like any other run; a fork attempt is recorded there too, as a
+`witness.reject` note. `GET /v1/witness/log/{name}?after=` (administrators,
+and auditors whose scopes cover that run) answers `{origin, origin_line,
+witness, cosigned, next}`, where each `cosigned[].checkpoint` is the signed
+note with this witness's cosignature line. An auditor's `--witness-log`
+file is `{"witness": witness, "origin": origin_line, "checkpoints": [every
+cosigned[].checkpoint, page by page, in order]}`.
 
 ## Sizing and limits
 
@@ -572,13 +671,13 @@ validity window, so earlier signatures stay checkable.
 | command | what it does |
 |---|---|
 | `serve` | run the server |
-| `keygen [--rotate]` | write a new signing key, or rotate it (server stopped) |
+| `keygen [--rotate \| --witness \| --anchor-key]` | write the log key (printing its origin and vkey), rotate it (server stopped), or write the witness-mode key or the anchor key; never over an existing file |
 | `token new\|revoke\|list` | manage tokens on a running server |
 | `token bootstrap` | print a fresh token and its SHA-256 for `[bootstrap]` |
 | `backup --to DIR` | copy the data directory while the server runs |
 | `restore --from DIR [--erasure-ledger FILE] [--trust-key HEX]` | restore into an empty data directory |
 | `verify-data [--offline]` | verify everything now |
-| `verify-evidence FILE` | verify an evidence bundle |
+| `verify-evidence FILE` | points to `pragmatic verify-evidence`, the CLI an auditor verifies bundles with |
 | `migrate` | bring the data directory to this build's format |
 | `accept-regression RUN` | accept a regressed run's history (logged) |
 

@@ -5,8 +5,9 @@
 # The image runs as an unprivileged user and works with a read-only root
 # filesystem: the only writable paths it needs are the data volume
 # (/var/lib/pragmatic) and /tmp. Mount the configuration at
-# /etc/pragmatic/pragmatic.toml and the signing key (a secret) at
-# /etc/pragmatic/server.ed25519, outside the data volume. See
+# /etc/pragmatic/pragmatic.toml and the log key (a secret, from
+# `pragmatic-server keygen`) at /etc/pragmatic/server.ed25519, outside the
+# data volume. The pinned TSA anchors are in /etc/pragmatic/tsa-roots. See
 # deploy/docker-compose.yml and deploy/kubernetes/.
 #
 # Pragmatic Server is licensed under the Business Source License 1.1:
@@ -16,7 +17,7 @@
 FROM rust:1.89-bookworm AS build
 WORKDIR /src
 # Every workspace member must be present for cargo to read the workspace,
-# even though only the server and the core are built.
+# even though only the server and what it depends on are built.
 COPY Cargo.toml ./
 COPY crates ./crates
 RUN cargo build --release -p pragmatic-server

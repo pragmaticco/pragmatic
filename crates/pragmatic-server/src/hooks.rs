@@ -15,12 +15,17 @@
 //!   [`ConsoleRenderer::render`] turns page data (the same JSON shapes the
 //!   API serves) into HTML.
 //!
-//! Each has a stub that is clearly not the real thing: [`NoAnchoring`]
+//! `pragmatic-server serve` plugs in the integrated components
+//! ([`crate::server::Hooks::integrated`]): [`crate::anchoring`] over the
+//! anchoring library, [`crate::evidence`] over the core evidence module,
+//! and [`crate::console_ui`] over `pragmatic-console`.
+//!
+//! Each hook also has a stub that is clearly not the real thing, for tests
+//! and for embedding the server without a component: [`NoAnchoring`]
 //! anchors nothing, [`EvidenceStub`] answers 501, and [`ConsoleStub`]
-//! answers 501. The server is complete without them in every other
-//! respect: access control, redaction and the access log all happen before
-//! a hook is called, so an integration never has to repeat them. A stub
-//! never claims what it does not do: [`NoAnchoring`] reports no
+//! answers 501. Access control, redaction and the access log all happen
+//! before a hook is called, so a component never has to repeat them. A
+//! stub never claims what it does not do: [`NoAnchoring`] reports no
 //! independent witness whatever the configuration names, and `/v1/info`
 //! says which components are not integrated.
 
@@ -96,8 +101,28 @@ pub struct BatchReceipt {
 /// Something an operator must hear about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnchorAlert {
-    /// A batch or a witness failed (webhook `anchor_failed`).
+    /// A batch failed, or anchoring found a problem that did not stop it
+    /// (webhook `anchor_failed`).
     Failed { reason: String },
+    /// One witness attempt failed; it is retried with backoff (metric
+    /// only: a witness that is down fails every pass, and the webhook
+    /// fires once checkpoints stay short of the policy).
+    WitnessFailed {
+        seq: u64,
+        witness: String,
+        reason: String,
+    },
+    /// A snapshot contradicts a signed leaf: fewer entries than the
+    /// object's latest leaf, or the same entries and another head (design
+    /// 4.7). It was not anchored. The run (`None`: the access log) was
+    /// rolled back or rewritten after it was anchored, so the server marks
+    /// it `regressed` (the access log: `chain_broken`).
+    Contradicted {
+        run_id: Option<String>,
+        /// The entries of the latest leaf the snapshot contradicts.
+        anchored_entries: u64,
+        reason: String,
+    },
 }
 
 /// Why anchoring could not do what was asked.
@@ -130,6 +155,32 @@ pub struct LeafView {
     /// `anchor_run_ids = "hmac"` it should not be).
     pub run_id: Option<String>,
     pub body: JsonValue,
+}
+
+/// How one anchor of a run is witnessed, for the console.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnchorWitnessing {
+    /// The stored witnesses meet `min_independent_operators`.
+    pub independent: bool,
+    /// The distinct operators of the stored witnesses.
+    pub operators: Vec<String>,
+    /// The earliest witness time (Unix seconds), from a signed structure.
+    pub time: Option<u64>,
+}
+
+/// A run's anchors as an evidence bundle carries them (design 5.1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunAnchors {
+    /// The run's key k_run under `anchor_run_ids = "hmac"`.
+    pub anchor_id: Option<[u8; 32]>,
+    /// The run's whole leaf chain, first leaf first.
+    pub anchors: Vec<pragmatic::evidence::Anchor>,
+    /// For each anchor, how it is witnessed (not part of a bundle: a
+    /// verifier decides from its own pins).
+    pub witnessing: Vec<AnchorWitnessing>,
+    /// The log's latest checkpoint, which every consistency proof leads
+    /// to.
+    pub latest_checkpoint: Option<String>,
 }
 
 /// What the server offers anchoring.
@@ -193,6 +244,17 @@ pub trait Anchoring: Send + Sync + 'static {
     /// anchored again with a `prev_leaf` that skips it, a fork in its leaf
     /// chain.
     fn last_leaves(&self) -> Result<Vec<LeafPlaced>, AnchorError>;
+
+    /// Retry the witnesses that still owe results, between batches. Runs
+    /// whose checkpoints become independently anchored are reported to
+    /// `host`, as after a batch.
+    fn retry(&self, _host: &dyn AnchorHost) {}
+
+    /// The run's anchors for an evidence bundle: its whole leaf chain with
+    /// proofs, checkpoints and witnesses. Empty for a run never anchored.
+    fn run_anchors(&self, _run_id: &str) -> Result<RunAnchors, AnchorError> {
+        Ok(RunAnchors::default())
+    }
 }
 
 /// INTEGRATION STUB: anchors nothing. Runs never become anchored, so
@@ -337,16 +399,23 @@ pub struct ConsoleViewer {
     pub view_raw: bool,
     /// `[license] licensee`, for the footer.
     pub licensee: String,
+    /// The session's CSRF token, which every form that changes something
+    /// carries.
+    pub csrf: String,
 }
 
-/// The data of one console page. Every JSON value has the shape the API
-/// serves for the same thing (RunSummary, Entry JSON, access-log records,
-/// holds, tokens), already filtered by scope and redacted for the viewer.
-#[derive(Debug, Clone, PartialEq)]
+/// The data of one console page, already filtered by scope for the viewer.
+/// List pages carry the JSON the API serves for the same thing
+/// (RunSummary, access-log records with personal fields withheld, holds,
+/// tokens); the run page carries the durable journal, which the renderer
+/// shows through `redactor` when the viewer may not see content raw.
+#[derive(Clone)]
 pub enum ConsolePage<'a> {
     SignIn {
         error: Option<&'a str>,
         licensee: &'a str,
+        /// The sign-in form's anti-forgery value (its cookie's value).
+        csrf: &'a str,
     },
     Runs {
         viewer: &'a ConsoleViewer,
@@ -356,10 +425,16 @@ pub enum ConsolePage<'a> {
     },
     Run {
         viewer: &'a ConsoleViewer,
+        run_id: &'a str,
         summary: &'a JsonValue,
-        entries: &'a [JsonValue],
-        next: Option<u64>,
-        anchors: &'a [JsonValue],
+        journal: &'a Journal,
+        report: &'a pragmatic::VerifyReport,
+        anchor: Option<&'a pragmatic_console::AnchorStatus>,
+        /// The first cursor of the timeline page.
+        from: u64,
+        /// Set when the viewer may not see content raw.
+        redactor: Option<&'a Redactor>,
+        notice: Option<&'a str>,
     },
     AccessLog {
         viewer: &'a ConsoleViewer,
@@ -370,10 +445,14 @@ pub enum ConsolePage<'a> {
         viewer: &'a ConsoleViewer,
         holds: &'a [JsonValue],
         retention: &'a JsonValue,
+        notice: Option<&'a str>,
     },
     Tokens {
         viewer: &'a ConsoleViewer,
         tokens: &'a [JsonValue],
+        /// A token just issued: its value (shown this once) and record.
+        issued: Option<(&'a str, &'a JsonValue)>,
+        notice: Option<&'a str>,
     },
 }
 

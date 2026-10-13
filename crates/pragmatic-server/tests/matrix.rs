@@ -369,7 +369,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "witness log",
             method: Method::GET,
-            path: |_| "/v1/witness/log/example.com%2Flog".into(),
+            path: |_| "/v1/witness/log/example-log".into(),
             body: none,
             expect: |r, _| match r {
                 Role::Admin => Allowed,
@@ -390,21 +390,18 @@ fn classify(status: StatusCode) -> Expect {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_endpoint_for_every_role_in_and_out_of_scope() {
-    let log_key = pragmatic_server::keys::ServerKey::generate().unwrap();
-    let vkey = pragmatic::note::VerifierKey::new(
-        "example.com/log",
-        pragmatic::note::SignatureType::Ed25519,
-        log_key.public_key(),
-    )
-    .unwrap()
-    .encode();
+    let log_key =
+        pragmatic_server::keys::ServerKey::generate_for_origin("example.com/log").unwrap();
     let ts = TestServer::start(|c| {
-        c.witness_mode.enabled = true;
-        c.witness_mode.origins.push(WitnessOrigin {
-            name: "example.com/log".into(),
-            token_sha256: token_sha256("prag_witness_client"),
-            public_key: vkey,
-        });
+        enable_witness_mode(
+            c,
+            vec![WitnessOrigin {
+                name: "example-log".into(),
+                origin: "example.com/log".into(),
+                log_vkeys: vec![log_key.vkey()],
+                token_sha256: token_sha256("prag_witness_client"),
+            }],
+        );
     })
     .await;
     let (writer_token, _) = ts.issue("agent", &["*"], false).await;

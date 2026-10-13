@@ -52,6 +52,8 @@ pub const JSON_LIMIT: u64 = 1 << 20;
 #[derive(Debug, Clone)]
 pub struct Caller {
     pub principal: Principal,
+    /// For a console request: the session's CSRF token.
+    pub csrf: Option<String>,
 }
 
 /// What a handler adds to its request's access-log record.
@@ -331,9 +333,19 @@ pub fn router(app: AppState) -> Router {
         .route("/console/sign-out", post(console::sign_out))
         .route("/console/runs/{id}", get(console::run))
         .route("/console/runs/{id}/evidence", get(console::evidence))
+        .route("/console/runs/{id}/erase", post(console::erase))
         .route("/console/access", get(console::access))
-        .route("/console/holds", get(console::holds))
-        .route("/console/tokens", get(console::tokens))
+        .route(
+            "/console/holds",
+            get(console::holds).post(console::add_hold),
+        )
+        .route("/console/holds/{id}/remove", post(console::remove_hold))
+        .route("/console/retention/run", post(console::retention))
+        .route(
+            "/console/tokens",
+            get(console::tokens).post(console::issue_token),
+        )
+        .route("/console/tokens/{id}/revoke", post(console::revoke_token))
         .route_layer(axum::middleware::from_fn_with_state(
             app.clone(),
             middleware::access,

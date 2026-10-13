@@ -14,7 +14,9 @@ security, failure-handling and compliance review of the server (4.1 to
 4.13, 4.16, 4.17), while building the Python runtime layer (3.1, 4.4,
 4.6, 6.2, 6.3, 6.7) and its journaled model clients (2.6, 2.11, 3.0, 3.1,
 6.5, 6.6, 6.7), and after the review of that layer (2.6, 2.7, 2.12, 3.1,
-4.6, 6.2 to 6.5), and reconciled when the four were integrated (11). This
+4.6, 6.2 to 6.5), reconciled when the four were integrated (11), and
+amended when the server was wired to its components (4.1, 4.4, 4.7, 4.8,
+4.14, 4.17, 5.3, 11). This
 document is the contract
 between the components built for 0.6. Everything marked MUST is
 normative; where code and this document disagree, one of them is a bug.
@@ -996,7 +998,7 @@ public_url = ""
 verify_interval_hours = 24
 
 [keys]
-signing_key_file = "/etc/pragmatic/server.ed25519"   # refused inside data_dir unless allow_key_in_data_dir
+signing_key_file = "/etc/pragmatic/server.ed25519"   # the log key (4.7), Go note format; refused inside data_dir unless allow_key_in_data_dir
 allow_key_in_data_dir = false
 anchor_key_file = ""                 # 32 random bytes; required when anchor_run_ids = "hmac" (4.7)
 
@@ -1007,7 +1009,7 @@ admin_token_sha256 = ""              # first admin; all other tokens are issued 
 interval_secs = 600                  # 60 to 3600 (4.7)
 min_independent_operators = 2        # at least 1: the server's own signature never counts
 # operator is required; roots_pem holds that operator's trust anchors (4.7)
-tsa = [ { url = "http://timestamp.digicert.com", operator = "digicert", roots_pem = "/etc/pragmatic/tsa/digicert.pem" } ]
+tsa = [ { url = "http://timestamp.digicert.com", operator = "digicert", roots_pem = "/etc/pragmatic/tsa-roots/digicert.pem" } ]
 # operator = "" means the witness key's name
 witness = [ { url = "https://witness.pragmatic.example", vkey = "<name>+<key id>+<base64>", operator = "", token_file = "..." } ]
 allow_self_anchoring = false
@@ -1429,9 +1431,11 @@ Witnesses:
   - The default config uses DigiCert (`http://timestamp.digicert.com`)
     and Sectigo (`http://timestamp.sectigo.com`), each pinned, where the
     operator publishes one, by the CA that issues its public
-    time-stamping certificates, otherwise by its root (DigiCert Trusted
-    Root G4, USERTrust RSA Certification Authority). The pinned anchors
-    ship in `deploy/tsa-roots/`, one file per operator.
+    time-stamping certificates, otherwise by its root: DigiCert by
+    DigiCert Trusted G4 TimeStamping RSA4096 SHA256 2025 CA1, Sectigo by
+    USERTrust RSA Certification Authority. The pinned anchors ship in
+    `deploy/tsa-roots/`, one file per operator, with their fingerprints and
+    where to obtain each independently in its README.
   - Requests to one TSA are spaced at least 15 s apart.
   - The docs say to obtain written permission from the TSA operators for
     automated use, and list the qualified (eIDAS) providers as a paid
@@ -1556,8 +1560,17 @@ can cosign checkpoints for other logs and join the public witness network.
     payload slot.
   - The log endpoint pages by record cursor: `after` is a cursor, one
     call reads at most 1,000 record entries, and the response is
-    `{origin, cosigned: [{cursor, at, origin, old_size, tree_size, root,
-    timestamp, checkpoint}], next}`.
+    `{origin, origin_line, witness, cosigned: [{cursor, at, origin,
+    old_size, tree_size, root, timestamp, checkpoint}], next}`: `origin`
+    is the entry's configuration name, `origin_line` its checkpoint origin,
+    `witness` the cosigner name, `root` hex, and each `checkpoint` the
+    cosigned note (the signed checkpoint with this witness's line), which
+    verifies with the witness's vkey alone. The `--witness-log` file of
+    5.3 is `{"witness": witness, "origin": origin_line, "checkpoints":
+    [every page's cosigned[].checkpoint, in order]}`.
+  - The checks and the cosigning are the anchoring library's
+    (`WitnessCore`: `check` before the record's lock, `decide` under it),
+    so the server and the library's own witness cosign alike.
   - While a record is written its journal is held whole (the store's
     writer keeps the parsed journal), about a kilobyte per cosignature.
     Bounded memory needs a writer that appends from the journal's tail
@@ -1778,6 +1791,27 @@ cut at 64 KiB.
   them, with every row `FAILED`).
 - **Format 1 runs** are counted (commits as ok effects) and shown in full:
   each recorded value in its own block, as a format 2 slot.
+- **In the server**, the run page is `render_run_page` with three
+  additions to `RunView`: a `Frame` (the policy, navigation, and a footer
+  naming the viewer and the licensee), a `SlotFilter` that shows every
+  present slot through the server's redaction (4.10) for a viewer without
+  `view_raw` (fields stay; refs resolve to their target first), and the
+  run's actions (evidence downloads for auditors and administrators,
+  erasure for administrators). The other pages (runs, access log, holds
+  and retention, tokens) are tables in the same frame. The server's policy
+  is the crate's with `form-action 'self'` (and `frame-ancestors
+  'none'`), sent as a header and in the page; it still loads and runs
+  nothing.
+- **Forms.** Every console form that changes something (sign-out, holds,
+  retention, erasure, tokens) carries the session's CSRF token, a random
+  value kept with the session and compared in constant time, and is
+  refused when `Sec-Fetch-Site` is cross-site or `Origin` is not the
+  server's; the sign-in form carries the value of a short-lived
+  `pragmatic_sign_in` cookie instead. Forms act through the same
+  operations as the API, so the access log and the erasure ledger record
+  them alike. A finished form redirects to its page with a fixed notice,
+  a refused one with its error code, never with text from the request; a
+  new token's value is shown on the page that answers, once.
 
 ### 4.15 Deployment
 
@@ -1890,14 +1924,39 @@ silent or disagreed:
   notes.
 - **Integration points.** Anchoring, evidence bundles and the console
   renderer plug in through `pragmatic_server::hooks` (`Anchoring`,
-  `EvidenceBuilder`, `ConsoleRenderer`). Until they are integrated the
-  server runs with stubs that anchor nothing and answer `501
-  not_implemented`, and `verify-evidence` defers to the CLI. A stub claims
-  nothing it does not do: `/v1/info` reports `components` and
-  `independent_witness: false`, the anchoring lag grows, and evidence
-  answers 501 before reading the journal. `Anchoring::last_leaves`
-  reports every object's last leaf so startup can recover leaves a crash
-  kept out of `meta.json`.
+  `EvidenceBuilder`, `ConsoleRenderer`). `serve` uses the integrated
+  components, built once the data directory is locked: the anchoring
+  library (`anchoring::LibraryAnchoring`), the core evidence module with
+  the library's anchor section (`evidence::BundleBuilder`), and
+  `pragmatic-console` (`console_ui::ConsoleUi`); `/v1/info` reports them
+  `integrated`. Stubs that anchor nothing and answer `501
+  not_implemented` remain for tests and embedding, and claim nothing they
+  do not do. `verify-evidence` points to the CLI: an auditor should not
+  need the operator's server to check its bundles.
+- **The anchoring adapter.** A batch hands the library the server's
+  snapshots (4.7) as its snapshot provider; the library links each leaf to
+  its object's previous leaf from the log itself, so a `meta.json` that
+  lags the log can never fork a leaf chain (a repeated snapshot is skipped
+  as unchanged). Every batch commits, then runs one witness pass, so
+  `anchor=now` waits for the witnesses that answer at once; witnesses
+  still owed are retried every 30 s between batches. The adapter reports
+  independently anchored leaves (`anchored_entries` advances, the lag
+  moves), snapshots the library refuses as regressed or rewritten
+  (`AnchorAlert::Contradicted`: the run is marked `regressed` once, and an
+  accepted regression is not reported again until the run grows past its
+  leaf), failed witness attempts (the failures metric), and three short
+  batches in a row (`anchor_failed`). At startup `last_leaves` and
+  `anchored_lengths` are read from the log's batch indexes and witness
+  results. `restore` and `verify-data --offline` open the log without
+  witnesses. TSAs need an OpenSSL whose `ts -verify` takes
+  `-partial_chain`; the server checks at startup.
+- **Evidence from the server.** A bundle is built from the durable
+  journal under a share of the byte budget four times its size (the
+  journal, its base64 and its records), taken once and held until the
+  response is sent in 1 MiB chunks. The anchors are cut at the journal's
+  length, since a batch may anchor appends made after the journal was
+  read. `redaction.detectors` and `patterns_sha256` describe what was
+  applied (`detectors` mode only).
 - **Reads are bounded by the request (4.4).** Entries and slots are read
   frame by frame at their offsets (64 MiB of offsets cached across runs,
   at most 64 MiB of frames per page); verification, evidence and the
@@ -2071,8 +2130,9 @@ the report says so (`tsa_ambiguous`, a warning).
       every unkeyed journal shares, so they vouch for no content).
     - `FAILED` (exit 1) for any integrity failure, or an audit of step 11
       that was asked for and could not be completed.
-11. **Full-log audit (optional):** `--log FILE` (from
-    `GET /v1/anchors/log`) verifies every leaf of the run against
+11. **Full-log audit (optional):** `--log FILE` (the `leaf` of every
+    leaf of an administrator's `GET /v1/anchors/log` pages, from index 0)
+    verifies every leaf of the run against
     `latest_checkpoint`, which detects hidden anchors (for plain run ids;
     with `anchor_id` it fails with `log_unauditable`, 4.7).
     `--witness-log FILE` checks the bundle's tree against a witness's
@@ -2744,28 +2804,20 @@ is brought to it when the server is wired to its components:
   `{entries, next, total}` and are followed by `next`, and `chain_broken`
   and `not_implemented` are definitive errors (`ServerError` in Python).
 
-Not yet true of the code, and due when the server is wired to the
-anchoring library, the evidence module and the console:
+Brought to these rules when the server was wired to its components:
+the server's configuration (witnesses by vkey, witness mode's own key and
+log vkeys, `anchor_key_file`), its keys (the anchoring library's
+`LogSigner` and `KeyRotation`, note key ids next to full public keys, a
+separate witness key), the witness record (the library's `WitnessCore`
+over the run store), the witness log (its pages carry the cosigned notes,
+the cosigner name and the origin line, from which the `--witness-log` file
+is assembled), `hooks::Anchoring` over the library (contradicted snapshots
+reported, `retry_pending` between batches) and the console (4.14).
 
-- The server's configuration still reads witnesses as `{public_key,
-  name}` and witness-mode origins as `{name, public_key}`, and has no
-  `[keys] anchor_key_file` or `[witness_mode] name, key_file` (4.1).
-- The server signs with a PKCS#8 key named by its SHA-256, writes its own
-  `key.rotate` message and cosigns with that same key; the anchoring
-  library's `LogSigner`, `KeyRotation` and a separate witness key replace
-  them (4.7, 4.8).
+Not yet true of the code:
+
 - Server views detect binary fields with their own rules, which now
   include `b64_json`; they move to `redact::binary::scan` (4.10).
-- `GET /v1/witness/log/{origin}` answers `{origin, cosigned, next}`, which
-  `--witness-log` does not read (it takes `{witness, origin,
-  checkpoints}`); one of the two is converted (5.3).
-- `hooks::Anchoring` (`anchor`, `last_leaves`, `anchored_lengths`, and the
-  rest) is implemented over `pragmatic_anchor::Anchorer`. Its
-  `AnchorHost` needs a way to hear about snapshots the library refuses as
-  regressed or rewritten, which today only `BatchOutcome::skipped`
-  carries, and the adapter calls `retry_pending` between batches.
-- `hooks::ConsoleRenderer` hands the renderer redacted Entry JSON page by
-  page, while `pragmatic-console` renders a whole `Journal`; the sign-in,
-  access log, holds and tokens pages exist only in the server.
+  Evidence redaction already uses the core scan.
 - `/v1/info` announces `min_sdk` 0.6.0 while the workspace, and so the
   Python SDK built from it, is still versioned 0.5.0.

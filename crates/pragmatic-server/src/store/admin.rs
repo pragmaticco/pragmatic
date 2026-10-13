@@ -410,6 +410,7 @@ impl Store {
         }
         let before = st.meta.anchored_entries;
         st.meta.regressed = false;
+        st.meta.regression_accepted = true;
         st.meta.anchored_entries = st.meta.entries;
         st.meta.unanchored_since = None;
         self.write_meta(&run, st)?;
@@ -468,9 +469,38 @@ impl Store {
                     index: leaf.leaf_index,
                     entries: leaf.entries,
                 });
+                st.meta.regression_accepted = false;
                 let _ = self.save_meta(&run, st, true);
             }
         }
+    }
+
+    /// The anchor log refused a snapshot of this run because it
+    /// contradicts the run's anchored leaf (design 4.7): the journal holds
+    /// fewer entries than the leaf, or the same entries and another head,
+    /// so it was rolled back or rewritten after it was anchored. The run is
+    /// marked `regressed` (appends answer 409 until an administrator
+    /// accepts its journal) and the `regressed` webhook fires, once. After
+    /// an acceptance the refusals continue until the run grows past the
+    /// leaf, and are not reported again.
+    pub fn mark_contradicted(&self, run_id: &str, anchored_entries: u64, reason: &str) {
+        let Some(run) = self.get(run_id) else { return };
+        let mut guard = run.lock();
+        let st: &mut RunState = &mut guard;
+        if st.meta.regressed || st.meta.regression_accepted || st.deleted {
+            return;
+        }
+        st.meta.regressed = true;
+        self.webhook(
+            "regressed",
+            run_id,
+            json!({
+                "entries": st.meta.entries,
+                "anchored_entries": anchored_entries,
+                "reason": reason,
+            }),
+        );
+        let _ = self.save_meta(&run, st, true);
     }
 
     /// Raise each run's last leaf to what the anchor log holds (at

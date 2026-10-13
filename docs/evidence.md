@@ -94,20 +94,25 @@ distinct operators.
 
 ```sh
 pragmatic verify-evidence support-ticket-4127.evidence.json \
-  --tsa-roots digicert=DigiCertTrustedRootG4.pem \
+  --tsa-roots digicert=DigiCertTimeStampingCA.pem \
   --tsa-roots sectigo=USERTrustRSACertificationAuthority.pem \
   --witness-key "witness-operator=witness.example.com+1a2b3c4d+BA..." \
-  --log-key "pragmatic/acme+5e6f7a8b+AQ..."
+  --log-key "pragmatic/acme/0123456789abcdef+5e6f7a8b+AQ..."
 ```
+
+(`deploy/tsa-roots/README.md` lists the anchors Pragmatic Server's example
+configuration pins, with their fingerprints and where to obtain each
+yourself. The log key is the vkey `pragmatic-server keygen` printed; get
+it from the operator out of band.)
 
 or with the reference verifier, with the same flags:
 
 ```sh
 python3 tools/verify_evidence.py support-ticket-4127.evidence.json \
-  --tsa-roots digicert=DigiCertTrustedRootG4.pem \
+  --tsa-roots digicert=DigiCertTimeStampingCA.pem \
   --tsa-roots sectigo=USERTrustRSACertificationAuthority.pem \
   --witness-key "witness-operator=witness.example.com+1a2b3c4d+BA..." \
-  --log-key "pragmatic/acme+5e6f7a8b+AQ..."
+  --log-key "pragmatic/acme/0123456789abcdef+5e6f7a8b+AQ..."
 ```
 
 Nothing is sent anywhere: both tools work offline. A trust input that is
@@ -171,7 +176,10 @@ A bundle lists the run's anchors, and each anchor points at the one
 before it, so an anchor removed from the middle is caught. An anchor
 removed from the end (a later anchor that shows a different history) is
 caught only against the whole log. If you can obtain the server's full
-anchor log (`GET /v1/anchors/log` with an administrator token), pass it:
+anchor log (`GET /v1/anchors/log` with an administrator token), pass it.
+The file is `{"leaves": [...]}`, every leaf's `leaf` hex in order from
+index 0; the endpoint serves at most 10,000 leaves per request, so ask for
+`from=0`, `from=10000` and so on, and join the pages:
 
 ```sh
 pragmatic verify-evidence bundle.json ... --log anchors-log.json
@@ -186,7 +194,12 @@ fails with `log_unauditable` rather than pass.
 The full log is checked against the bundle's latest checkpoint, a tree
 head the server chose. To rule out a server that forked its log (one
 history for you, another for everyone else), check it against a witness
-that cosigns the log: pass its cosigned history and its key.
+that cosigns the log: pass its cosigned history and its key. A Pragmatic
+Server in witness mode serves the history at
+`GET /v1/witness/log/{name}?after=`; the file is `{"witness": <the
+page's witness>, "origin": <its origin_line>, "checkpoints": [every
+page's cosigned[].checkpoint, in order]}`, each checkpoint carrying the
+witness's cosignature line.
 
 ```sh
 pragmatic verify-evidence bundle.json ... --log anchors-log.json \

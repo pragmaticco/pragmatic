@@ -73,3 +73,6 @@ pub use log::{
 pub use operator::{canonical_operator, IndependencePolicy};
 pub use schedule::BatchSchedule;
 pub use tree::TreeCache;
+pub use witness::{
+    Cosigner, Refused, RejectRecord, Submission, WitnessConfig, WitnessCore, WitnessOrigin,
+};

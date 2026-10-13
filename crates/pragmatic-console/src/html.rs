@@ -146,12 +146,55 @@ const STYLE: &str = r#"
   .verdict.warn { background: var(--warn); border-color: var(--warn); }
   .verdict p { margin-top: 6px; font-size: 12.5px; }
 
+  form.inline { display: inline; }
+  .forms { display: flex; flex-wrap: wrap; gap: 14px 28px; margin: 6px 0 18px; }
+  .forms form { border: 1px solid var(--hair); padding: 10px 12px; font-size: 12px; }
+  .forms label { display: block; color: var(--muted); margin: 6px 0 2px; }
+  input, select, button { font: 12px/1.4 var(--mono); color: var(--ink); background: var(--bg);
+                          border: 1px solid var(--faint); padding: 3px 6px; }
+  button { cursor: pointer; border-color: var(--ink); }
+  button.link { border: none; padding: 0; text-decoration: underline; background: none; }
+  .notice { border-left: 2px solid var(--ink); padding: 6px 12px; margin: 0 0 16px;
+            background: var(--tint); font-size: 12px; }
+  .secret { font-weight: 700; overflow-wrap: anywhere; }
+  .nav a, .nav button.link { margin-left: 12px; }
+
   .foot { margin-top: 34px; padding-top: 10px; border-top: 1px solid var(--hair);
           color: var(--faint); font-size: 11px; display: flex; flex-wrap: wrap; gap: 6px 24px; }
 "#;
 
+/// How a live console frames its pages (Pragmatic Server): a policy that
+/// lets its own forms submit, a navigation bar, and a footer naming the
+/// viewer and the licensee. Pages without a frame (exported files, the
+/// CLI's console) keep [`CONTENT_SECURITY_POLICY`], which allows no form at
+/// all.
+#[derive(Clone, Copy, Debug)]
+pub struct Frame<'a> {
+    /// The Content-Security-Policy of the page's meta tag. Still forbids
+    /// loading or running anything.
+    pub csp: &'a str,
+    /// Escaped HTML for the masthead's right side (links, a sign-out form).
+    pub nav: &'a str,
+    /// Escaped HTML at the start of the footer.
+    pub footer: &'a str,
+}
+
+/// The policy of a live console's pages: as [`CONTENT_SECURITY_POLICY`],
+/// except that forms may submit to the console's own origin.
+pub const CONSOLE_POLICY: &str = "default-src 'none'; img-src data:; \
+     style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
 /// A complete page. `title` and `body` must already be escaped HTML.
 pub fn page(title: &str, body: &str) -> String {
+    page_framed(title, body, None)
+}
+
+/// [`page`] in a live console's [`Frame`].
+pub fn page_framed(title: &str, body: &str, frame: Option<&Frame<'_>>) -> String {
+    let (csp, footer) = match frame {
+        Some(f) => (f.csp, format!("<span>{}</span>", f.footer)),
+        None => (CONTENT_SECURITY_POLICY, String::new()),
+    };
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -168,14 +211,13 @@ pub fn page(title: &str, body: &str) -> String {
 <div class="wrap">
 {body}
 <div class="foot">
-  <span>append-only, hash-chained; replay reads the journal, never the model</span>
+  {footer}<span>append-only, hash-chained; replay reads the journal, never the model</span>
   <span>pragmatic {version}</span>
 </div>
 </div>
 </body>
 </html>
 "#,
-        csp = CONTENT_SECURITY_POLICY,
         mark = mark_uri(),
         version = env!("CARGO_PKG_VERSION"),
     )
@@ -274,6 +316,21 @@ mod tests {
         assert!(p.contains("default-src 'none'"));
         assert!(!p.contains("<script"));
         assert!(!p.contains("http://") && !p.contains("https://"));
+    }
+
+    #[test]
+    fn framed_pages_allow_their_own_forms_and_still_load_nothing() {
+        let frame = Frame {
+            csp: CONSOLE_POLICY,
+            nav: "<a href=\"/console\">runs</a>",
+            footer: "licensed to Example Corp",
+        };
+        let p = page_framed("t", "<p>x</p>", Some(&frame));
+        assert!(p.contains("form-action 'self'"));
+        assert!(p.contains("default-src 'none'"));
+        assert!(p.contains("licensed to Example Corp"));
+        assert!(!p.contains("<script"));
+        assert!(page("t", "").contains("form-action 'none'"));
     }
 
     #[test]

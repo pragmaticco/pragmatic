@@ -28,7 +28,7 @@ use pragmatic::journal::{
 use pragmatic::json::Json;
 use pragmatic::VerifyReport;
 
-use crate::html::{block, esc, masthead, page, pill, pre, pretty_json};
+use crate::html::{block, esc, masthead, page_framed, pill, pre, pretty_json, Frame};
 use crate::slots::{slot_html, value_html};
 use crate::text;
 
@@ -38,6 +38,20 @@ pub const PAGE_ENTRIES: usize = 5_000;
 /// The most bytes of timeline HTML one page holds. The page ends before the
 /// entry whose row would pass it, unless that entry is the page's first.
 pub const PAGE_BYTES: usize = 16 << 20;
+
+/// Content shown in place of each present slot's content, for a viewer
+/// who may not see it raw (Pragmatic Server's redaction for tokens without
+/// `view_raw`). It sees every slot's bytes and returns what to show; refs
+/// resolve to their target's content first, so a repeated message is
+/// filtered the same way wherever it appears.
+#[derive(Clone, Copy)]
+pub struct SlotFilter<'a>(pub &'a (dyn Fn(&[u8]) -> Vec<u8> + Sync));
+
+impl std::fmt::Debug for SlotFilter<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SlotFilter")
+    }
+}
 
 /// What a page needs to show one run.
 #[derive(Clone, Copy, Debug)]
@@ -60,6 +74,14 @@ pub struct RunView<'a> {
     /// page's first cursor is appended, such as `/run/r1?from=`. Without
     /// one (an exported file), the page says where the next one starts.
     pub page_link: Option<&'a str>,
+    /// A live console's frame (policy, navigation, footer).
+    pub frame: Option<&'a Frame<'a>>,
+    /// What to show in place of slot content, when the viewer may not see
+    /// it raw.
+    pub filter: Option<SlotFilter<'a>>,
+    /// Escaped HTML shown after the run's facts: a live console's actions
+    /// (evidence downloads, erasure).
+    pub actions: Option<&'a str>,
 }
 
 impl<'a> RunView<'a> {
@@ -73,6 +95,9 @@ impl<'a> RunView<'a> {
             home: None,
             from: 0,
             page_link: None,
+            frame: None,
+            filter: None,
+            actions: None,
         }
     }
 }
@@ -109,7 +134,10 @@ pub fn render_run(view: &RunView<'_>) -> String {
 pub fn render_run_page(view: &RunView<'_>) -> RunPage {
     let j = view.journal;
     let mut body = String::new();
-    let right = view.source.map(esc).unwrap_or_default();
+    let right = match view.frame {
+        Some(f) => f.nav.to_string(),
+        None => view.source.map(esc).unwrap_or_default(),
+    };
     body.push_str(&masthead(
         view.home,
         &format!("runs / {}", esc(view.run_id)),
@@ -117,6 +145,9 @@ pub fn render_run_page(view: &RunView<'_>) -> RunPage {
     ));
     body.push_str(&facts(view));
     body.push_str(&alarms(view));
+    if let Some(actions) = view.actions {
+        body.push_str(actions);
+    }
     if let Some(a) = view.anchor {
         body.push_str(&anchor_block(a, j.len()));
     }
@@ -129,11 +160,23 @@ pub fn render_run_page(view: &RunView<'_>) -> RunPage {
         );
     }
     body.push_str("<h2>timeline</h2>");
-    let (rows, next) = timeline(j, view.from, view.page_link);
+    if view.filter.is_some() {
+        body.push_str(
+            "<p class=\"lede\">Content is shown redacted: personal data and secrets the \
+             server's detectors and patterns find are replaced, and attachments are \
+             summarized. Redaction does not inspect images, PDFs or audio, and is not \
+             de-identification.</p>",
+        );
+    }
+    let (rows, next) = timeline(j, view.from, view.page_link, view.filter);
     body.push_str(&rows);
     body.push_str(&verification(view.report, j));
     RunPage {
-        html: page(&format!("{} \u{b7} pragmatic", esc(view.run_id)), &body),
+        html: page_framed(
+            &format!("{} \u{b7} pragmatic", esc(view.run_id)),
+            &body,
+            view.frame,
+        ),
         next,
     }
 }
@@ -401,7 +444,12 @@ fn attempts_table(j: &Journal) -> String {
 
 /// One page of the timeline, as nested lanes, from cursor `from`, and the
 /// cursor the next page starts at (see the module documentation).
-pub(crate) fn timeline(j: &Journal, from: Cursor, link: Option<&str>) -> (String, Option<Cursor>) {
+pub(crate) fn timeline(
+    j: &Journal,
+    from: Cursor,
+    link: Option<&str>,
+    filter: Option<SlotFilter<'_>>,
+) -> (String, Option<Cursor>) {
     let results = text::results_by_intent(j);
     let mut out = String::new();
     let total = j.len();
@@ -423,7 +471,10 @@ pub(crate) fn timeline(j: &Journal, from: Cursor, link: Option<&str>) -> (String
             next = Some(e.cursor);
             break;
         }
-        let html = row(e, j, &results);
+        let html = match filter {
+            Some(f) => row(&filtered(e, f), j, &results),
+            None => row(e, j, &results),
+        };
         if n > 0 && size + html.len() > PAGE_BYTES {
             next = Some(e.cursor);
             break;
@@ -443,6 +494,73 @@ pub(crate) fn timeline(j: &Journal, from: Cursor, link: Option<&str>) -> (String
         ));
     }
     (out, next)
+}
+
+/// An entry with every present slot's content passed through `filter`
+/// (fields are structural and shown as they are).
+fn filtered(e: &Entry, filter: SlotFilter<'_>) -> Entry {
+    let f = |c: &Content| match c {
+        Content::Sealed(v) => Content::Sealed(pragmatic::Value::new((filter.0)(v.as_bytes()))),
+        other => other.clone(),
+    };
+    let event = match &e.event {
+        Event::DrawIntent { provenance, parts } => Event::DrawIntent {
+            provenance: provenance.clone(),
+            parts: parts.iter().map(f).collect(),
+        },
+        Event::DrawResult {
+            intent,
+            meta,
+            head,
+            body,
+        } => Event::DrawResult {
+            intent: *intent,
+            meta: meta.clone(),
+            head: f(head),
+            body: f(body),
+        },
+        Event::ChannelRecv { channel, value } => Event::ChannelRecv {
+            channel: channel.clone(),
+            value: f(value),
+        },
+        Event::EffectIntent { name, arg } => Event::EffectIntent {
+            name: name.clone(),
+            arg: f(arg),
+        },
+        Event::EffectResult {
+            intent,
+            outcome,
+            error_kind,
+            payload,
+        } => Event::EffectResult {
+            intent: *intent,
+            outcome: *outcome,
+            error_kind: error_kind.clone(),
+            payload: payload.as_ref().map(f),
+        },
+        Event::Note {
+            kind,
+            data,
+            payload,
+        } => Event::Note {
+            kind: kind.clone(),
+            data: data.clone(),
+            payload: payload.iter().map(f).collect(),
+        },
+        Event::Random {
+            source,
+            args,
+            value,
+        } => Event::Random {
+            source: source.clone(),
+            args: args.clone(),
+            value: f(value),
+        },
+        // No slots (format 1 entries hold no slots either; a server holds
+        // only format 2 journals).
+        other => other.clone(),
+    };
+    Entry { event, ..e.clone() }
 }
 
 /// A link to the page starting at `from`, or the plain `text` when there is
