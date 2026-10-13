@@ -241,6 +241,20 @@ HTML file you can attach to an incident ticket - it opens anywhere.
 > audit trail), so `serve` binds to loopback only by default. See
 > [SECURITY.md](../SECURITY.md).
 
+### Erase and export evidence
+
+```sh
+pragmatic erase research-42 --match "jane@example.com" --reason-code gdpr_art17 --dir ./journals
+pragmatic evidence research-42 --dir ./journals -o research-42.evidence.json --redact detectors
+pragmatic verify-evidence research-42.evidence.json
+```
+
+`erase` drops the content of the matching slots under the run's write lock
+and records an `erasure` note; every chain hash still verifies. `evidence`
+packages a run as an evidence bundle (a local bundle is unanchored: it
+proves integrity, not time), and `verify-evidence` checks a bundle against
+the trust roots you pin. See [evidence.md](evidence.md).
+
 ---
 
 ## 7. Using it from Python
