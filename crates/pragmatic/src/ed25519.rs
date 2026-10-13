@@ -896,13 +896,218 @@ mod tests {
             assert!(!verify(&pk, b"m", &sig2), "{s}");
         }
 
-        // A valid key with a small-order R is rejected before the equation
-        // is evaluated.
+        // A valid key with a small-order R is rejected. These signatures
+        // fail the equation as well, so they do not isolate the check on R;
+        // identity_r_from_the_key_holder_is_rejected does.
         let (pk, msg, sig) = decode_vector(&RFC8032[0]);
         for s in SMALL_ORDER {
             let mut bad = sig;
             bad[..32].copy_from_slice(&hex_decode_exact::<32>(s).unwrap());
             assert!(!verify(&pk, &msg, &bad), "{s}");
+        }
+    }
+
+    // -- Each rejection rule on its own --
+    //
+    // The tests below build signatures for which the cofactorless equation
+    // holds or fails by construction, so exactly one rule decides the
+    // result. Some need a key with a known secret scalar; they use RFC 8032
+    // test 1's published seed.
+
+    const RFC8032_TEST1_SEED: &str =
+        "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+
+    /// The secret scalar of an RFC 8032 key: the first half of
+    /// SHA-512(seed), clamped (section 5.1.5).
+    fn secret_scalar(seed: &[u8; 32]) -> [u8; 32] {
+        let h = crate::sha512::sha512(seed);
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&h[..32]);
+        a[0] &= 248;
+        a[31] &= 127;
+        a[31] |= 64;
+        a
+    }
+
+    /// `(a b + c) mod L` for little-endian integers with `a b + c` below
+    /// 2^512, by schoolbook multiplication and [`reduce_scalar_wide`].
+    fn scalar_mul_add(a: &[u8; 32], b: &[u8; 32], c: &[u8; 32]) -> [u8; 32] {
+        let words = |x: &[u8; 32]| -> [u64; 4] {
+            std::array::from_fn(|i| u64::from_le_bytes(x[i * 8..i * 8 + 8].try_into().unwrap()))
+        };
+        let (a, b, c) = (words(a), words(b), words(c));
+        let mut wide = [0u64; 8];
+        wide[..4].copy_from_slice(&c);
+        for i in 0..4 {
+            let mut carry = 0u128;
+            for j in 0..4 {
+                let t = u128::from(a[i]) * u128::from(b[j]) + u128::from(wide[i + j]) + carry;
+                wide[i + j] = t as u64;
+                carry = t >> 64;
+            }
+            wide[i + 4] = carry as u64;
+        }
+        let mut bytes = [0u8; 64];
+        for (i, w) in wide.iter().enumerate() {
+            bytes[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+        }
+        reduce_scalar_wide(&bytes)
+    }
+
+    /// `[n]B`.
+    fn base_mul(n: &[u8; 32]) -> Point {
+        double_scalar_mul(n, &base_point(), &[0; 32], &Point::IDENTITY)
+    }
+
+    /// `k = SHA-512(R ‖ A ‖ M) mod L`.
+    fn challenge(r: &[u8; 32], a: &[u8; 32], msg: &[u8]) -> [u8; 32] {
+        let mut h = Sha512::new();
+        h.update(r);
+        h.update(a);
+        h.update(msg);
+        reduce_scalar_wide(&h.finalize())
+    }
+
+    fn signature(r: &[u8; 32], s: &[u8; 32]) -> [u8; 64] {
+        let mut sig = [0u8; 64];
+        sig[..32].copy_from_slice(r);
+        sig[32..].copy_from_slice(s);
+        sig
+    }
+
+    #[test]
+    fn known_secret_helpers_reproduce_rfc8032_test1() {
+        // The helpers rebuild test 1's public key and signature exactly, so
+        // the constructions below are honest signing with one rule bent.
+        let seed: [u8; 32] = hex_decode_exact(RFC8032_TEST1_SEED).unwrap();
+        let a = secret_scalar(&seed);
+        let (pk, msg, sig) = decode_vector(&RFC8032[0]);
+        assert_eq!(base_mul(&a).encode(), pk);
+        // RFC 8032's nonce: r = SHA-512(second half of SHA-512(seed) ‖ M)
+        // mod L.
+        let mut nonce_input = crate::sha512::sha512(&seed)[32..].to_vec();
+        nonce_input.extend_from_slice(&msg);
+        let r = reduce_scalar_wide(&crate::sha512::sha512(&nonce_input));
+        let r_bytes = base_mul(&r).encode();
+        let k = challenge(&r_bytes, &pk, &msg);
+        assert_eq!(signature(&r_bytes, &scalar_mul_add(&k, &a, &r)), sig);
+    }
+
+    #[test]
+    fn small_order_key_forgery_is_rejected_by_the_key_check_alone() {
+        // R = [s]B is an honest prime-order point and S = s, so only the
+        // check on A stands between these signatures and acceptance: with
+        // A of small order, [k]A is the identity whenever the order of A
+        // divides k, and then [S]B = R + [k]A holds for that message. One
+        // (R, S), made without any secret, is then valid on an eighth of
+        // all messages (on every message when A is the identity).
+        let mut s = [0u8; 32];
+        s[0] = 77;
+        let r_point = base_mul(&s);
+        let r = r_point.encode();
+        let sig = signature(&r, &s);
+        for pk_hex in SMALL_ORDER {
+            let pk: [u8; 32] = hex_decode_exact(pk_hex).unwrap();
+            let a = Point::decode(&pk).unwrap();
+            let mut forged = 0;
+            for i in 0u32..256 {
+                let msg = i.to_le_bytes();
+                let k = challenge(&r, &pk, &msg);
+                if double_scalar_mul(&s, &base_point(), &k, &a.neg()).equals(&r_point) {
+                    forged += 1;
+                    assert!(!verify(&pk, &msg, &sig), "{pk_hex} message {i}");
+                }
+            }
+            assert!(forged > 0, "{pk_hex}: no message satisfied the equation");
+        }
+    }
+
+    #[test]
+    fn identity_r_from_the_key_holder_is_rejected() {
+        // With R the identity and S = k a mod L, [S]B - [k]A is the
+        // identity, so the equation holds and only the small-order check on
+        // R rejects. Go's crypto/ed25519 and OpenSSL accept these; this
+        // module must not, since an honest signer never produces them.
+        let seed: [u8; 32] = hex_decode_exact(RFC8032_TEST1_SEED).unwrap();
+        let a = secret_scalar(&seed);
+        let (pk, _, _) = decode_vector(&RFC8032[0]);
+        let a_point = Point::decode(&pk).unwrap();
+        let r: [u8; 32] = hex_decode_exact(SMALL_ORDER[0]).unwrap();
+        for msg in [&b""[..], b"m", b"checkpoint 999"] {
+            let k = challenge(&r, &pk, msg);
+            let s = scalar_mul_add(&k, &a, &[0; 32]);
+            let check = double_scalar_mul(&s, &base_point(), &k, &a_point.neg());
+            assert!(check.is_identity(), "the equation holds");
+            assert!(!verify(&pk, msg, &signature(&r, &s)));
+        }
+    }
+
+    #[test]
+    fn mixed_order_key_follows_the_cofactorless_equation() {
+        // A = [a]B + T with T of order 8 is not of small order, so it passes
+        // the key check, as in Go. Signing honestly with a gives
+        // [S]B - [k]A = R - [k]T, which is R only when 8 divides k. The
+        // cofactorless equation accepts exactly those messages, as Go's
+        // crypto/ed25519 does; the cofactored one would accept them all.
+        let seed: [u8; 32] = hex_decode_exact(RFC8032_TEST1_SEED).unwrap();
+        let a = secret_scalar(&seed);
+        let torsion = Point::decode(&hex_decode_exact(SMALL_ORDER[4]).unwrap()).unwrap();
+        let a_point = base_mul(&a).add(&torsion);
+        let pk = a_point.encode();
+        assert!(is_valid_public_key(&pk));
+        let r_scalar = reduce_scalar_wide(&crate::sha512::sha512(b"mixed-order nonce"));
+        let r_point = base_mul(&r_scalar);
+        let r = r_point.encode();
+        let times_eight = |p: Point| p.double().double().double();
+
+        let (mut accepted, mut rejected) = (0, 0);
+        for i in 0u32..64 {
+            let msg = i.to_le_bytes();
+            let k = challenge(&r, &pk, &msg);
+            let s = scalar_mul_add(&k, &a, &r_scalar);
+            let sig = signature(&r, &s);
+            let check = double_scalar_mul(&s, &base_point(), &k, &a_point.neg());
+            assert!(
+                times_eight(check).equals(&times_eight(r_point)),
+                "the cofactored equation holds for message {i}"
+            );
+            if k[0].is_multiple_of(8) {
+                accepted += 1;
+                assert!(verify(&pk, &msg, &sig), "message {i}: k = 0 mod 8");
+            } else {
+                rejected += 1;
+                assert!(!verify(&pk, &msg, &sig), "message {i}: k != 0 mod 8");
+            }
+        }
+        assert!(
+            accepted > 0 && rejected > 0,
+            "{accepted} accepted, {rejected} rejected"
+        );
+    }
+
+    #[test]
+    fn negated_r_is_rejected() {
+        // Sign with nonce r but publish R' = -[r]B: then [S]B - [k]A = [r]B
+        // = -R', which has the same y coordinate as R' and the opposite x,
+        // so only the x half of the point comparison rejects it.
+        let seed: [u8; 32] = hex_decode_exact(RFC8032_TEST1_SEED).unwrap();
+        let a = secret_scalar(&seed);
+        let (pk, _, _) = decode_vector(&RFC8032[0]);
+        let a_point = Point::decode(&pk).unwrap();
+        let r_scalar = reduce_scalar_wide(&crate::sha512::sha512(b"negated nonce"));
+        let r_neg_point = base_mul(&r_scalar).neg();
+        let r_neg = r_neg_point.encode();
+        for msg in [&b""[..], b"m", b"checkpoint 999"] {
+            let k = challenge(&r_neg, &pk, msg);
+            let s = scalar_mul_add(&k, &a, &r_scalar);
+            let check = double_scalar_mul(&s, &base_point(), &k, &a_point.neg());
+            assert!(check.equals(&r_neg_point.neg()));
+            // The y coordinates agree: Y1 Z2 = Y2 Z1.
+            assert!(check
+                .y
+                .mul(r_neg_point.z)
+                .equals(r_neg_point.y.mul(check.z)));
+            assert!(!verify(&pk, msg, &signature(&r_neg, &s)));
         }
     }
 

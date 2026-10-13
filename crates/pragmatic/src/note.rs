@@ -49,14 +49,19 @@
 //!   `u64`, and the root decodes to exactly 32 bytes;
 //! - notes are UTF-8 without control characters other than newline; key
 //!   names are non-empty and contain no Unicode white space and no `+`;
+//! - a `cosignature/v1` key's name is a cosigner name, which
+//!   tlog-cosignature also limits to [`MAX_ORIGIN_LEN`] bytes;
 //! - at most [`MAX_SIGNATURES`] signature lines, the limit Go uses (the
 //!   specification requires accepting at least 16).
 //!
-//! One rule is deliberately *not* enforced: a checkpoint's origin only has
-//! to be a non-empty line. tlog-checkpoint defers to tlog-cosignature, which
-//! forbids spaces and `+` in origins, but the Go checksum database's origin
-//! `go.sum database tree` predates that rule, and an origin is never trusted
-//! from the note anyway: callers compare it with the origin they
+//! One rule is enforced only when writing. tlog-checkpoint takes its
+//! origins from tlog-cosignature, which allows at most [`MAX_ORIGIN_LEN`]
+//! bytes and no Unicode white space, `+` or control characters.
+//! [`Checkpoint::encode`] enforces that, so the server never signs a
+//! checkpoint that a strict witness would refuse. [`Checkpoint::parse`]
+//! only requires a non-empty line: the Go checksum database's origin
+//! `go.sum database tree` predates the rule, and an origin is never trusted
+//! from the note anyway, since callers compare it with the origin they
 //! configured.
 //!
 //! # Verification rules
@@ -67,8 +72,20 @@
 //! verify, otherwise the whole note is rejected (the specification says
 //! SHOULD; Go's `sumdb/note` checks only the first line per key, this
 //! module checks them all). If no known key signed, the note is rejected.
-//! Each key that verified is reported once, so a repeated line cannot make
-//! one witness count twice.
+//!
+//! Each known key may sign at most one distinct line. Byte-identical
+//! repeats are harmless and the key is reported once, as in Go, so a
+//! repeated line cannot make one witness count twice. Two *different*
+//! lines from one known key reject the note: tlog-checkpoint forbids two
+//! lines with the same key name and key ID, and for a cosigner they would
+//! let whoever assembled the note choose which signed time is reported.
+//!
+//! Configured keys that are equal in every field are one key, so merging
+//! key lists from several sources (the witness keys built into the CLI and
+//! those given on the command line, say) cannot make a valid note fail.
+//! Go's `VerifierList` calls such a list ambiguous. Distinct keys that
+//! share a name and key ID are ambiguous here too, and a line that matches
+//! them rejects the note.
 //!
 //! [signed note]: https://github.com/C2SP/C2SP/blob/main/signed-note.md
 //! [checkpoint]: https://github.com/C2SP/C2SP/blob/main/tlog-checkpoint.md
@@ -86,6 +103,10 @@ use crate::sha256::Sha256;
 /// notes with more than 100, and signed-note requires verifiers to accept
 /// at least 16.
 pub const MAX_SIGNATURES: usize = 100;
+
+/// The longest log origin or cosigner name tlog-cosignature allows, in
+/// bytes. Its ML-DSA signed message encodes both with a one-byte length.
+pub const MAX_ORIGIN_LEN: usize = 255;
 
 /// Each signature line starts with an em dash (U+2014) and a space.
 const SIGNATURE_PREFIX: &str = "\u{2014} ";
@@ -142,10 +163,13 @@ pub enum NoteError {
     Checkpoint(&'static str),
     /// A verifier key is malformed or inconsistent.
     VerifierKey(&'static str),
-    /// A signature line matches more than one configured key.
+    /// A signature line matches more than one distinct configured key.
     AmbiguousKey { name: String, key_id: [u8; 4] },
     /// A signature from a configured key does not verify.
     InvalidSignature { name: String, key_id: [u8; 4] },
+    /// A configured key signed two different lines of one note, which
+    /// tlog-checkpoint forbids.
+    RepeatedKey { name: String, key_id: [u8; 4] },
     /// No configured key signed the note.
     NoVerifiedSignature,
 }
@@ -161,6 +185,13 @@ impl fmt::Display for NoteError {
             }
             NoteError::InvalidSignature { name, key_id } => {
                 write!(f, "invalid signature for key {name}+{}", hex_encode(key_id))
+            }
+            NoteError::RepeatedKey { name, key_id } => {
+                write!(
+                    f,
+                    "two different signatures for key {name}+{}",
+                    hex_encode(key_id)
+                )
             }
             NoteError::NoVerifiedSignature => f.write_str("note has no verifiable signatures"),
         }
@@ -183,6 +214,14 @@ pub fn is_valid_key_name(name: &str) -> bool {
         && !name
             .chars()
             .any(|c| c.is_whitespace() || c == '+' || c < ' ')
+}
+
+/// A valid log origin or cosigner name, which tlog-cosignature defines the
+/// same way (one string may be both): a valid key name of at most
+/// [`MAX_ORIGIN_LEN`] bytes. Signed-note key names have no length limit,
+/// so this is stricter than [`is_valid_key_name`].
+pub fn is_valid_origin(origin: &str) -> bool {
+    origin.len() <= MAX_ORIGIN_LEN && is_valid_key_name(origin)
 }
 
 /// The recommended key ID: the first four bytes of
@@ -382,6 +421,11 @@ pub struct VerifierKey {
 
 impl VerifierKey {
     /// A key for `name` with the derived key ID.
+    ///
+    /// A `cosignature/v1` key's name is a cosigner name, so it must also
+    /// satisfy [`is_valid_origin`]. An Ed25519 note key's name only has to
+    /// be a valid key name: signed-note sets no length limit, and Go's
+    /// `sumdb/note` accepts longer names.
     pub fn new(
         name: &str,
         signature_type: SignatureType,
@@ -389,6 +433,11 @@ impl VerifierKey {
     ) -> Result<VerifierKey, NoteError> {
         if !is_valid_key_name(name) {
             return Err(NoteError::VerifierKey("invalid key name"));
+        }
+        if signature_type == SignatureType::CosignatureV1 && !is_valid_origin(name) {
+            return Err(NoteError::VerifierKey(
+                "cosigner name is longer than 255 bytes",
+            ));
         }
         if !ed25519::is_valid_public_key(&public_key) {
             return Err(NoteError::VerifierKey(
@@ -508,9 +557,11 @@ impl fmt::Display for VerifierKey {
 /// A configured key that signed a note.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VerifiedSignature {
-    /// Index of the key in the `keys` slice given to [`verify_note`].
+    /// Index of the key in the `keys` slice given to [`verify_note`]: the
+    /// first, if the slice holds equal copies of the key.
     pub key: usize,
-    /// Index of the key's first signature line in [`Note::signatures`].
+    /// Index of the key's first signature line in [`Note::signatures`]. Any
+    /// later line from the key is identical to it.
     pub signature: usize,
     /// For a `cosignature/v1` key, the signed timestamp (Unix seconds).
     /// It is not compared with any clock here; tlog-cosignature lets
@@ -524,10 +575,12 @@ pub struct VerifiedSignature {
 /// a known key must verify, and at least one must.
 ///
 /// Returns one entry per configured key that signed, in signature-line
-/// order. Errors with [`NoteError::InvalidSignature`] if any line from a
-/// known key fails, [`NoteError::AmbiguousKey`] if a line matches two
-/// configured keys, and [`NoteError::NoVerifiedSignature`] if no known key
-/// signed.
+/// order. Equal entries in `keys` count as one key. Errors, at the first
+/// offending line, with [`NoteError::AmbiguousKey`] if the line matches two
+/// distinct configured keys, [`NoteError::InvalidSignature`] if it is from
+/// a known key and fails, and [`NoteError::RepeatedKey`] if it verifies but
+/// differs from an earlier line of the same key; and with
+/// [`NoteError::NoVerifiedSignature`] if no known key signed.
 pub fn verify_note(note: &Note, keys: &[VerifierKey]) -> Result<Vec<VerifiedSignature>, NoteError> {
     let mut verified: Vec<VerifiedSignature> = Vec::new();
     for (index, sig) in note.signatures.iter().enumerate() {
@@ -535,7 +588,7 @@ pub fn verify_note(note: &Note, keys: &[VerifierKey]) -> Result<Vec<VerifiedSign
         let Some((key_index, key)) = matching.next() else {
             continue; // unknown key
         };
-        if matching.next().is_some() {
+        if matching.any(|(_, other)| other != key) {
             return Err(NoteError::AmbiguousKey {
                 name: sig.name.clone(),
                 key_id: sig.key_id,
@@ -547,15 +600,23 @@ pub fn verify_note(note: &Note, keys: &[VerifierKey]) -> Result<Vec<VerifiedSign
                 key_id: sig.key_id,
             });
         }
-        if verified.iter().all(|v| v.key != key_index) {
-            verified.push(VerifiedSignature {
+        match verified.iter().find(|v| v.key == key_index) {
+            None => verified.push(VerifiedSignature {
                 key: key_index,
                 signature: index,
                 timestamp: match key.signature_type {
                     SignatureType::Ed25519 => None,
                     SignatureType::CosignatureV1 => sig.cosignature_timestamp(),
                 },
-            });
+            }),
+            // Same name and key ID, so only the signature bytes can differ.
+            Some(first) if note.signatures[first.signature].signature != sig.signature => {
+                return Err(NoteError::RepeatedKey {
+                    name: sig.name.clone(),
+                    key_id: sig.key_id,
+                });
+            }
+            Some(_) => {} // an identical repeated line
         }
     }
     if verified.is_empty() {
@@ -606,7 +667,9 @@ fn is_valid_line(line: &str) -> bool {
 
 impl Checkpoint {
     /// Parse a checkpoint body (a note's text, such as [`Note::body`]):
-    /// at least three non-empty lines, each ending in a newline.
+    /// at least three non-empty lines, each ending in a newline. The origin
+    /// may be any non-empty line, even one [`Checkpoint::encode`] refuses
+    /// to write (see the module documentation).
     pub fn parse(body: &str) -> Result<Checkpoint, NoteError> {
         let text = body
             .strip_suffix('\n')
@@ -634,12 +697,16 @@ impl Checkpoint {
         })
     }
 
-    /// The checkpoint body. Fails if the origin or an extension line is
-    /// empty or contains a newline or other control character, since the
-    /// body would then not parse back to this value.
+    /// The checkpoint body. Fails if the origin is not a tlog-cosignature
+    /// origin ([`is_valid_origin`]), which strict witnesses would refuse to
+    /// cosign, or if an extension line is empty or contains a newline or
+    /// other control character, since the body would then not parse back
+    /// to this value.
     pub fn encode(&self) -> Result<String, NoteError> {
-        if !is_valid_line(&self.origin) {
-            return Err(NoteError::Checkpoint("invalid origin line"));
+        if !is_valid_origin(&self.origin) {
+            return Err(NoteError::Checkpoint(
+                "origin must be 1 to 255 bytes with no white space, '+' or control characters",
+            ));
         }
         if !self.extensions.iter().all(|e| is_valid_line(e)) {
             return Err(NoteError::Checkpoint("invalid extension line"));
@@ -710,7 +777,7 @@ mod tests {
         let (doc, keys) = fixture();
         assert_eq!(keys.len(), 5);
         let cases = doc.get("cases").and_then(Json::as_array).unwrap();
-        assert_eq!(cases.len(), 15);
+        assert_eq!(cases.len(), 19);
         for case in cases {
             let name = case.get("name").and_then(Json::as_str).unwrap();
             let text = case.get("note").and_then(Json::as_str).unwrap();
@@ -795,6 +862,19 @@ mod tests {
                         );
                     }
                 }
+                "repeated_key" => {
+                    assert!(
+                        matches!(got, Err(NoteError::RepeatedKey { .. })),
+                        "{name}: {got:?}"
+                    );
+                    // Every line from a trusted key verifies on its own, so
+                    // the repeat alone is what rejects the note.
+                    for sig in &note.signatures {
+                        if let Some(k) = trusted.iter().find(|k| k.matches(sig)) {
+                            assert!(k.verify(&note.body, sig), "{name}");
+                        }
+                    }
+                }
                 "invalid_signature" => {
                     assert!(
                         matches!(got, Err(NoteError::InvalidSignature { .. })),
@@ -837,21 +917,107 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_keys() {
+    fn duplicate_and_ambiguous_keys() {
         let (doc, keys) = fixture();
         let case = &doc.get("cases").and_then(Json::as_array).unwrap()[0];
         let note = Note::parse(case.get("note").and_then(Json::as_str).unwrap()).unwrap();
         let log = keys[0].key.clone();
         let other = keys[3].key.clone();
+
+        // Equal keys are one key, reported at its first index: the CLI may
+        // hold a witness key twice, built in and from --witness-key.
+        let once = vec![VerifiedSignature {
+            key: 0,
+            signature: 0,
+            timestamp: None,
+        }];
         assert_eq!(
             verify_note(&note, &[log.clone(), log.clone()]),
-            Err(NoteError::AmbiguousKey {
-                name: log.name().to_string(),
-                key_id: log.key_id()
-            })
+            Ok(once.clone())
         );
-        // A duplicate that no line uses is harmless.
-        assert!(verify_note(&note, &[log, other.clone(), other]).is_ok());
+        assert_eq!(
+            verify_note(&note, &[log.clone(), other.clone(), log.clone()]),
+            Ok(once)
+        );
+
+        // Distinct keys that share a name and key ID are ambiguous. A real
+        // pair takes about 2^32 key generations to find, so these are built
+        // directly: another public key under the log's name and key ID, and
+        // the log's key registered with another signature type.
+        let ambiguous: Result<Vec<VerifiedSignature>, NoteError> = Err(NoteError::AmbiguousKey {
+            name: log.name().to_string(),
+            key_id: log.key_id(),
+        });
+        let another_key = VerifierKey {
+            public_key: *other.public_key(),
+            ..log.clone()
+        };
+        let another_type = VerifierKey {
+            signature_type: SignatureType::CosignatureV1,
+            ..log.clone()
+        };
+        for impostor in [another_key, another_type] {
+            assert_ne!(impostor, log);
+            assert_eq!(
+                verify_note(&note, &[log.clone(), impostor.clone()]),
+                ambiguous
+            );
+            assert_eq!(
+                verify_note(&note, &[impostor, log.clone(), log.clone()]),
+                ambiguous
+            );
+        }
+        // An ambiguous pair that no line uses is harmless.
+        let other_impostor = VerifierKey {
+            public_key: *log.public_key(),
+            ..other.clone()
+        };
+        assert!(verify_note(&note, &[log, other, other_impostor]).is_ok());
+    }
+
+    #[test]
+    fn repeated_key_must_sign_identical_lines() {
+        let (doc, keys) = fixture();
+        let cases = doc.get("cases").and_then(Json::as_array).unwrap();
+        let note_of = |name: &str| {
+            let case = cases
+                .iter()
+                .find(|c| c.get("name").and_then(Json::as_str) == Some(name))
+                .unwrap();
+            Note::parse(case.get("note").and_then(Json::as_str).unwrap()).unwrap()
+        };
+        let log = keys[0].key.clone();
+        let w1 = keys[1].key.clone();
+        let repeated = Err(NoteError::RepeatedKey {
+            name: w1.name().to_string(),
+            key_id: w1.key_id(),
+        });
+        // Two valid cosignatures from one witness at different times are
+        // refused in either order, rather than reporting whichever time
+        // comes first.
+        let a = note_of("two different cosignatures from one witness");
+        let mut b = a.clone();
+        b.signatures.swap(1, 2);
+        assert_ne!(a.signatures[1], a.signatures[2]);
+        for note in [&a, &b] {
+            assert!(w1.verify(&note.body, &note.signatures[1]));
+            assert!(w1.verify(&note.body, &note.signatures[2]));
+            assert_eq!(
+                verify_note(note, &[log.clone(), w1.clone()]),
+                repeated.clone()
+            );
+            // The rule applies to known keys only.
+            assert_eq!(
+                verify_note(note, std::slice::from_ref(&log)).unwrap().len(),
+                1
+            );
+        }
+        // An identical repeat is reported once, with its one timestamp.
+        let same = note_of("repeated cosignature line is reported once");
+        assert_eq!(same.signatures[0], same.signatures[2]);
+        let got = verify_note(&same, &[w1, log]).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].timestamp, same.signatures[0].cosignature_timestamp());
     }
 
     // -- Go's sumdb/note test vectors (golang.org/x/mod/sumdb/note,
@@ -894,12 +1060,18 @@ mod tests {
         assert_eq!(got.iter().map(|v| v.key).collect::<Vec<_>>(), vec![1, 0]);
         // Neither.
         assert_eq!(verify_note(&note, &[]), Err(NoteError::NoVerifiedSignature));
-        // Duplicated verifier, used and unused.
+        // Duplicated verifier, used and unused. Go's VerifierList reports
+        // the used one as an ambiguous key; here equal keys are one key,
+        // reported at its first index (see duplicate_and_ambiguous_keys).
         let enoch_only = Note::parse(&format!("{GO_TEXT}\n{ENOCH_SIG}")).unwrap();
-        assert!(matches!(
+        assert_eq!(
             verify_note(&enoch_only, &[enoch.clone(), peter.clone(), enoch.clone()]),
-            Err(NoteError::AmbiguousKey { .. })
-        ));
+            Ok(vec![VerifiedSignature {
+                key: 0,
+                signature: 0,
+                timestamp: None
+            }])
+        );
         let peter_only = Note::parse(&format!("{GO_TEXT}\n{PETER_SIG}")).unwrap();
         assert!(verify_note(&peter_only, &[enoch.clone(), peter.clone(), enoch]).is_ok());
 
@@ -1045,14 +1217,16 @@ mod tests {
                 timestamp: None
             }]
         );
+        // Its origin parses but predates tlog-cosignature's origin rules,
+        // so this crate would not write it.
+        assert!(matches!(cp.encode(), Err(NoteError::Checkpoint(_))));
         // The same body with a different size no longer verifies.
         let mut forged = note.clone();
-        forged.body = Checkpoint {
-            tree_size: cp.tree_size + 1,
-            ..cp
-        }
-        .encode()
-        .unwrap();
+        forged.body = note.body.replacen("\n68816444\n", "\n68816445\n", 1);
+        assert_eq!(
+            Checkpoint::parse(&forged.body).unwrap().tree_size,
+            cp.tree_size + 1
+        );
         assert!(matches!(
             verify_note(&forged, &[key]),
             Err(NoteError::InvalidSignature { .. })
@@ -1220,10 +1394,39 @@ mod tests {
             extensions: vec![],
         };
         assert!(cp.encode().is_ok());
-        for origin in ["", "a\nb", "a\rb"] {
+        // The encoder holds origins to tlog-cosignature: at most 255 bytes,
+        // no Unicode white space, no '+' and no control characters. The
+        // parser reads every one of these back except the first three.
+        let long = "o".repeat(MAX_ORIGIN_LEN + 1);
+        for origin in [
+            "",
+            "a\nb",
+            "a\rb",
+            "pragmatic/my server",
+            "pragmatic/server+x",
+            "a\tb",
+            "a\u{a0}b",
+            "a\u{3000}b",
+            "go.sum database tree",
+            &long,
+        ] {
             cp.origin = origin.into();
-            assert!(cp.encode().is_err(), "{origin:?}");
+            assert!(
+                matches!(cp.encode(), Err(NoteError::Checkpoint(_))),
+                "{origin:?}"
+            );
+            assert!(!is_valid_origin(origin), "{origin:?}");
         }
+        cp.origin = "o".repeat(MAX_ORIGIN_LEN);
+        assert!(cp.encode().is_ok());
+        // Multi-byte characters count in bytes: 128 two-byte letters is 256.
+        cp.origin = "\u{e9}".repeat(128);
+        assert!(cp.encode().is_err());
+        cp.origin = "\u{e9}".repeat(127);
+        assert!(cp.encode().is_ok());
+        // Parsing stays lenient about the origin, as the module explains.
+        let parsed = Checkpoint::parse(&format!("{long}\n1\n{b64}\n")).unwrap();
+        assert_eq!(parsed.origin, long);
         cp.origin = "o".into();
         cp.extensions = vec![String::new()];
         assert!(cp.encode().is_err());
@@ -1261,6 +1464,37 @@ mod tests {
         };
         assert!(VerifierKey::new("a", SignatureType::Ed25519, off_curve).is_err());
 
+        // A cosigner name is at most 255 bytes, whether the key is built or
+        // parsed. A plain Ed25519 note key's name has no length limit.
+        let max = "w".repeat(MAX_ORIGIN_LEN);
+        let long = "w".repeat(MAX_ORIGIN_LEN + 1);
+        let cosigner = VerifierKey::new(&max, SignatureType::CosignatureV1, pk).unwrap();
+        assert_eq!(VerifierKey::parse(&cosigner.encode()).unwrap(), cosigner);
+        assert_eq!(
+            VerifierKey::new(&long, SignatureType::CosignatureV1, pk),
+            Err(NoteError::VerifierKey(
+                "cosigner name is longer than 255 bytes"
+            ))
+        );
+        let mut raw = vec![SignatureType::CosignatureV1.id()];
+        raw.extend_from_slice(&pk);
+        let long_vkey = format!(
+            "{long}+{}+{}",
+            hex_encode(&key_id(&long, SignatureType::CosignatureV1, &pk)),
+            base64_encode(&raw)
+        );
+        assert_eq!(
+            VerifierKey::parse(&long_vkey),
+            Err(NoteError::VerifierKey(
+                "cosigner name is longer than 255 bytes"
+            ))
+        );
+        let long_plain = VerifierKey::new(&long, SignatureType::Ed25519, pk).unwrap();
+        assert_eq!(
+            VerifierKey::parse(&long_plain.encode()).unwrap(),
+            long_plain
+        );
+
         // Uppercase key IDs are not canonical hex.
         let upper = PETER_VKEY.replace("c74f20a3", "C74F20A3");
         assert_eq!(
@@ -1295,6 +1529,14 @@ mod tests {
             }
             .to_string(),
             "invalid signature for key PeterNeumann+c74f20a3"
+        );
+        assert_eq!(
+            NoteError::RepeatedKey {
+                name: "witness.example/one".into(),
+                key_id: [0xfb, 0x78, 0x3f, 0xf6]
+            }
+            .to_string(),
+            "two different signatures for key witness.example/one+fb783ff6"
         );
         assert_eq!(
             NoteError::NoVerifiedSignature.to_string(),

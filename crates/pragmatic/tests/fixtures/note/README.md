@@ -35,7 +35,12 @@ The file has two parts:
     signature-line order, with the index of its first line and, for
     cosignatures, the signed timestamp;
   - `invalid_signature`: a line from a trusted key fails to verify;
+  - `repeated_key`: a trusted key signed two different lines, which
+    `tlog-checkpoint` forbids;
   - `no_verified_signature`: no trusted key signed.
+
+  Lines are checked in order, and the first failing line decides the
+  result.
 
 The cases cover a log signature alone; a log signature with two witness
 cosignatures under different trust sets; unknown signers; a flipped
@@ -43,7 +48,9 @@ signature bit from a trusted and from an untrusted key; a cosignature whose
 timestamp field was changed; a cosigner key configured as a plain Ed25519
 key; the log's name and key ID on another key's signature; a cosignature
 over a different checkpoint; extension lines; the empty tree; a repeated
-signature line; and a note whose text is not a checkpoint and contains a
+log signature line and a repeated cosignature line; two valid cosignatures
+from one witness with different timestamps, in both orders and with the
+witness untrusted; and a note whose text is not a checkpoint and contains a
 blank line.
 
 ## `sum.golang.org.note`
@@ -59,6 +66,8 @@ sum.golang.org+033de0ae+Ac4zctda0e5eza+HJyk9SxEdh+s3Ux18htTTAD8OuAn8
 
 Its origin, `go.sum database tree`, contains spaces, which is why
 `Checkpoint::parse` only requires the origin line to be non-empty.
+`Checkpoint::encode` refuses to write such an origin, since `tlog-cosignature`
+now forbids spaces in origins.
 
 ## Vectors in the test source
 
