@@ -45,8 +45,10 @@ fn err<T>(msg: impl Into<String>) -> Result<T, ConfigError> {
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     /// The server's name. Anchoring checkpoints use the origin
-    /// `pragmatic/<name>`, and witness mode cosigns under it. Empty means
-    /// the host name.
+    /// `pragmatic/<name>/<log id>`, the log id being 16 hex digits of the
+    /// SHA-256 of the log's first public key (design 4.7), so two servers
+    /// that pick the same name never share an origin at a witness. Empty
+    /// means the host name.
     pub name: String,
     /// The address to listen on, `IP:port`.
     pub listen: String,
@@ -175,8 +177,10 @@ pub struct TsaConfig {
     pub url: String,
     /// PEM file of the pinned roots its tokens must chain to.
     pub roots_pem: PathBuf,
-    /// Who runs it, for counting distinct operators. Empty means the URL's
-    /// host.
+    /// Who runs it, for counting distinct operators. Required: a token
+    /// counts for the operator whose anchors verify it, so the name must be
+    /// a statement about those anchors, never a guess from a URL (design
+    /// 4.7).
     #[serde(default)]
     pub operator: String,
 }
@@ -491,6 +495,12 @@ impl Config {
             if t.roots_pem.as_os_str().is_empty() {
                 return err(format!("anchoring.tsa[{i}].roots_pem: must not be empty"));
             }
+            if t.operator.trim().is_empty() {
+                return err(format!(
+                    "anchoring.tsa[{i}].operator: must name who runs the TSA (its roots_pem \
+                     holds that operator's trust anchors)"
+                ));
+            }
         }
         for (i, w) in a.witness.iter().enumerate() {
             if !is_http_url(&w.url) {
@@ -763,6 +773,11 @@ mod tests {
             roots_pem: "/etc/roots.pem".into(),
             operator: String::new(),
         });
+        assert!(
+            c.validate().unwrap_err().0.contains("operator"),
+            "a TSA must name its operator"
+        );
+        c.anchoring.tsa[0].operator = "example".into();
         c.check_startup_rules().unwrap();
     }
 

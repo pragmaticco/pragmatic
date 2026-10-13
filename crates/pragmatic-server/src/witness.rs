@@ -26,6 +26,11 @@
 //! TSAs, and `GET /v1/witness/log/{origin}` serves it for audits. The last
 //! cosigned size is read back from that record under the run's lock, so
 //! the record and the witness's state can never disagree.
+//!
+//! A correctly signed checkpoint that fails the consistency check is a
+//! fork attempt by the log, and the refusal is evidence: it is recorded
+//! as a `witness.reject` note with the submitted checkpoint, as the
+//! anchoring library's witness does.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,6 +48,9 @@ use crate::timefmt;
 
 /// The note kind of a cosigned checkpoint in the witness record.
 pub const COSIGN_KIND: &str = "witness.cosign";
+
+/// The note kind of a refused fork attempt in the witness record.
+pub const REJECT_KIND: &str = "witness.reject";
 
 /// The most record entries one `GET /v1/witness/log/{origin}` reads.
 pub const LOG_PAGE: u64 = 1000;
@@ -255,9 +263,36 @@ impl Witness {
                 content_type: "text/x.tlog.size",
                 body: format!("{}\n", e.message),
             }),
-            Err(e) if e.code == "witness_proof" => Err(WitnessError::text(422, e.message)),
+            Err(e) if e.code == "witness_proof" => {
+                self.record_reject(store, origin, &sub, &e.message);
+                Err(WitnessError::text(422, e.message))
+            }
             Err(e) => Err(WitnessError::text(e.status, e.message)),
         }
+    }
+
+    /// Record a fork attempt: a checkpoint the log signed that does not
+    /// extend what this witness cosigned. Best effort: the refusal stands
+    /// whether or not the record could be written, and a record that
+    /// cannot be written refuses every later cosignature too.
+    fn record_reject(&self, store: &Store, origin: &str, sub: &Submission, reason: &str) {
+        let data = json!({
+            "origin": origin,
+            "old_size": sub.old,
+            "tree_size": sub.checkpoint.tree_size,
+            "root": pragmatic::encoding::base64_encode(&sub.checkpoint.root),
+            "reason": reason,
+        })
+        .to_string();
+        let note_text = sub.note_text.clone();
+        let _ = store.internal_append(&record_run_id(origin), |_| {
+            Ok((
+                REJECT_KIND.to_string(),
+                data,
+                vec![Value::from(note_text)],
+                (),
+            ))
+        });
     }
 
     /// A `cosignature/v1` line for a checkpoint body, and its timestamp.

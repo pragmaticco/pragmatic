@@ -58,8 +58,11 @@ pub fn normalize_operator(name: &str) -> String {
 // Trust inputs
 // ---------------------------------------------------------------------------
 
-/// A pinned TSA root: a PEM file of one or more root certificates, and the
-/// operator every token it verifies counts for.
+/// Pinned TSA trust anchors (`--tsa-roots OPERATOR=FILE`): a PEM file of
+/// one or more certificates, every one an anchor (`-partial_chain`, so an
+/// auditor can pin the CA that issues the operator's time-stamping
+/// certificates rather than a broad root), and the operator the tokens
+/// they verify count for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TsaRoot {
     pub operator: String,
@@ -146,7 +149,8 @@ pub struct TsaCheck<'a> {
     /// The bundle's certificates, untrusted intermediates only. Already
     /// checked to be PEM certificate blocks with canonical base64.
     pub certs_pem: &'a str,
-    /// The one pinned root file to verify against.
+    /// The one pinned anchors file to verify against. Every certificate
+    /// in it is a trust anchor, roots and issuing CAs alike.
     pub root: &'a Path,
     /// The time to validate certificates at: the token's `genTime` plus
     /// one second (`-attime`), so an expired TSA certificate that was valid
@@ -261,6 +265,7 @@ codes! {
     LogUnauditable = "log_unauditable", Failure;
     TsaUntrusted = "tsa_untrusted", Warning;
     TsaUnchecked = "tsa_unchecked", Warning;
+    TsaAmbiguous = "tsa_ambiguous", Warning;
     CosignatureUntrusted = "cosignature_untrusted", Warning;
     WitnessKeyExpired = "witness_key_expired", Warning;
     OperatorMismatch = "operator_mismatch", Warning;
@@ -1390,7 +1395,7 @@ impl Verifier<'_> {
                 self.finding(
                     Code::OperatorMismatch,
                     format!(
-                        "anchor {seq}: the bundle names the TSA's operator {claimed:?}; the pinned root that verifies it is {op:?}"
+                        "anchor {seq}: the bundle names the TSA's operator {claimed:?}; the pinned anchors that verify it are {op:?}'s"
                     ),
                 );
             }
@@ -1399,8 +1404,15 @@ impl Verifier<'_> {
         report
     }
 
-    /// Try each pinned root in turn. Returns the untrusted code (if any)
-    /// and a description; marks `report` trusted on success.
+    /// Try every pinned operator's anchors. Returns the untrusted code (if
+    /// any) and a description; marks `report` trusted when exactly one
+    /// operator's anchors verify the token.
+    ///
+    /// A token that verifies under the anchors of two operators (they pin
+    /// a shared CA, or one company under two names) says nothing about
+    /// which of them issued it, so it counts for neither
+    /// (`tsa_ambiguous`): stopping at the first match would credit
+    /// whichever operator was listed first.
     fn tsa_trust(
         &mut self,
         token: &[u8],
@@ -1416,7 +1428,12 @@ impl Verifier<'_> {
             );
         }
         let mut last = String::new();
+        let mut verified: Vec<String> = Vec::new();
         for root in &self.policy.tsa_roots {
+            let op = self.policy.operator(&root.operator);
+            if verified.contains(&op) {
+                continue;
+            }
             self.tsa_index += 1;
             let check = TsaCheck {
                 index: self.tsa_index,
@@ -1427,22 +1444,31 @@ impl Verifier<'_> {
                 at_time: info.gen_time_unix.saturating_add(1),
             };
             match self.tsa.verify(&check) {
-                TsaResult::Verified => {
-                    let op = self.policy.operator(&root.operator);
-                    report.class = WitnessClass::Trusted;
-                    report.operator = Some(op.clone());
-                    return (None, format!("verified against the pinned root for {op}"));
-                }
+                TsaResult::Verified => verified.push(op),
                 TsaResult::Rejected(why) => last = why,
                 TsaResult::Unavailable(why) => {
                     return (Some(Code::TsaUnchecked), format!("not checked: {why}"));
                 }
             }
         }
-        (
-            Some(Code::TsaUntrusted),
-            format!("does not verify against any pinned root ({last})"),
-        )
+        match verified.as_slice() {
+            [] => (
+                Some(Code::TsaUntrusted),
+                format!("does not verify against any pinned anchors ({last})"),
+            ),
+            [op] => {
+                report.class = WitnessClass::Trusted;
+                report.operator = Some(op.clone());
+                (None, format!("verified against the pinned anchors for {op}"))
+            }
+            many => (
+                Some(Code::TsaAmbiguous),
+                format!(
+                    "verifies under the pinned anchors of more than one operator ({}), so it counts for none",
+                    many.join(", ")
+                ),
+            ),
+        }
     }
 
     fn cosignature(

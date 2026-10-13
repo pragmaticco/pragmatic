@@ -167,6 +167,21 @@ async fn checkpoints_are_cosigned_consistently_and_forks_refused() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let j = stored(&ts, "pragmatic:witness:example.com/log");
     assert!(j.audit().is_ok());
+    // The fork attempt is on record as well, with the checkpoint the log
+    // signed: the refusal is evidence against the log.
+    let rejects: Vec<_> = j
+        .entries()
+        .iter()
+        .filter_map(|e| match &e.event {
+            pragmatic::Event::Note { kind, data, .. } if kind == "witness.reject" => {
+                Some(serde_json::from_str::<Value>(data).unwrap())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rejects.len(), 1, "{rejects:?}");
+    assert_eq!(rejects[0]["tree_size"], 6);
+    assert_eq!(rejects[0]["old_size"], 5);
     assert_eq!(
         j.run_start_id().as_deref(),
         Some("pragmatic:witness:example.com/log")

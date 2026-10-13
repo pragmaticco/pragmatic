@@ -290,6 +290,50 @@ fn nothing_pinned_means_unanchored() {
 }
 
 #[test]
+fn a_token_that_verifies_for_two_operators_counts_for_neither() {
+    // TSA A's anchors pinned again under another operator's name: its
+    // tokens verify under both, so neither may count them (design 5.2).
+    let mut roots = tsa_roots();
+    roots.push(TsaRoot {
+        operator: "Someone Else".into(),
+        path: dir().join("trust/tsa-a-root.pem"),
+    });
+    let r = check(
+        &bundle(),
+        &TrustPolicy {
+            tsa_roots: roots,
+            ..full_trust()
+        },
+    );
+    assert!(r.has(Code::TsaAmbiguous), "{:?}", codes(&r));
+    for a in &r.anchors {
+        for op in ["fixture-tsa-a", "someone-else"] {
+            assert!(
+                !a.trusted_operators.iter().any(|t| t == op),
+                "{op} counted: {:?}",
+                a.trusted_operators
+            );
+        }
+        assert!(a.trusted_operators.iter().any(|t| t == "fixture-tsa-b"));
+    }
+    // The same anchors pinned twice for one operator are not ambiguous.
+    let mut roots = tsa_roots();
+    roots.push(TsaRoot {
+        operator: "fixture  tsa_a".into(),
+        path: dir().join("trust/tsa-a-root.pem"),
+    });
+    let r = check(
+        &bundle(),
+        &TrustPolicy {
+            tsa_roots: roots,
+            ..full_trust()
+        },
+    );
+    assert!(!r.has(Code::TsaAmbiguous), "{:?}", codes(&r));
+    assert_eq!(r.verdict, Verdict::Verified, "{:#?}", r.findings);
+}
+
+#[test]
 fn one_operator_is_not_independent_unless_the_minimum_allows_it() {
     let policy = TrustPolicy {
         tsa_roots: tsa_roots(),

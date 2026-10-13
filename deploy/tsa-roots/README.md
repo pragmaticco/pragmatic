@@ -1,8 +1,11 @@
 # Pinned TSA roots
 
 Pragmatic Server verifies every RFC 3161 time-stamp token it stores with
-`openssl ts -verify -CAfile <roots_pem>`, and an auditor verifies evidence
-bundles the same way with `pragmatic verify-evidence --tsa-roots FILE`.
+`openssl ts -verify -CAfile <roots_pem> -partial_chain`, and an auditor
+verifies evidence bundles the same way with `pragmatic verify-evidence
+--tsa-roots OPERATOR=FILE`. Every certificate in a file is a trust anchor,
+so a file may hold the CA that issues an operator's time-stamping
+certificates instead of its root, which is narrower.
 These files are the root certificates the example configuration pins for
 the public TSAs. A root is a trust anchor, so do not take these files on
 faith: check each fingerprint against at least two sources you obtained
@@ -74,7 +77,10 @@ publication and in a root program you trust is the minimum.
 ## Using your own roots
 
 Any RFC 3161 TSA works, including qualified (eIDAS) providers as a paid
-option. Put its root (or roots) in a PEM file, name the operator in the
-`tsa` entry, and pin the same file when verifying evidence. Obtain written
+option. Put its root (or roots, or better its issuing CA) in a PEM file, name the
+operator in the `tsa` entry, and pin the same file under the same
+operator when verifying evidence. Files of different operators must not
+share a certificate: a token that verifies for two operators counts for
+neither. Obtain written
 permission from TSA operators before automated use; the server already
 spaces its requests to one TSA at least 15 seconds apart.

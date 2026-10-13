@@ -74,7 +74,7 @@ USAGE:
                       [--reason TEXT] [--dir DIR]
     pragmatic evidence RUN -o FILE [--dir DIR] [--redact none|detectors|binary|all]
                       [--detectors NAME,...] [--withhold CURSOR:SLOT]...
-    pragmatic verify-evidence FILE [--tsa-roots [OPERATOR=]PEM]...
+    pragmatic verify-evidence FILE [--tsa-roots OPERATOR=PEM]...
                       [--witness-key OPERATOR=VKEY]... [--log-key VKEY]...
                       [--min-operators N] [--log FILE] [--witness-log FILE]...
                       [--openssl | --no-openssl]
@@ -102,8 +102,10 @@ OPTIONS:
     --key-file FILE  HMAC key for keyed journals (or PRAGMATIC_JOURNAL_KEY)
     --key KEY        Deprecated: puts the key on the command line
     -o, --out FILE   Output path
-    --tsa-roots      A pinned TSA root PEM; tokens it verifies count for
-                     OPERATOR (default: the file name)
+    --tsa-roots      OPERATOR=PEM: an operator's pinned TSA trust anchors (any
+                     certificate in the file, root or issuing CA); tokens they
+                     verify count for OPERATOR, unless another operator's
+                     anchors verify them too
     --witness-key    A pinned witness key (C2SP vkey, or 64 hex digits), counted
                      for OPERATOR
     --log-key        The log's pinned key (C2SP vkey or a file holding one);

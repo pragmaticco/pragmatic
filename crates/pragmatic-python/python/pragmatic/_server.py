@@ -809,7 +809,11 @@ class ServerStore:
 
     def entries(self, run_id: str, page: int = 1000) -> List[Dict[str, Any]]:
         """``GET /v1/runs/{id}/entries`` with every page followed. Content is
-        redacted unless the token has ``view_raw``."""
+        redacted unless the token has ``view_raw``.
+
+        A page is ``{entries, next, total}``. The server also bounds a page
+        by bytes, so a page shorter than ``limit`` is not the last: only a
+        ``next`` of ``null`` is."""
         out: List[Dict[str, Any]] = []
         start = 0
         while True:
@@ -818,11 +822,23 @@ class ServerStore:
             if resp.status != 200:
                 raise self._fail(resp, "entries", run_id)
             doc = resp.json()
-            batch = doc.get("entries", []) if isinstance(doc, dict) else (doc or [])
-            out.extend(batch)
-            if not batch or len(batch) < page:
+            if not isinstance(doc, dict) or not isinstance(doc.get("entries"), list):
+                raise ServerError(
+                    f"entries of run {run_id!r} on {self.url}: the answer is not an entries page",
+                    status=resp.status,
+                    url=self.url,
+                )
+            out.extend(doc["entries"])
+            following = doc.get("next")
+            if following is None:
                 return out
-            start = int(batch[-1]["cursor"]) + 1
+            if int(following) <= start:
+                raise ServerError(
+                    f"entries of run {run_id!r} on {self.url}: the next page does not advance",
+                    status=resp.status,
+                    url=self.url,
+                )
+            start = int(following)
 
     # -- pushing local journals --------------------------------------------
 

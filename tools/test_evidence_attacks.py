@@ -415,6 +415,26 @@ class Attacks(unittest.TestCase):
         self.assertEqual(r, p, f"Rust exit {r}, Python exit {p}\n--- rust\n{rout}\n--- python\n{pout}")
         self.assertEqual(r, expect, rout)
 
+    def test_agree_one_tsa_pinned_under_two_operators(self):
+        # TSA A's anchors pinned under a second name: its tokens verify for
+        # both operators, so both verifiers count them for neither, and TSA
+        # B alone is one operator short.
+        t = os.path.join(FIX, "trust")
+        args = self.fixture_args() + ["--tsa-roots", "c=" + os.path.join(t, "tsa-a-root.pem")]
+        path = self.write("ambiguous.json", json.dumps(self.fixture_bundle(), ensure_ascii=False))
+        r, rout = self.rust(path, *args)
+        p, pout = self.py(path, *args)
+        self.assertEqual((r, p), (3, 3), f"--- rust\n{rout}\n--- python\n{pout}")
+        self.assertIn("tsa_ambiguous", rout)
+        self.assertIn("tsa_ambiguous", pout)
+
+    def test_agree_tsa_roots_need_an_operator(self):
+        root = os.path.join(FIX, "trust", "tsa-a-root.pem")
+        path = os.path.join(FIX, "bundle.json")
+        r, rout = self.rust(path, "--tsa-roots", root)
+        p, pout = self.py(path, "--tsa-roots", root)
+        self.assertEqual((r, p), (64, 64), f"--- rust\n{rout}\n--- python\n{pout}")
+
     def test_control_fixture_agrees(self):
         self.agree("fixture-unsigned.json", json.dumps(self.fixture_bundle(), ensure_ascii=False),
                    expect=0)

@@ -6,14 +6,19 @@
 //!
 //! ```text
 //! openssl ts -verify -token_in -in <i>.der -digest <anchor digest>
-//!     -CAfile <pinned root> -untrusted <i>.pem -attime <genTime + 1>
+//!     -CAfile <pinned anchors> -partial_chain -untrusted <i>.pem
+//!     -attime <genTime + 1>
 //! ```
 //!
 //! which checks the signature, the ESS signing-certificate binding, the
 //! critical `timeStamping` extended key usage, that the imprint is the
-//! anchor digest, and that the TSA certificate chains to the pinned root as
+//! anchor digest, and that the TSA certificate chains to a pinned anchor as
 //! of the time the token was made (so a TSA certificate that has since
 //! expired still verifies, and one that was not yet valid does not).
+//! `-partial_chain` makes every certificate in the pinned file an anchor,
+//! not only self-signed roots, so an auditor can pin the CA that issues an
+//! operator's time-stamping certificates instead of a root under which
+//! anyone can buy one (design 5.2). A file of roots verifies as before.
 //!
 //! Not every `openssl` can do this. macOS ships LibreSSL as
 //! `/usr/bin/openssl`, whose `ts -verify` has no `-attime`: it prints its
@@ -94,8 +99,12 @@ impl OpenSslTsa {
         if check.at_time < 0 {
             return Ok(TsaResult::Rejected("genTime is before 1970".into()));
         }
-        let root = std::fs::canonicalize(check.root)
-            .map_err(|e| format!("cannot read the pinned root {}: {e}", check.root.display()))?;
+        let root = std::fs::canonicalize(check.root).map_err(|e| {
+            format!(
+                "cannot read the pinned anchors {}: {e}",
+                check.root.display()
+            )
+        })?;
         let der = dir.join(format!("{}.der", check.index));
         std::fs::write(&der, check.token).map_err(|e| e.to_string())?;
         let mut cmd = Command::new(&self.bin);
@@ -105,6 +114,7 @@ impl OpenSslTsa {
             .arg(&digest)
             .arg("-CAfile")
             .arg(&root)
+            .arg("-partial_chain")
             .arg("-attime")
             .arg(check.at_time.to_string());
         if !check.certs_pem.trim().is_empty() {
@@ -155,8 +165,8 @@ fn classify(success: bool, stdout: &[u8], stderr: &[u8]) -> TsaResult {
 }
 
 /// Whether `bin` can check tokens as step 9 needs: it is OpenSSL (not
-/// LibreSSL) and its `ts` command takes `-attime`. Returns its version, or
-/// why not.
+/// LibreSSL) and its `ts` command takes `-attime` and `-partial_chain`.
+/// Returns its version, or why not.
 pub fn capability(bin: &Path) -> Result<String, String> {
     let run = |args: &[&str]| -> Result<String, String> {
         let out = Command::new(bin)
@@ -180,11 +190,14 @@ pub fn capability(bin: &Path) -> Result<String, String> {
             "{version}, whose ts -verify cannot check a token at its signing time (no -attime)"
         ));
     }
-    if !run(&["ts", "-help"])?.contains("-attime") {
-        return Err(format!(
-            "{} ({version}) has no ts -verify -attime",
-            bin.display()
-        ));
+    let help = run(&["ts", "-help"])?;
+    for option in ["-attime", "-partial_chain"] {
+        if !help.contains(option) {
+            return Err(format!(
+                "{} ({version}) has no ts -verify {option}",
+                bin.display()
+            ));
+        }
     }
     Ok(version)
 }

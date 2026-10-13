@@ -310,6 +310,11 @@ class Adversarial(Fixtures):
         b = load("bundle.json")
         b["anchors"][0]["leaf"] += "00"
         self.assertFails(verify(b, tsa=()), "anchor_leaf")
+        # An empty id is malformed (ids are 1 to 1024 bytes), as in the
+        # core verifier and the anchoring library.
+        empty = ve.LEAF_TAG + bytes([0]) + (0).to_bytes(4, "little") + bytes(48)
+        with self.assertRaises(ValueError):
+            ve.decode_leaf(empty)
         b = load("bundle.json")
         b["run_id"] = "another-run"
         self.assertFails(verify(b, tsa=()), "run_id_mismatch")

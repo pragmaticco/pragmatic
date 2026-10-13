@@ -90,6 +90,7 @@ class MockServer:
         advertised_max: Optional[int] = None,
         api_version: int = 1,
         snapshots: bool = True,
+        page_cap: Optional[int] = None,
     ):
         self.token = token
         self.ttl = ttl
@@ -97,6 +98,7 @@ class MockServer:
         self.advertised_max = advertised_max if advertised_max is not None else max_request_bytes
         self.api_version = api_version
         self.snapshots = snapshots
+        self.page_cap = page_cap
         self.runs: Dict[str, Run] = {}
         self.tombstones: set = set()
         self.lock = threading.RLock()
@@ -337,10 +339,17 @@ class _Handler(BaseHTTPRequestHandler):
                     return 404, error("not_found", run_id), {}
                 return 200, run.journal, {"Pragmatic-Entries": str(len(run.frames)), "Pragmatic-Head": run.head}
             if sub == "/entries" and method == "GET":
+                # As the server pages (spec 4.4): {entries, next, total},
+                # and a page may stop short of `limit` (the server bounds
+                # pages by bytes too), which `page_cap` imitates.
                 start = int(query.get("from", ["0"])[0])
                 limit = int(query.get("limit", ["1000"])[0])
-                entries = [{"cursor": i} for i in range(start, min(len(run.frames), start + limit))]
-                return 200, entries, {}
+                if m.page_cap is not None:
+                    limit = min(limit, m.page_cap)
+                total = len(run.frames)
+                end = min(total, start + limit)
+                entries = [{"cursor": i} for i in range(start, end)]
+                return 200, {"entries": entries, "next": end if end < total else None, "total": total}, {}
             if sub == "/frames" and method == "POST":
                 return self._append(run, query, body)
         return 404, error("not_found", path), {}

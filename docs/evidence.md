@@ -62,7 +62,12 @@ independently. Gather:
   website or your operating system's trust store, with the fingerprint
   checked. Pragmatic Server's default TSAs are DigiCert (root "DigiCert
   Trusted Root G4") and Sectigo (root "USERTrust RSA Certification
-  Authority"). Give each root the name of the company that runs it.
+  Authority"). Give each file the name of the company that runs it
+  (`--tsa-roots OPERATOR=FILE`; the name is required). Every certificate
+  in the file is trusted as an anchor, so you can pin the CA that issues
+  the authority's time-stamping certificates instead of its root, which
+  is narrower: under a public root, others can buy time-stamping
+  certificates too.
 - **Witness keys.** For each cosigning witness you trust, its verifier key
   (a line such as `witness.example.com+1a2b3c4d+BA...`), from the witness
   operator, and the name of that operator.
@@ -144,6 +149,10 @@ Findings you may see, and what to do:
 - `tsa_untrusted`: a time-stamp did not verify against any root you
   pinned. Check that you have the right root for that authority; if you
   do, the time-stamp is not evidence.
+- `tsa_ambiguous`: a time-stamp verified against the files of two or more
+  operators you named (they share a CA, or you pinned one company under
+  two names), so it counts for none of them. Pin each operator's own
+  issuing CA, or one name per company.
 - `cosignature_untrusted`: a witness signed, but you did not pin its key.
 - `operator_asserted`: pass the log key to check the server's signatures.
 - `anchor_id_unbound`: the server names runs in its log by HMAC, under a

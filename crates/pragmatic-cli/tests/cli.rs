@@ -513,6 +513,45 @@ fn unpinned_or_wrong_roots_leave_it_unanchored() {
     let s = stdout(&o);
     assert!(s.contains("tsa_untrusted"));
     assert!(s.contains("unable to get local issuer certificate"), "{s}");
+    // TSA B's tokens verify under both names, so they count for neither.
+    assert!(s.contains("tsa_ambiguous"), "{s}");
+}
+
+/// Every certificate in a pinned file is an anchor (`-partial_chain`), so
+/// an auditor can pin the certificate that issues an operator's tokens
+/// rather than a root; and the operator must always be named.
+#[test]
+fn issuing_certificates_can_be_pinned_and_operators_must_be_named() {
+    needs_openssl!();
+    let b = Bundle::from_json(&std::fs::read(fixture("bundle.json")).unwrap()).unwrap();
+    let issuer = b
+        .anchors
+        .iter()
+        .flat_map(|a| &a.witnesses)
+        .find_map(|w| match w {
+            Witness::Rfc3161 { tsa, certs_pem, .. } if tsa.contains("tsa-a") => {
+                Some(certs_pem.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let dir = temp("issuing");
+    let pinned = dir.join("tsa-a-issuer.pem");
+    std::fs::write(&pinned, issuer).unwrap();
+    let mut flags = full_trust();
+    flags[1] = format!("fixture-tsa-a={}", pinned.display());
+    let o = verify_evidence(&fixture("bundle.json"), &flags);
+    let s = stdout(&o);
+    assert_eq!(code(&o), 0, "{s}{}", stderr(&o));
+    assert!(s.contains("trusted (fixture-tsa-a)"), "{s}");
+    // A file without an operator is a usage error, not a guess.
+    let o = verify_evidence(
+        &fixture("bundle.json"),
+        &["--tsa-roots".into(), fixture("trust/tsa-a-root.pem")],
+    );
+    assert_eq!(code(&o), 64, "{}", stdout(&o));
+    assert!(stderr(&o).contains("OPERATOR=FILE"), "{}", stderr(&o));
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// Write a changed copy of the fixture bundle.

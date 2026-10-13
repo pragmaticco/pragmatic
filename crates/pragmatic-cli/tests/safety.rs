@@ -503,7 +503,7 @@ fn libressl_is_never_used_to_check_tokens() {
         .unwrap();
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(
-        !out.contains("does not verify against any pinned root (usage:)"),
+        !out.contains("does not verify against any pinned anchors (usage:)"),
         "an openssl that cannot run the check is reported as a rejected token:\n{out}"
     );
     assert!(out.contains("cannot check time-stamp tokens"), "{out}");

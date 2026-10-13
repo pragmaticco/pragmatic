@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Reference verifier for Pragmatic evidence bundles (pragmatic-evidence/1).
 
-    python3 verify_evidence.py BUNDLE [--tsa-roots [OPERATOR=]PEM]...
+    python3 verify_evidence.py BUNDLE [--tsa-roots OPERATOR=PEM]...
         [--witness-key OPERATOR=VKEY]... [--log-key VKEY]...
         [--min-operators N] [--log FILE] [--witness-log FILE]... [--json]
 
@@ -50,7 +50,8 @@ SEVERITY = {
     "anchor_omitted": FAILURE, "log_mismatch": FAILURE, "witness_log_fork": FAILURE,
     "witness_log_mismatch": FAILURE, "witness_log_origin": FAILURE,
     "witness_log_untrusted": FAILURE, "log_unauditable": FAILURE,
-    "tsa_untrusted": WARNING, "tsa_unchecked": WARNING, "cosignature_untrusted": WARNING,
+    "tsa_untrusted": WARNING, "tsa_unchecked": WARNING, "tsa_ambiguous": WARNING,
+    "cosignature_untrusted": WARNING,
     "witness_key_expired": WARNING, "operator_mismatch": WARNING, "log_newer": WARNING,
     "anchor_id_unbound": WARNING,
     "unsigned": INFO, "operator_asserted": INFO, "no_anchors": INFO,
@@ -813,7 +814,7 @@ def decode_leaf(d):
     try:
         kind = r.u8()
         n = r.u32()
-        if kind not in (0, 1) or n > 1024:
+        if kind not in (0, 1) or n == 0 or n > 1024:
             raise ValueError("leaf type or id length is out of range")
         ident = r.take(n)
         entries = r.u64()
@@ -1243,7 +1244,8 @@ def check_certs_pem(pem):
 
 def openssl_capability(binary):
     """None if `binary` can check tokens as step 9 needs (OpenSSL, not
-    LibreSSL, whose `ts` has no -attime), otherwise why not."""
+    LibreSSL, whose `ts` has no -attime, with -partial_chain), otherwise
+    why not."""
     def run(*args):
         p = subprocess.run([binary, *args], capture_output=True, stdin=subprocess.DEVNULL)
         return (p.stdout + p.stderr).decode(errors="replace")
@@ -1252,8 +1254,10 @@ def openssl_capability(binary):
         version = lines[0] if lines else "version unknown"
         if "LibreSSL" in version:
             return f"{version}, whose ts -verify cannot check a token at its signing time (no -attime)"
-        if "-attime" not in run("ts", "-help"):
-            return f"{binary} ({version}) has no ts -verify -attime"
+        help_text = run("ts", "-help")
+        for option in ("-attime", "-partial_chain"):
+            if option not in help_text:
+                return f"{binary} ({version}) has no ts -verify {option}"
     except OSError as e:
         return f"cannot run {binary}: {e}"
     return None
@@ -1310,7 +1314,7 @@ def openssl_verify(token, digest, certs_pem, root, at_time, index):
         with open(tok, "wb") as f:
             f.write(token)
         args = [binary, "ts", "-verify", "-token_in", "-in", tok, "-digest", hexdigest,
-                "-CAfile", os.path.abspath(root), "-attime", str(at_time)]
+                "-CAfile", os.path.abspath(root), "-partial_chain", "-attime", str(at_time)]
         if certs_pem.strip():
             pem = os.path.join(work, f"{index}.pem")
             with open(pem, "w") as f:
@@ -1735,8 +1739,12 @@ class Verifier:
             rep["detail"] = "no TSA roots are pinned"
             self.find("tsa_untrusted", f"anchor {seq}: TSA {w['tsa']!r}: no TSA roots are pinned")
             return rep
-        last = ""
+        # Every operator's anchors are tried: a token counts for an
+        # operator only if no other operator's anchors also verify it.
+        last, verified = "", []
         for op, root in self.roots:
+            if operator(op) in verified:
+                continue
             self.index += 1
             ok, why, unchecked = openssl_verify(w["token"], a["anchor_digest"], w["certs_pem"], root,
                                                 info["gen_unix"] + 1, self.index)
@@ -1745,13 +1753,21 @@ class Verifier:
                 self.find("tsa_unchecked", f"anchor {seq}: TSA {w['tsa']!r}: {rep['detail']}")
                 return rep
             if ok:
-                rep["class"], rep["operator"] = "trusted", operator(op)
-                rep["detail"] = f"verified against the pinned root for {rep['operator']}"
-                if operator(w["operator"]) != rep["operator"]:
-                    self.find("operator_mismatch", f"anchor {seq}: the bundle names another operator than the pinned root")
-                return rep
-            last = why
-        rep["detail"] = f"does not verify against any pinned root ({last})"
+                verified.append(operator(op))
+            else:
+                last = why
+        if len(verified) > 1:
+            rep["detail"] = ("verifies under the pinned anchors of more than one operator ("
+                             + ", ".join(verified) + "), so it counts for none")
+            self.find("tsa_ambiguous", f"anchor {seq}: TSA {w['tsa']!r}: {rep['detail']}")
+            return rep
+        if verified:
+            rep["class"], rep["operator"] = "trusted", verified[0]
+            rep["detail"] = f"verified against the pinned anchors for {rep['operator']}"
+            if operator(w["operator"]) != rep["operator"]:
+                self.find("operator_mismatch", f"anchor {seq}: the bundle names another operator than the pinned anchors")
+            return rep
+        rep["detail"] = f"does not verify against any pinned anchors ({last})"
         self.find("tsa_untrusted", f"anchor {seq}: TSA {w['tsa']!r}: {rep['detail']}")
         return rep
 
@@ -2047,7 +2063,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("bundle", help="the bundle file, or a directory bundle")
-    p.add_argument("--tsa-roots", action="append", default=[], metavar="[OPERATOR=]PEM")
+    p.add_argument("--tsa-roots", action="append", default=[], metavar="OPERATOR=PEM")
     p.add_argument("--witness-key", action="append", default=[], metavar="OPERATOR=VKEY")
     p.add_argument("--log-key", action="append", default=[], metavar="VKEY")
     p.add_argument("--min-operators", type=int, default=2)
@@ -2071,8 +2087,8 @@ def run(args):
     roots = []
     for v in args.tsa_roots:
         op, sep, path = v.partition("=")
-        if not sep or os.path.exists(v):
-            op, path = os.path.splitext(os.path.basename(v))[0], v
+        if not sep or not normalize(op) or not path:
+            raise UsageError(f"--tsa-roots: expected OPERATOR=FILE, got {v!r}: name the operator the anchors belong to")
         if not os.path.isfile(path):
             raise UsageError(f"--tsa-roots: {path} is not a file")
         roots.append((op, path))

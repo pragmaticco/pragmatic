@@ -5,7 +5,8 @@
 # to a default. The full reference is docs/server.md.
 
 # The server's name. Anchoring checkpoints use the origin
-# "pragmatic/<name>". Empty means the host name.
+# "pragmatic/<name>/<log id>", the log id being fixed by the log's first
+# key. Empty means the host name.
 name = ""
 
 # The address to listen on, as IP:port. A non-loopback address needs

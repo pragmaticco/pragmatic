@@ -17,9 +17,10 @@ use std::path::{Path, PathBuf};
 
 use pragmatic::encoding::hex_decode_exact;
 use pragmatic::evidence::{
-    self, AnchorLog, Audit, Bundle, CheckStatus, Code, EvidenceReport, NoTsaVerifier, Redact,
-    Severity, SignatureStatus, TrustPolicy, TsaRoot, TsaVerifier, Verdict, VerificationSpec,
-    WitnessClass, WitnessKey, WitnessLog, DIRECTORY_BUNDLE_FILE, DIRECTORY_THRESHOLD,
+    self, normalize_operator, AnchorLog, Audit, Bundle, CheckStatus, Code, EvidenceReport,
+    NoTsaVerifier, Redact, Severity, SignatureStatus, TrustPolicy, TsaRoot, TsaVerifier, Verdict,
+    VerificationSpec, WitnessClass, WitnessKey, WitnessLog, DIRECTORY_BUNDLE_FILE,
+    DIRECTORY_THRESHOLD,
 };
 use pragmatic::note::{SignatureType, VerifierKey};
 use pragmatic::redact::Kind;
@@ -243,18 +244,19 @@ fn witness_key(value: &str) -> Result<WitnessKey, Usage> {
     })
 }
 
-/// `--tsa-roots [OPERATOR=]FILE`: the operator defaults to the file's
-/// name without its extension.
+/// `--tsa-roots OPERATOR=FILE`. The operator is required: it is what a
+/// token is counted for, so it must be the auditor's statement, never
+/// something read off a file name (design 5.2).
 fn tsa_root(value: &str) -> Result<TsaRoot, Usage> {
     let (operator, path) = match value.split_once('=') {
-        Some((op, p)) if !Path::new(value).exists() => (op.to_string(), PathBuf::from(p)),
+        Some((op, p)) if !normalize_operator(op).is_empty() && !p.is_empty() => {
+            (op.to_string(), PathBuf::from(p))
+        }
         _ => {
-            let p = PathBuf::from(value);
-            let stem = p
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            (stem, p)
+            return Err(Usage(format!(
+                "--tsa-roots: expected OPERATOR=FILE, got {value:?}: name the operator the \
+                 anchors belong to"
+            )))
         }
     };
     if !path.is_file() {

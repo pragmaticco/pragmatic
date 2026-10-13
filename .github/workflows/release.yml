@@ -3,11 +3,11 @@ name: Release
 # Tag a release (e.g. `git tag v0.3.0 && git push --tags`) to publish:
 #   - the publishable Rust crates to crates.io (dependency order handled by
 #     cargo; publish=false crates like pragmatic-ffi/-python are skipped).
-#     Pragmatic Server (crates/pragmatic-server) is commercial software
-#     under the Business Source License and is never published to
-#     crates.io: it has publish = false, and the job below checks that
-#     before publishing anything. It ships as a container image and
-#     binaries instead.
+#     Pragmatic Server (crates/pragmatic-server) and its anchoring library
+#     (crates/pragmatic-anchor) are commercial software under the Business
+#     Source License and are never published to crates.io: they have
+#     publish = false, and the job below checks that before publishing
+#     anything. The server ships as a container image and binaries instead.
 #   - abi3 wheels + sdist for `pragmatic-runtime` to PyPI
 #
 # One-time setup (see RELEASING.md):
@@ -35,15 +35,16 @@ jobs:
           fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      - name: The server is never published to crates.io
+      - name: The commercial crates are never published to crates.io
         run: |
           cargo metadata --no-deps --format-version 1 | python3 -c '
           import json, sys
           meta = json.load(sys.stdin)
-          server = [p for p in meta["packages"] if p["name"] == "pragmatic-server"]
-          assert server, "pragmatic-server is missing from the workspace"
-          assert server[0]["publish"] == [], "pragmatic-server must have publish = false"
-          assert server[0]["license"] == "BUSL-1.1", "pragmatic-server must be BUSL-1.1"
+          for name in ("pragmatic-server", "pragmatic-anchor"):
+              found = [p for p in meta["packages"] if p["name"] == name]
+              assert found, f"{name} is missing from the workspace"
+              assert found[0]["publish"] == [], f"{name} must have publish = false"
+              assert found[0]["license"] == "BUSL-1.1", f"{name} must be BUSL-1.1"
           '
       - name: Publish workspace crates
         run: cargo publish --workspace --no-verify

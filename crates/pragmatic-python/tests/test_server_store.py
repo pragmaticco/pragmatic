@@ -436,7 +436,19 @@ def test_entries_are_read_page_by_page(server):
     report = rt.run("pages", lambda ctx: [ctx.uuid4() for _ in range(5)] and "ok")
     entries = rt.store.entries("pages", page=2)
     assert [e["cursor"] for e in entries] == list(range(report.journal_len))
-    assert server.count("GET", "/v1/runs/pages/entries$") == report.journal_len // 2 + 1
+    pages = (report.journal_len + 1) // 2
+    assert server.count("GET", "/v1/runs/pages/entries$") == pages
+
+
+def test_short_entries_pages_are_followed_to_next():
+    # The server bounds a page by bytes as well as by `limit`, so a short
+    # page is not the last; only `next: null` is.
+    with MockServer(page_cap=1) as srv:
+        rt = runtime(srv)
+        report = rt.run("short", lambda ctx: [ctx.uuid4() for _ in range(3)] and "ok")
+        entries = rt.store.entries("short", page=100)
+        assert [e["cursor"] for e in entries] == list(range(report.journal_len))
+        assert srv.count("GET", "/v1/runs/short/entries$") == report.journal_len
 
 
 # ---------------------------------------------------------------------------

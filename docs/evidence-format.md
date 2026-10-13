@@ -240,8 +240,8 @@ leaf_data = "pragmatic/v2/leaf" ‖ u8 type ‖ u32 len(id) ‖ id ‖
             u64 entries ‖ head (32 bytes) ‖ u64 prev_leaf_index
 ```
 
-Little-endian. `type` is 0 for a run and 1 for the access log; an id is at
-most 1024 bytes; `prev_leaf_index` is the index of the same id's previous
+Little-endian. `type` is 0 for a run and 1 for the access log; an id is 1
+to 1024 bytes (an empty id is malformed); `prev_leaf_index` is the index of the same id's previous
 leaf, or `0xFFFFFFFFFFFFFFFF` for its first; nothing follows it. Leaves are
 hashed into the log as RFC 6962 leaves: `SHA-256(0x00 ‖ leaf_data)`, with
 interior nodes `SHA-256(0x01 ‖ left ‖ right)`.
@@ -306,13 +306,17 @@ is always operator-controlled and never counts towards independence.
 
 A verifier takes trust only from its own inputs:
 
-- **TSA roots** (`--tsa-roots [OPERATOR=]FILE`, repeatable): PEM files of
-  root certificates, each with the operator its tokens count for (by
-  default the file's name without its extension). A token's operator is
-  the operator of the root that verifies it, never the bundle's
-  `operator` field. `certs_pem` is used only as untrusted intermediates.
-  The TSA certificate MUST carry the extended key usage
-  `id-kp-timeStamping`.
+- **TSA anchors** (`--tsa-roots OPERATOR=FILE`, repeatable): PEM files of
+  trust anchors, each with the operator its tokens count for. The
+  operator is required. Every certificate in a file is an anchor (OpenSSL
+  `-partial_chain`), so an auditor can pin the CA that issues an
+  operator's time-stamping certificates rather than a broad root under
+  which others can buy them; a file of roots works as well. A token's
+  operator is the operator whose anchors verify it, never the bundle's
+  `operator` field, and a token that the anchors of more than one
+  operator verify counts for none of them. `certs_pem` is used only as
+  untrusted intermediates. The TSA certificate MUST carry the extended key
+  usage `id-kp-timeStamping`.
 - **Witness keys** (`--witness-key OPERATOR=VKEY`, repeatable; or
   `OPERATOR=HEX` for a 32-byte cosignature key whose cosigner name is
   `OPERATOR`), plus the hosted Pragmatic Witness keys built into the CLI
@@ -396,29 +400,33 @@ code. Codes marked *failure* make the verdict `FAILED`; the others do not.
      (`witness_malformed`, failure), its imprint MUST be SHA-256 of
      `anchor_digest` (`tsa_imprint_mismatch`, failure), and `certs_pem`
      MUST be well formed (`witness_malformed`, failure). It is trusted if
-     it verifies against a pinned root with
+     it verifies against the pinned anchors of exactly one operator with
 
      ```text
      openssl ts -verify -token_in -in <i>.der -digest <anchor_digest>
-         -CAfile <one pinned root file> -untrusted <i>.pem -attime <genTime + 1>
+         -CAfile <one pinned anchors file> -partial_chain -untrusted <i>.pem
+         -attime <genTime + 1>
      ```
 
      run with the token and certificates written to a fresh directory only
      the verifier can read (mode 0700), files named by a counter, the
      arguments passed directly (never through a shell), every path
      absolute, and the digest checked to be 64 lowercase hex digits. Only
-     an OpenSSL whose `ts` command takes `-attime` is used (LibreSSL's does
-     not, so it cannot check a token at its signing time). Each pinned root
-     is tried in turn; the operator is that root's. A token is rejected by
-     a root only when OpenSSL ran the verification and reported it failed
-     (`Verification: FAILED`); a token that verifies against no root is
-     self-asserted (`tsa_untrusted`, warning). One that could not be
-     checked (no usable OpenSSL, or OpenSSL did not run the check, as when
-     it answers with a usage message) is self-asserted too
-     (`tsa_unchecked`, warning), and is never reported as rejected by the
-     roots. The token's time is `genTime` plus its accuracy. A trusted
-     token whose bundle `operator` disagrees with the root's operator is
-     reported (`operator_mismatch`, warning).
+     an OpenSSL whose `ts` command takes `-attime` and `-partial_chain` is
+     used (LibreSSL's does not, so it cannot check a token at its signing
+     time). Every operator's pinned anchors are tried. A token is rejected
+     by an operator's anchors only when OpenSSL ran the verification and
+     reported it failed (`Verification: FAILED`); a token that verifies
+     against no operator's anchors is self-asserted (`tsa_untrusted`,
+     warning), and one that verifies against the anchors of more than one
+     operator is self-asserted too and counts for none of them
+     (`tsa_ambiguous`, warning). One that could not be checked (no usable
+     OpenSSL, or OpenSSL did not run the check, as when it answers with a
+     usage message) is self-asserted (`tsa_unchecked`, warning), and is
+     never reported as rejected by the anchors. The token's time is
+     `genTime` plus its accuracy. A trusted token whose bundle `operator`
+     disagrees with the operator of the anchors that verify it is reported
+     (`operator_mismatch`, warning).
    - `cosignature`: the line MUST parse as a signature line naming the
      witness's `name` (`witness_malformed`, failure). It is trusted if a
      pinned witness key with that name and key id verifies it over the
@@ -541,6 +549,7 @@ code. Codes marked *failure* make the verdict `FAILED`; the others do not.
 | `cosignature_invalid` | failure | 9 |
 | `tsa_untrusted` | warning | 9 |
 | `tsa_unchecked` | warning | 9 |
+| `tsa_ambiguous` | warning | 9 |
 | `cosignature_untrusted` | warning | 9 |
 | `witness_key_expired` | warning | 9 |
 | `operator_mismatch` | warning | 9 |

@@ -10,8 +10,9 @@
 //! - **Binary fields** are replaced by
 //!   `[binary media_type=… bytes=n sha256=…]` and never served: Anthropic
 //!   content blocks whose `source.type` is `base64`, `data:` URLs (OpenAI
-//!   image inputs), `file_data`, `input_audio.data`, and codec
-//!   `{"$bytes": …}` objects. They are never scanned either; a detector
+//!   image inputs), `file_data`, OpenAI image outputs' `b64_json`,
+//!   `input_audio.data`, and codec `{"$bytes": …}` objects, as the core's
+//!   `redact::binary::scan` recognizes them. They are never scanned either; a detector
 //!   finding "personal data" inside base64 would be noise.
 //! - **Text** (every other string, and numbers, which can hold a card
 //!   number) goes through the core detectors and the configured patterns.
@@ -120,11 +121,13 @@ impl Redactor {
         self.kinds.iter().map(|k| k.name()).collect()
     }
 
-    /// SHA-256 over the configured patterns (newline-separated), so a
-    /// bundle can say which patterns were applied without listing them.
+    /// SHA-256 of the canonical JSON array of the configured patterns, as
+    /// an evidence bundle's `redaction.patterns_sha256` states it (design
+    /// 5.1), so a bundle can say which patterns were applied without
+    /// listing them, and a verifier holding the list can check it.
     pub fn patterns_sha256(&self) -> String {
-        let joined: Vec<&str> = self.patterns.iter().map(Regex::as_str).collect();
-        hex_encode(&sha256(joined.join("\n").as_bytes()))
+        let patterns: Vec<&str> = self.patterns.iter().map(Regex::as_str).collect();
+        hex_encode(&pragmatic::evidence::patterns_sha256(&patterns))
     }
 
     /// Redact free text: embedded `data:` URLs, then the detectors, then
@@ -191,7 +194,7 @@ impl Redactor {
                 if let Some(b) = self.data_url_binary(&s) {
                     return Json::String(b.placeholder());
                 }
-                if key == Some("file_data") {
+                if matches!(key, Some("file_data") | Some("b64_json")) {
                     return Json::String(
                         binary_of_base64("application/octet-stream", &s).placeholder(),
                     );
@@ -499,5 +502,23 @@ mod tests {
         let a = redactor().patterns_sha256();
         assert_eq!(a, redactor().patterns_sha256());
         assert_eq!(a.len(), 64);
+        // The digest evidence bundles carry: the canonical JSON array.
+        assert_eq!(
+            a,
+            hex_encode(&sha256(br#"["ACME-\\d{6}"]"#)),
+            "patterns_sha256 is SHA-256 of the canonical JSON array"
+        );
+    }
+
+    #[test]
+    fn openai_image_outputs_are_withheld() {
+        let b64 = base64_encode(b"\x89PNG image bytes");
+        let slot = format!(r#"{{"created":1,"data":[{{"b64_json":"{b64}"}}]}}"#);
+        let out = text(redactor().redact_slot(slot.as_bytes()));
+        assert!(!out.contains(&b64), "{out}");
+        assert!(
+            out.contains("[binary media_type=application/octet-stream bytes=16"),
+            "{out}"
+        );
     }
 }

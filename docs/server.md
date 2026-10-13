@@ -145,7 +145,7 @@ setting cannot silently fall back to its default.
 
 | key | default | meaning |
 |---|---|---|
-| `name` | host name | The server's name. Anchoring checkpoints use the origin `pragmatic/<name>`; witness mode cosigns under it. |
+| `name` | host name | The server's name. Anchoring checkpoints use the origin `pragmatic/<name>/<log id>`, where the log id is 16 hex digits of the SHA-256 of the log's first public key, fixed when that key is made. |
 | `listen` | `"127.0.0.1:7272"` | IP address and port to listen on. |
 | `data_dir` | `"/var/lib/pragmatic"` | Where runs, the access log, tokens and anchors live. |
 | `allow_plain_http` | `false` | Allow a non-loopback `listen`. TLS must then terminate in front of the server. |
@@ -174,7 +174,7 @@ setting cannot silently fall back to its default.
 | key | default | meaning |
 |---|---|---|
 | `interval_secs` | `600` | Seconds between anchoring batches (60 to 3600). A batch also runs within 30 seconds after an agent finishes successfully. |
-| `tsa` | `[]` | RFC 3161 time-stamping authorities: `{ url, roots_pem, operator }`. `roots_pem` is the pinned root certificate file; `operator` names who runs it (default: the URL's host). |
+| `tsa` | `[]` | RFC 3161 time-stamping authorities: `{ url, roots_pem, operator }`. `roots_pem` holds that operator's pinned trust anchors (a root, or better the CA that issues its time-stamping certificates); `operator` names who runs it and is required. |
 | `witness` | `[]` | C2SP tlog-witness cosigners: `{ url, public_key, token_file, name, operator }`. |
 | `allow_self_anchoring` | `false` | Start without an independent witness. |
 | `anchor_run_ids` | `"plain"` | `"plain"` puts run ids in anchor leaves; `"hmac"` puts a keyed hash, so the anchor log reveals no run ids. |

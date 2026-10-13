@@ -2010,7 +2010,7 @@ bundle: it is the operator whose anchors verify the token. The `operator`
 in a witness object is written by the server, which this verification
 does not trust, so it is shown but never counted. A token that verifies
 under the anchors of more than one operator counts for none of them, and
-the report says so.
+the report says so (`tsa_ambiguous`, a warning).
 
 ### 5.3 Checks (`pragmatic verify-evidence FILE`)
 
@@ -2656,6 +2656,8 @@ Resolved while building the clients:
 - a self-signed TSA
 - a TSA token relabeled with another `operator` (counted by the
   verifier's anchors, not the label)
+- a TSA token whose anchors are pinned for two operators (counted for
+  neither, `tsa_ambiguous`)
 - a swapped witness key
 - an omitted anchor (caught by `--log`)
 - an entries or head mismatch
@@ -2741,3 +2743,29 @@ is brought to it when the server is wired to its components:
   `entries`, a lease is renewed only by the same token, entries pages are
   `{entries, next, total}` and are followed by `next`, and `chain_broken`
   and `not_implemented` are definitive errors (`ServerError` in Python).
+
+Not yet true of the code, and due when the server is wired to the
+anchoring library, the evidence module and the console:
+
+- The server's configuration still reads witnesses as `{public_key,
+  name}` and witness-mode origins as `{name, public_key}`, and has no
+  `[keys] anchor_key_file` or `[witness_mode] name, key_file` (4.1).
+- The server signs with a PKCS#8 key named by its SHA-256, writes its own
+  `key.rotate` message and cosigns with that same key; the anchoring
+  library's `LogSigner`, `KeyRotation` and a separate witness key replace
+  them (4.7, 4.8).
+- Server views detect binary fields with their own rules, which now
+  include `b64_json`; they move to `redact::binary::scan` (4.10).
+- `GET /v1/witness/log/{origin}` answers `{origin, cosigned, next}`, which
+  `--witness-log` does not read (it takes `{witness, origin,
+  checkpoints}`); one of the two is converted (5.3).
+- `hooks::Anchoring` (`anchor`, `last_leaves`, `anchored_lengths`, and the
+  rest) is implemented over `pragmatic_anchor::Anchorer`. Its
+  `AnchorHost` needs a way to hear about snapshots the library refuses as
+  regressed or rewritten, which today only `BatchOutcome::skipped`
+  carries, and the adapter calls `retry_pending` between batches.
+- `hooks::ConsoleRenderer` hands the renderer redacted Entry JSON page by
+  page, while `pragmatic-console` renders a whole `Journal`; the sign-in,
+  access log, holds and tokens pages exist only in the server.
+- `/v1/info` announces `min_sdk` 0.6.0 while the workspace, and so the
+  Python SDK built from it, is still versioned 0.5.0.

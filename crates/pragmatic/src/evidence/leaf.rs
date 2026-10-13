@@ -34,7 +34,9 @@ pub const LEAF_ACCESS_LOG: u8 = 1;
 /// `prev_leaf_index` of an id's first leaf.
 pub const NO_PREVIOUS: u64 = u64::MAX;
 /// The longest id a leaf may carry. A run id is at most 200 bytes and an
-/// HMAC id 32, so anything longer is malformed.
+/// HMAC id 32, so anything longer is malformed. An id is never empty: run
+/// ids are not, the access log's is `access`, and the anchoring library
+/// refuses to write an empty one, so an empty id can only be forged.
 pub const MAX_LEAF_ID: usize = 1024;
 
 /// One decoded anchor log leaf.
@@ -66,7 +68,7 @@ impl Leaf {
         out
     }
 
-    /// Decode leaf data exactly: the tag, a known type, an id of at most
+    /// Decode leaf data exactly: the tag, a known type, an id of 1 to
     /// [`MAX_LEAF_ID`] bytes, and nothing after the last field.
     pub fn decode(data: &[u8]) -> Result<Leaf, &'static str> {
         let rest = data
@@ -78,7 +80,7 @@ impl Leaf {
         }
         let (len, rest) = take::<4>(rest)?;
         let len = u32::from_le_bytes(len) as usize;
-        if len > MAX_LEAF_ID || len > rest.len() {
+        if len == 0 || len > MAX_LEAF_ID || len > rest.len() {
             return Err("leaf id length is out of range");
         }
         let (id, rest) = rest.split_at(len);
@@ -262,6 +264,14 @@ mod tests {
         let mut len = data;
         len[LEAF_TAG.len() + 1] = 0xff;
         assert!(Leaf::decode(&len).is_err());
+        let empty = Leaf {
+            id: Vec::new(),
+            ..leaf()
+        };
+        assert!(
+            Leaf::decode(&empty.encode()).is_err(),
+            "an empty id is refused, as the anchoring library refuses to write one"
+        );
     }
 
     #[test]
