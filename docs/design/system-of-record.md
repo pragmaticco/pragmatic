@@ -3,7 +3,8 @@
 Status: design, revision 3 (2026-10-13), after an adversarial review across
 cryptography, replay correctness, storage and failure handling, compliance,
 developer experience and completeness, amended after the review of the core
-runtime (2.4, 2.6 to 2.8, 2.11, 2.12, 2.14, 3.1 to 3.3, 6.7). This document
+runtime (2.4, 2.6 to 2.8, 2.11, 2.12, 2.14, 3.1 to 3.3, 6.7) and with the
+anchoring library (1.5, 4.1, 4.2, 4.7, 4.8, 5.1). This document
 is the contract
 between the components built for 0.6. Everything marked MUST is
 normative; where code and this document disagree, one of them is a bug.
@@ -85,6 +86,12 @@ the server.
     `license = "BUSL-1.1"`, has `publish = false`, is excluded from
     `cargo publish --workspace`, and ships as a container image and
     binaries.
+  - The anchoring library the server calls, `crates/pragmatic-anchor`
+    (sections 4.7 and 4.8), is part of the same commercial layer under the
+    same terms: its own `LICENSE` (BUSL 1.1, Licensed Work "Pragmatic
+    Server and anchoring"), `license = "BUSL-1.1"` and `publish = false`.
+    The formats it writes come from the Apache-2.0 core, so verifying
+    anchors never needs it.
 - **No license enforcement in code:** `[license] licensee` from the server
   config is shown in the console footer and in `/v1/info`.
 
@@ -911,14 +918,16 @@ public_url = ""
 [keys]
 signing_key_file = "/etc/pragmatic/server.ed25519"   # refused inside data_dir unless allow_key_in_data_dir
 allow_key_in_data_dir = false
+anchor_key_file = ""                 # 32 random bytes; required when anchor_run_ids = "hmac" (4.7)
 
 [bootstrap]
 admin_token_sha256 = ""              # first admin; all other tokens are issued through the API
 
 [anchoring]
-interval_secs = 60
-tsa = [ { url = "https://freetsa.org/tsr", roots_pem = "/etc/pragmatic/tsa/freetsa-root.pem" } ]
-witness = [ { url = "https://witness.pragmatic.example", public_key = "hex", token_file = "..." } ]
+interval_secs = 600                  # 60 to 3600 (4.7)
+min_independent_operators = 2
+tsa = [ { url = "http://timestamp.digicert.com", operator = "digicert", roots_pem = "/etc/pragmatic/tsa/digicert_g4.pem" } ]
+witness = [ { url = "https://witness.pragmatic.example", vkey = "<name>+<key id>+<base64>", operator = "", token_file = "..." } ]
 allow_self_anchoring = false
 anchor_run_ids = "plain"             # or "hmac"
 
@@ -940,7 +949,9 @@ events = ["chain_broken", "anchor_failed", "regressed", "erasure", "retention", 
 
 [witness_mode]
 enabled = false
-origins = [ { name = "acme", token_sha256 = "hex" } ]
+name = "witness.example.com"         # the cosigner key name (a tlog-cosignature name)
+key_file = "/etc/pragmatic/witness.ed25519"
+origins = [ { name = "acme", origin = "pragmatic/acme", log_vkeys = ["pragmatic/acme+<key id>+<base64>"], token_sha256 = "hex" } ]
 
 [license]
 licensee = ""
@@ -959,6 +970,10 @@ licensee = ""
   runs/<hh>/<64hex>.tombstone.json    {run_id, deleted_at, entries, head, policy}
   anchors/log.leaves                  the cumulative anchor log, append-only
   anchors/sth/<seq 20-digit>.json     one per batch, create_new, never overwritten
+  anchors/batches/<seq 20-digit>.json run id of each leaf of the batch (never served raw)
+  anchors/witness/<seq 20-digit>/<label>.json
+                                      one verified witness result per witness, create_new
+  witness/witness.journal             witness mode only: cosigned checkpoints, journal format 2
   audit/access.journal                the access log, journal format 2
   erasure-ledger.jsonl                every erasure and shred, also streamed to webhooks
 ```
@@ -1131,14 +1146,28 @@ leaf_data = "pragmatic/v2/leaf" ‖ u8 type (0 run, 1 access log) ‖ u32 len(id
             u64 entries ‖ head(32) ‖ u64 prev_leaf_index (u64::MAX if none)
 ```
 
+- Integers are little-endian, as everywhere in format 2, and `id` is 1 to
+  1024 bytes. The Merkle leaf hash is RFC 6962's `SHA-256(0x00 ‖
+  leaf_data)`.
 - With `anchor_run_ids = "hmac"`, `id` = HMAC-SHA-256(anchor_salt,
   run_id), and bundles carry the per-run value needed to recompute it.
+  The salt is per run, `anchor_salt = HMAC-SHA-256(anchor_key,
+  "pragmatic/v2/anchor-salt" ‖ run_id)` with the 32-byte
+  `[keys] anchor_key_file`, so a bundle's salt (its `anchor_id`, 5.1)
+  recomputes that run's id and reveals nothing about the log's other ids.
+- The access log's leaves (type 1) carry the id `access` in both modes. A
+  server in witness mode anchors its witness journal (4.8) as run
+  `pragmatic:witness`.
 - Every `interval_secs`, one task snapshots, under each run's lock, the
   fsynced `(entries, head)` of every run and of the access log that
   changed since its last leaf. Runs created by PUT are included even with
   zero entries.
 - Leaves are appended to the log in order of (type, raw id bytes).
   Duplicate ids within a batch abort the batch.
+- A snapshot with fewer entries than its id's latest leaf, or the same
+  entries and another head, contradicts a signed leaf. It is never
+  anchored; the server marks the run `regressed`. A snapshot equal to the
+  latest leaf is skipped.
 - Each batch ends in a **checkpoint**, a signed tree head in the C2SP
   `tlog-checkpoint` format. This is the format used by Go's checksum
   database and Sigstore, so existing witness and verification tooling
@@ -1149,10 +1178,28 @@ leaf_data = "pragmatic/v2/leaf" ‖ u8 type (0 run, 1 access log) ‖ u32 len(id
   - `origin` is `pragmatic/<server name>`, from config.
   - The checkpoint is signed as a C2SP `signed-note` with the server's
     Ed25519 key, with key id = SHA-256(name ‖ 0x0A ‖ 0x01 ‖ pubkey)[:4].
+    The key name is the origin. Key files use the Go `sumdb/note` private
+    key format, `PRIVATE+KEY+<name>+<key id>+<base64(0x01 ‖ seed)>`.
   - `seq` is the batch number: a gap-free u64 recovered at startup as the
     maximum + 1.
   - The checkpoint file stores the consistency proof from the previous
-    tree.
+    tree: `{seq, tree_size, root, checkpoint (the signed note),
+    anchor_digest, prev_tree_size, consistency_from_prev, created_at}`.
+- **Files and recovery.** `log.leaves` is a 16-byte header (`PRAGLEAF`,
+  u32 LE version 1, u32 LE flags 0), then `u32 LE len ‖ leaf_data` per
+  leaf. A batch commits in this order, each step fsynced with its
+  directory: the leaves, `batches/<seq>.json`, then `sth/<seq>.json`,
+  which is the commit point. At startup the latest checkpoint's tree size
+  says how many leaves are real:
+  - leaves past it (a crash before the checkpoint was stored) are moved to
+    `log.leaves.uncommitted-<unix ms>` and the file is truncated; so is a
+    latest checkpoint file that is not even JSON (a torn write), and batch
+    indexes newer than the latest checkpoint are removed;
+  - a leaf inside the checkpointed prefix that does not decode, a
+    checkpoint root the leaves do not reproduce, leaves out of order
+    within a batch, or a broken `prev_leaf_index` chain is corruption: the
+    server refuses to start. Every checkpoint root is recomputed from the
+    leaves at startup.
 - **What witnesses timestamp:** `anchor_digest = SHA-256(checkpoint body)`,
   meaning the body only. Signatures and cosignatures can therefore be added
   later without changing the anchored digest.
@@ -1162,7 +1209,9 @@ leaf_data = "pragmatic/v2/leaf" ‖ u8 type (0 run, 1 access log) ‖ u32 len(id
   (`anchor=now`).
 - **Anchoring never blocks journaling.** The anchoring lag (the age of the
   oldest unanchored append) is a metric and an alert. It is the window in
-  which an insider could rewrite history undetected.
+  which an insider could rewrite history undetected. The server measures
+  it from each append's time and the `anchored_entries` each batch
+  reports.
 
 Witnesses:
 
@@ -1184,24 +1233,42 @@ Witnesses:
 - **`server-ed25519`:** the checkpoint signature itself. It is always on,
   operator-controlled, and never counted as independent.
 - **`witness`:** a C2SP `tlog-witness` cosigner (4.8), such as the hosted
-  Pragmatic Witness.
+  Pragmatic Witness. Each is configured with its `url` (requests go to
+  `<url>/add-checkpoint`), its `cosignature/v1` vkey, an `operator`
+  (default: the key name) and a bearer token. The server submits from
+  the size the witness last cosigned for it, learning that size from a
+  409 when it does not know it.
 
 Rules:
 
 - The checkpoint file is stored as soon as the server signature exists.
 - Failed external witnesses are retried against the same checkpoint with a
-  fresh nonce, with backoff.
+  fresh nonce, with backoff. Older checkpoints are retried before newer
+  ones, so a cosigner sees the log's checkpoints in order; once a cosigner
+  has cosigned a newer checkpoint it can never cosign an older one, and
+  that retry is dropped. Each verified result is stored as
+  `anchors/witness/<seq>/<label>.json`; the first per witness is kept.
 - A checkpoint counts as *independently anchored* once witnesses from at
   least `min_independent_operators` distinct operators (default 2) have
   verified. A run's `anchored_entries` advances only then. Entrust is
   treated as the same operator as Sectigo, and QuoVadis EU as the same
   operator as DigiCert. An alert fires if fewer than the minimum succeed
   for 3 intervals.
+- A run's leaves in different checkpoints can become independent out of
+  order (a retry succeeds late), so `anchored_entries` is the largest
+  `entries` among its independently anchored leaves.
+  `min_independent_operators = 0` lets the server's signature alone
+  advance it, for `allow_self_anchoring` deployments.
 - Each TSA request times out after 30 s.
 
 **Key rotation:** `keygen --rotate` appends a `key.rotate` record (old and
 new key ids, signed by both) to the access log. `GET /v1/keys` lists every
-key with its validity window.
+key with its validity window. Both keys sign `"pragmatic/v2/key-rotate\n"
+‖ canonical JSON of {at, new_key_id, new_public_key, old_key_id,
+old_public_key}`; the note data is those fields plus `old_signature` and
+`new_signature`, all hex. Key ids are the 4-byte note key ids. The origin
+does not change on rotation, and the server refuses to sign for a log
+whose checkpoints name another origin.
 
 ### 4.8 Witness mode
 
@@ -1210,23 +1277,41 @@ can cosign checkpoints for other logs and join the public witness network.
 
 - **Endpoint:** with `[witness_mode] enabled`, `POST /add-checkpoint`
   accepts the body defined by `tlog-witness`: an `old <size>` line, the
-  consistency proof lines, and the signed checkpoint.
+  consistency proof lines, and the signed checkpoint. (`POST /v1/witness`
+  in 4.4 is the same handler.)
 - **Who may submit:** each origin is configured with the log's public
   key, and callers authenticate with a `witness_client` token bound to
   that origin. The origin always comes from the configuration, never from
-  the body.
-- **Checks:**
-  - the log's signature on the checkpoint;
+  the body. An origin entry gives its configuration `name` (bound to the
+  token, and the `{origin}` of the log endpoint), the checkpoint `origin`
+  line and the log's vkeys; a checkpoint naming another origin than the
+  token's is refused with 403.
+- **Checks**, in the protocol's order:
+  - the log's signature on the checkpoint (403);
+  - an old size no larger than the checkpoint's (400);
   - that the old size matches the last size this witness cosigned for the
     origin (otherwise 409 with the witness's current size, as the
-    protocol specifies);
-  - the consistency proof.
+    protocol specifies: `<size>\n` as `text/x.tlog.size`);
+  - the consistency proof, empty from size 0, and equal roots at equal
+    sizes; a size-0 checkpoint must have the empty root (422).
 - **What it returns:** a `cosignature/v1` signature line (Ed25519)
   covering `"cosignature/v1\ntime <unix>\n" ‖ checkpoint body`.
 - **Its own record:** the witness appends every cosigned checkpoint to its
   own journal, which it anchors to its own TSAs.
   `GET /v1/witness/log/{origin}?after=` returns the cosigned history for
   audits.
+  - The journal is `witness/witness.journal`, format 2, run id
+    `pragmatic:witness`, anchored in the server's own log like a run.
+  - Each cosigned checkpoint is a `witness.cosign` note `{origin,
+    old_size, tree_size, root, timestamp, checkpoint, cosignature}`,
+    durable before the cosignature is returned and atomic with the size
+    check, so a crash can never make the witness forget a cosignature and
+    sign a fork. The latest size per origin is recovered from it at
+    startup.
+  - A correctly signed checkpoint that fails the consistency checks (a
+    fork attempt) is recorded as a `witness.reject` note.
+  - The log endpoint pages by journal cursor: `after` is a cursor, and
+    the response is `{origin, records: [{cursor, ...}], next}`.
 
 Pragmatic Research runs the hosted witness with this same binary. The CLI
 ships its public keys, an empty list until it launches.
@@ -1413,6 +1498,10 @@ becomes a directory with the journal as a separate file referenced by
   never altered inside a slot.
 - `anchors` is the run's full leaf chain, from its first leaf through its
   latest, linked by `prev_leaf_index`.
+- `leaf` is the hex of the full `leaf_data` (4.7). `anchor_id` is `null`
+  with plain run ids, and the lowercase hex of the run's 32-byte
+  `anchor_salt` with HMAC ids, so the verifier checks that the leaf's id
+  equals `HMAC-SHA-256(anchor_id, run_id)`.
 - `records` is the journal decoded for human reading (CSV and HTML
   renderers come from the CLI).
 
