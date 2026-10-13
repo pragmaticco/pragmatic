@@ -5,6 +5,7 @@ members = [
     "crates/pragmatic-macros",
     "crates/pragmatic-anthropic",
     "crates/pragmatic-cli",
+    "crates/pragmatic-console",
     "crates/pragmatic-python",
     "crates/pragmatic-ffi",
     "crates/pragmatic-openai",

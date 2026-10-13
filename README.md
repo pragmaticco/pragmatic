@@ -177,7 +177,8 @@ agent itself** must be recoverable and auditable:
 | [`pragmatic-macros`](crates/pragmatic-macros) | `#[pragmatic::durable]` - program identity, journaled and verified (sync and async fns) | **zero** |
 | [`pragmatic-anthropic`](crates/pragmatic-anthropic) | Claude as a journaled Oracle - plain completions **and full tool-use loops** (Messages API), wire-tested over real sockets | `ureq`, `serde_json` |
 | [`pragmatic-openai`](crates/pragmatic-openai) | Any OpenAI-compatible server (OpenAI, Ollama, vLLM, …) as a journaled Oracle, wire-tested | `ureq`, `serde_json` |
-| [`pragmatic-cli`](crates/pragmatic-cli) | `pragmatic runs / show / verify / export / serve` - HTML replay console, exportable or served live | **zero** |
+| [`pragmatic-cli`](crates/pragmatic-cli) | `pragmatic runs / show / verify / export / serve / erase / evidence / verify-evidence / render-evidence`: inspect, erase and export runs, and verify evidence bundles offline against pinned trust roots | **zero** |
+| [`pragmatic-console`](crates/pragmatic-console) | The HTML and CSV views of runs and evidence bundles, shared by the CLI and Pragmatic Server | **zero** |
 | [`pragmatic-python`](crates/pragmatic-python) | The runtime from Python (`pip install pragmatic-runtime`); journals byte-compatible with Rust | `pyo3` |
 | [`pragmatic-ffi`](crates/pragmatic-ffi) | The C ABI behind the [C++ / Java / Go / Node bindings](bindings/) | **zero** |
 

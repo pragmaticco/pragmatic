@@ -68,6 +68,64 @@ pub fn root(leaves: &[Digest]) -> Digest {
     }
 }
 
+/// The roots of the trees made of the first `s` leaves, for each `s` in
+/// `sizes`, in the order given: `prefix_roots(leaves, &[s])[0]` equals
+/// `root(&leaves[..s])`, and a size beyond `leaves.len()` gives `None`.
+///
+/// An auditor holding a log's full leaf list uses this to check every tree
+/// head a witness cosigned against the list itself. Recomputing [`root`]
+/// for each size would cost O(n) hashes per size; this makes one pass over
+/// the leaves, keeping the *frontier* (the roots of the perfect subtrees
+/// that a tree of the current size splits into, largest first), so it
+/// costs O(n) hashes plus O(log n) per size. The root of a tree is its
+/// frontier folded from the right, `node(P1, node(P2, ... node(Pk-1, Pk)))`,
+/// which is RFC 6962's split at the largest power of two below the size,
+/// applied recursively.
+pub fn prefix_roots(leaves: &[Digest], sizes: &[u64]) -> Vec<Option<Digest>> {
+    let mut order: Vec<usize> = (0..sizes.len()).collect();
+    order.sort_by_key(|&i| sizes[i]);
+    let mut out = vec![None; sizes.len()];
+    // (root, height) of each perfect subtree, left to right.
+    let mut frontier: Vec<(Digest, u32)> = Vec::new();
+    let mut size = 0u64;
+    let mut pending = order.into_iter().peekable();
+    while let Some(&i) = pending.peek() {
+        if sizes[i] == size {
+            out[i] = Some(fold_frontier(&frontier));
+            pending.next();
+            continue;
+        }
+        let Some(leaf) = leaves.get(size as usize) else {
+            break; // every remaining size is beyond the leaves
+        };
+        let mut node = *leaf;
+        let mut height = 0;
+        while let Some(&(left, h)) = frontier.last() {
+            if h != height {
+                break;
+            }
+            frontier.pop();
+            node = node_hash(&left, &node);
+            height += 1;
+        }
+        frontier.push((node, height));
+        size += 1;
+    }
+    out
+}
+
+/// The root of a tree from its frontier (see [`prefix_roots`]).
+fn fold_frontier(frontier: &[(Digest, u32)]) -> Digest {
+    let mut subtrees = frontier.iter().rev();
+    let Some(&(mut acc, _)) = subtrees.next() else {
+        return empty_root();
+    };
+    for (left, _) in subtrees {
+        acc = node_hash(left, &acc);
+    }
+    acc
+}
+
 /// `MTH` for a non-empty list.
 fn subtree_root(leaves: &[Digest]) -> Digest {
     if leaves.len() == 1 {
@@ -622,6 +680,25 @@ mod tests {
         assert!(!verify_consistency(0, 0, &empty, &r5, &[]));
         assert!(!verify_consistency(0, 0, &r5, &empty, &[]));
         assert!(!verify_consistency(0, 0, &empty, &empty, &[empty]));
+    }
+
+    #[test]
+    fn prefix_roots_equal_the_roots_of_prefixes() {
+        let leaves = synthetic_leaves(70);
+        let sizes: Vec<u64> = (0..=72).rev().collect();
+        let roots = prefix_roots(&leaves, &sizes);
+        for (s, r) in sizes.iter().zip(&roots) {
+            let want = (*s as usize <= leaves.len()).then(|| root(&leaves[..*s as usize]));
+            assert_eq!(*r, want, "size {s}");
+        }
+        // Repeated sizes, in any order, and the RFC 6962 vectors.
+        let v = vector_leaves();
+        let got = prefix_roots(&v, &[8, 3, 8, 0]);
+        assert_eq!(got[0], Some(digest(ROOTS[7])));
+        assert_eq!(got[1], Some(digest(ROOTS[2])));
+        assert_eq!(got[2], got[0]);
+        assert_eq!(got[3], Some(empty_root()));
+        assert!(prefix_roots(&[], &[]).is_empty());
     }
 
     #[test]
