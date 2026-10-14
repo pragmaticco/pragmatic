@@ -6,7 +6,9 @@ categories = ["development-tools", "visualization"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+# The code is Apache-2.0; the bundled fonts (assets/fonts in
+# pragmatic-console) are under the SIL Open Font License 1.1.
+license = "Apache-2.0 AND OFL-1.1"
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true

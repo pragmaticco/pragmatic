@@ -36,6 +36,9 @@ COPY --from=build /src/target/release/pragmatic-server /usr/local/bin/pragmatic-
 COPY deploy/tsa-roots /etc/pragmatic/tsa-roots
 COPY deploy/pragmatic.example.toml /etc/pragmatic/pragmatic.example.toml
 COPY crates/pragmatic-server/LICENSE /usr/share/doc/pragmatic-server/LICENSE
+# The console's fonts are built into the binary: their licence travels too.
+COPY NOTICE crates/pragmatic-console/assets/fonts/OFL-EBGaramond.txt \
+     crates/pragmatic-console/assets/fonts/OFL-IBMPlexMono.txt /usr/share/doc/pragmatic-server/
 USER 10001:10001
 VOLUME ["/var/lib/pragmatic"]
 EXPOSE 7272

@@ -8,15 +8,22 @@
 //! immutable cache (Pragmatic Server and `pragmatic serve`, whose policy
 //! then allows `font-src 'self'`).
 //!
-//! Every face first tries the fonts installed on the reader's machine
-//! (`local()`), then the bundled file if there is one. A face with no
-//! bundled file and no installed font falls through the family stack to
-//! Georgia (scaled to Garamond's metrics) or the system monospace.
+//! The crate bundles all four faces the design uses, as the Latin subsets
+//! Google Fonts serves, unmodified: EB Garamond roman and italic, and IBM
+//! Plex Mono regular and medium. Every face loads from its bundled file
+//! only, never from a copy installed on the reader's machine (which may be
+//! another version with other metrics), so a page looks the same
+//! everywhere, as the website does. While a file loads, Georgia (scaled to
+//! Garamond's metrics) or Menlo (scaled to Plex Mono's x-height) stands
+//! in, so text barely moves.
 //!
-//! Adding a font is one line in [`BUNDLED`]: the file in
-//! `assets/fonts/`, its family and its style. Every bundled font is under
-//! the SIL Open Font License 1.1 (`assets/fonts/OFL.txt`), which the
-//! stylesheet repeats in a comment with each font's copyright line.
+//! Both families are under the SIL Open Font License 1.1, whose text is in
+//! `assets/fonts/` (`OFL-EBGaramond.txt`, `OFL-IBMPlexMono.txt`), and the
+//! stylesheet repeats each font's copyright line in a comment. IBM Plex
+//! has the Reserved Font Name "Plex": its files are shipped exactly as
+//! distributed and keep their family name. Adding a font is one line in
+//! [`BUNDLED`]: the file in `assets/fonts/`, its family, style, weight and
+//! copyright line.
 
 use std::sync::OnceLock;
 
@@ -30,6 +37,8 @@ pub struct BundledFont {
     pub family: &'static str,
     /// `normal` or `italic`.
     pub style: &'static str,
+    /// The CSS weight, `400` or `500`.
+    pub weight: u16,
     /// The file's name in `assets/fonts/`.
     pub file: &'static str,
     /// Its copyright line, repeated in the stylesheet.
@@ -37,12 +46,13 @@ pub struct BundledFont {
     pub bytes: &'static [u8],
 }
 
-/// One bundled font: `font!(family, style, file, copyright)`.
+/// One bundled font: `font!(family, style, weight, file, copyright)`.
 macro_rules! font {
-    ($family:literal, $style:literal, $file:literal, $copyright:literal) => {
+    ($family:literal, $style:literal, $weight:literal, $file:literal, $copyright:expr) => {
         BundledFont {
             family: $family,
             style: $style,
+            weight: $weight,
             file: $file,
             copyright: $copyright,
             bytes: include_bytes!(concat!("../assets/fonts/", $file)),
@@ -50,44 +60,41 @@ macro_rules! font {
     };
 }
 
-/// The fonts the crate ships. EB Garamond Italic and IBM Plex Mono are
-/// added here, one line each, once their files are in `assets/fonts/`.
-pub const BUNDLED: &[BundledFont] = &[font!(
-    "EB Garamond",
-    "normal",
-    "eb-garamond-latin.woff2",
-    "Copyright 2017 The EB Garamond Project Authors (https://github.com/octaviopardo/EBGaramond12)"
-)];
+const GARAMOND: &str =
+    "Copyright 2017 The EB Garamond Project Authors (https://github.com/octaviopardo/EBGaramond12)";
+const PLEX: &str = "Copyright \u{a9} 2017 IBM Corp. with Reserved Font Name \"Plex\"";
 
-/// The faces the stylesheet declares, and the names an installed copy of
-/// each goes by (full name and PostScript name).
-struct Face {
-    family: &'static str,
-    style: &'static str,
-    local: &'static [&'static str],
-}
-
-const FACES: &[Face] = &[
-    Face {
-        family: "EB Garamond",
-        style: "normal",
-        local: &["EB Garamond Regular", "EBGaramond-Regular", "EB Garamond"],
-    },
-    Face {
-        family: "EB Garamond",
-        style: "italic",
-        local: &["EB Garamond Italic", "EBGaramond-Italic"],
-    },
-    Face {
-        family: "IBM Plex Mono",
-        style: "normal",
-        local: &[
-            "IBM Plex Mono",
-            "IBMPlexMono",
-            "IBM Plex Mono Regular",
-            "IBMPlexMono-Regular",
-        ],
-    },
+/// The fonts the crate ships. A `static`, so each font has one address
+/// (its served name and data URI are looked up by it).
+pub static BUNDLED: &[BundledFont] = &[
+    font!(
+        "EB Garamond",
+        "normal",
+        400,
+        "eb-garamond-latin.woff2",
+        GARAMOND
+    ),
+    font!(
+        "EB Garamond",
+        "italic",
+        400,
+        "eb-garamond-italic-latin.woff2",
+        GARAMOND
+    ),
+    font!(
+        "IBM Plex Mono",
+        "normal",
+        400,
+        "ibm-plex-mono-400-latin.woff2",
+        PLEX
+    ),
+    font!(
+        "IBM Plex Mono",
+        "normal",
+        500,
+        "ibm-plex-mono-500-latin.woff2",
+        PLEX
+    ),
 ];
 
 /// Where a page finds the bundled fonts.
@@ -150,34 +157,28 @@ fn data_uri(f: &BundledFont) -> &'static str {
     uris[i].as_str()
 }
 
-/// The `@font-face` rules of a page.
+/// The `@font-face` rules of a page: one per bundled file.
 pub fn font_faces(fonts: Fonts<'_>) -> String {
     let mut out =
         String::from("/* Fonts: SIL Open Font License 1.1 (https://openfontlicense.org).\n");
     for f in BUNDLED {
-        out.push_str(&format!("   {} {}: {}\n", f.family, f.style, f.copyright));
+        out.push_str(&format!(
+            "   {} {} {}: {}\n",
+            f.family, f.style, f.weight, f.copyright
+        ));
     }
     out.push_str("*/\n");
-    for face in FACES {
-        let mut src: Vec<String> = face.local.iter().map(|n| format!("local('{n}')")).collect();
-        for f in BUNDLED
-            .iter()
-            .filter(|f| f.family == face.family && f.style == face.style)
-        {
-            let url = match fonts {
-                Fonts::Inline => data_uri(f).to_string(),
-                // The prefix is the console's own literal path; the name is
-                // hex and a fixed file name.
-                Fonts::Served(prefix) => format!("{prefix}{}", f.served_name()),
-            };
-            src.push(format!("url({url}) format('woff2')"));
-        }
+    for f in BUNDLED {
+        let url = match fonts {
+            Fonts::Inline => data_uri(f).to_string(),
+            // The prefix is the console's own literal path; the name is a
+            // fixed file name and hex.
+            Fonts::Served(prefix) => format!("{prefix}{}", f.served_name()),
+        };
         out.push_str(&format!(
-            "@font-face {{ font-family: '{}'; font-style: {}; font-weight: 400; \
-             font-display: swap; src: {}; }}\n",
-            face.family,
-            face.style,
-            src.join(", ")
+            "@font-face {{ font-family: '{}'; font-style: {}; font-weight: {}; \
+             font-display: swap; src: url({url}) format('woff2'); }}\n",
+            f.family, f.style, f.weight
         ));
     }
     // While EB Garamond loads (or where it is missing), Georgia stands in,
@@ -190,6 +191,16 @@ pub fn font_faces(fonts: Fonts<'_>) -> String {
          local('Georgia-Italic'); font-style: italic; font-weight: 400; size-adjust: 81.3%; \
          ascent-override: 124%; descent-override: 37%; line-gap-override: 0%; }\n",
     );
+    // While IBM Plex Mono loads, Menlo (macOS) or DejaVu Sans Mono (Linux)
+    // stands in, scaled to Plex Mono's x-height (0.516 against their
+    // 0.547), so data in a line of Garamond is not set larger than the
+    // design draws it.
+    out.push_str(
+        "@font-face { font-family: 'Mono Fallback'; src: local('Menlo-Regular'), \
+         local('Menlo Regular'), local('Menlo'), local('DejaVuSansMono'), \
+         local('DejaVu Sans Mono'); font-style: normal; font-weight: 400; \
+         size-adjust: 94.3%; }\n",
+    );
     out
 }
 
@@ -198,12 +209,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_bundled_font_is_a_woff2_with_a_face() {
+    fn every_bundled_font_is_an_unmodified_woff2() {
         for f in BUNDLED {
             assert_eq!(&f.bytes[..4], b"wOF2", "{}", f.file);
-            assert!(FACES
-                .iter()
-                .any(|face| face.family == f.family && face.style == f.style));
             assert!(served(f.served_name()).is_some());
             assert!(f.served_name().ends_with(".woff2"));
         }
@@ -211,28 +219,43 @@ mod tests {
             served("eb-garamond-latin.woff2").is_none(),
             "names carry a hash"
         );
+        let faces: Vec<(&str, &str, u16)> = BUNDLED
+            .iter()
+            .map(|f| (f.family, f.style, f.weight))
+            .collect();
+        assert_eq!(
+            faces,
+            [
+                ("EB Garamond", "normal", 400),
+                ("EB Garamond", "italic", 400),
+                ("IBM Plex Mono", "normal", 400),
+                ("IBM Plex Mono", "normal", 500),
+            ]
+        );
     }
 
     #[test]
-    fn faces_try_installed_fonts_first() {
+    fn faces_load_from_the_bundled_files_only() {
         let css = font_faces(Fonts::Served("/console/assets/"));
-        let italic = css
-            .lines()
-            .find(|l| l.contains("font-style: italic") && l.contains("EB Garamond'"))
-            .unwrap();
-        assert!(italic.contains("local('EB Garamond Italic'), local('EBGaramond-Italic')"));
-        let mono = css.lines().find(|l| l.contains("IBM Plex Mono'")).unwrap();
-        assert!(mono.contains("local('IBM Plex Mono'), local('IBMPlexMono')"));
-        let roman = css
-            .lines()
-            .find(|l| l.contains("EB Garamond'") && l.contains("font-style: normal"))
-            .unwrap();
-        let local = roman.find("local(").unwrap();
-        let url = roman
-            .find("url(/console/assets/eb-garamond-latin.")
-            .unwrap();
-        assert!(local < url);
-        assert!(font_faces(Fonts::Inline).contains("url(data:font/woff2;base64,d09GMg"));
+        for f in BUNDLED {
+            let face = css
+                .lines()
+                .find(|l| {
+                    l.contains(&format!("'{}'", f.family))
+                        && l.contains(&format!("font-style: {};", f.style))
+                        && l.contains(&format!("font-weight: {};", f.weight))
+                })
+                .unwrap_or_else(|| panic!("no face for {}", f.file));
+            assert!(face.contains(&format!("url(/console/assets/{})", f.served_name())));
+            assert!(!face.contains("local("), "{face}");
+            assert!(css.contains(f.copyright));
+        }
+        let inline = font_faces(Fonts::Inline);
+        assert_eq!(
+            inline.matches("url(data:font/woff2;base64,d09GMg").count(),
+            4
+        );
         assert!(css.contains("SIL Open Font License"));
+        assert!(css.contains("Reserved Font Name \"Plex\""));
     }
 }
