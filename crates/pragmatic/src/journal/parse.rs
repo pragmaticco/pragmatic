@@ -234,19 +234,19 @@ fn check_header(bytes: &[u8], key: Option<&[u8]>) -> Result<u32, JournalError> {
 }
 
 /// Why the frame at the tail start failed, with what the classifier needs.
-struct Failure {
-    reason: &'static str,
+pub(crate) struct Failure {
+    pub(crate) reason: &'static str,
     /// When the frame decoded: where it ends and the chain hash its content
     /// implies.
-    implied: Option<(usize, Digest)>,
+    pub(crate) implied: Option<(usize, Digest)>,
     /// The frame is complete and its damage cannot be what an interrupted
     /// write leaves behind, so it is corruption whatever follows (see the
     /// module docs).
-    intact: bool,
+    pub(crate) intact: bool,
 }
 
 impl Failure {
-    fn plain(reason: &'static str) -> Failure {
+    pub(crate) fn plain(reason: &'static str) -> Failure {
         Failure {
             reason,
             implied: None,
@@ -256,7 +256,7 @@ impl Failure {
 }
 
 /// `(record, stored hash, end offset)` of the frame at `pos`.
-fn read_frame(bytes: &[u8], pos: usize) -> Result<(&[u8], Digest, usize), &'static str> {
+pub(crate) fn read_frame(bytes: &[u8], pos: usize) -> Result<(&[u8], Digest, usize), &'static str> {
     if bytes.len() - pos < 4 {
         return Err("incomplete frame");
     }
@@ -278,7 +278,7 @@ fn read_frame(bytes: &[u8], pos: usize) -> Result<(&[u8], Digest, usize), &'stat
 /// implied hash up to some byte, and zeros from there to the end (a block
 /// the filesystem extended but never wrote reads back as zeros). A wrong
 /// key or a forged hash differs from the implied hash before its zeros.
-fn hash_possibly_unwritten(stored: &Digest, implied: &Digest) -> bool {
+pub(crate) fn hash_possibly_unwritten(stored: &Digest, implied: &Digest) -> bool {
     let zeros = stored.iter().rev().take_while(|&&b| b == 0).count();
     zeros > 0 && stored[..DIGEST_LEN - zeros] == implied[..DIGEST_LEN - zeros]
 }
@@ -290,25 +290,31 @@ const BLOCK: usize = 512;
 /// True if the bytes `bytes[start..end]` (a slot's content) contain a
 /// stretch that reads like a block the filesystem never wrote: for some
 /// 512-byte-aligned block of the file, its overlap with the content is all
-/// zeros.
-fn shows_unwritten_block(bytes: &[u8], start: usize, end: usize) -> bool {
+/// zeros. `base` is the file offset of `bytes[0]`: blocks are aligned in the
+/// file, not in the buffer, so a reader holding only the end of a file
+/// (the bytes after the last frame that followed the chain) passes where
+/// that end starts.
+pub(crate) fn shows_unwritten_block(bytes: &[u8], start: usize, end: usize, base: u64) -> bool {
     if start >= end {
         return false;
     }
-    let mut block = start - start % BLOCK;
-    while block < end {
-        let lo = block.max(start);
-        let hi = (block + BLOCK).min(end);
+    let misalign = ((base + start as u64) % BLOCK as u64) as usize;
+    // The block holding `start` may begin before the buffer does; only its
+    // overlap with the content is examined either way.
+    let mut block = start as i128 - misalign as i128;
+    while block < end as i128 {
+        let lo = block.max(start as i128) as usize;
+        let hi = ((block + BLOCK as i128) as usize).min(end);
         if bytes[lo..hi].iter().all(|&b| b == 0) {
             return true;
         }
-        block += BLOCK;
+        block += BLOCK as i128;
     }
     false
 }
 
 /// Where `part` starts within `whole`, for a sub-slice of it.
-fn offset_in(whole: &[u8], part: &[u8]) -> usize {
+pub(crate) fn offset_in(whole: &[u8], part: &[u8]) -> usize {
     part.as_ptr() as usize - whole.as_ptr() as usize
 }
 
@@ -341,7 +347,7 @@ pub(crate) fn first_run_start_id(prefix: &[u8]) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// The smallest possible format 2 frame: length, the smallest record, hash.
-const MIN_FRAME_V2: usize = 4 + MIN_RECORD + DIGEST_LEN;
+pub(crate) const MIN_FRAME_V2: usize = 4 + MIN_RECORD + DIGEST_LEN;
 
 fn parse_v2(bytes: &[u8], key: Option<&[u8]>, flags: u32, allow_withheld: bool) -> Lenient {
     let mut j = Journal::empty(FORMAT, flags, key, codec::genesis(key, flags));
@@ -413,7 +419,7 @@ fn next_v2(
         // was cut off by a crash only if its hash shows that too.
         let intact = if linked {
             let start = offset_in(bytes, content);
-            !shows_unwritten_block(bytes, start, start + content.len())
+            !shows_unwritten_block(bytes, start, start + content.len(), 0)
         } else {
             !hash_possibly_unwritten(&stored, &implied)
         };
@@ -445,6 +451,17 @@ fn next_v2(
 /// stored hash and its skeleton (what the chain hashes besides the previous
 /// hash and the cursor).
 fn probe_v2(j: &Journal, bytes: &[u8], p: usize, opts: DecodeOpts) -> Option<(Digest, Vec<u8>)> {
+    probe_frame(&j.entries, bytes, p, opts)
+}
+
+/// [`probe_v2`] against any list of earlier entries (none, for a reader
+/// that keeps only a journal's tail).
+pub(crate) fn probe_frame(
+    entries: &[Entry],
+    bytes: &[u8],
+    p: usize,
+    opts: DecodeOpts,
+) -> Option<(Digest, Vec<u8>)> {
     let (rec, stored, _) = read_frame(bytes, p).ok()?;
     if rec.len() < MIN_RECORD {
         return None;
@@ -456,7 +473,7 @@ fn probe_v2(j: &Journal, bytes: &[u8], p: usize, opts: DecodeOpts) -> Option<(Di
     };
     // Refs to entries the damage destroyed are accepted unresolved: the
     // largest cursor keeps "points backwards" from rejecting them.
-    let (entry, _) = codec::build_entry(&raw, Cursor::MAX, &j.entries, probe).ok()?;
+    let (entry, _) = codec::build_entry(&raw, Cursor::MAX, entries, probe).ok()?;
     Some((stored, codec::skeleton(&entry)))
 }
 
@@ -534,7 +551,7 @@ fn probe_v1(bytes: &[u8], p: usize) -> Option<(Digest, Vec<u8>)> {
 // ---------------------------------------------------------------------------
 
 /// The chain function of a format: `H(prev ‖ cursor ‖ input)`.
-type LinkFn = fn(Option<&[u8]>, &Digest, Cursor, &[u8]) -> Digest;
+pub(crate) type LinkFn = fn(Option<&[u8]>, &Digest, Cursor, &[u8]) -> Digest;
 
 /// The most chain links one classification computes. A torn tail holds at
 /// most a few candidate frames, so this is only reached by bytes crafted to
@@ -544,20 +561,20 @@ const MAX_LINK_TRIES: u64 = 1 << 18;
 
 /// The search for a frame that still chains after the damage at
 /// `tail_start` (spec 2.14).
-struct Scan<'a> {
-    bytes: &'a [u8],
-    tail_start: usize,
+pub(crate) struct Scan<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) tail_start: usize,
     /// The cursor of the failing frame.
-    failing: Cursor,
-    min_frame: usize,
-    key: Option<&'a [u8]>,
-    link: LinkFn,
+    pub(crate) failing: Cursor,
+    pub(crate) min_frame: usize,
+    pub(crate) key: Option<&'a [u8]>,
+    pub(crate) link: LinkFn,
 }
 
 impl Scan<'_> {
     /// `Some(reason)` if the damage is corruption, `None` if it is a torn
     /// tail. `probe(p)` decodes a complete, well-formed frame at `p`.
-    fn classify(
+    pub(crate) fn classify(
         &self,
         fail: &Failure,
         probe: impl Fn(usize) -> Option<(Digest, Vec<u8>)>,
@@ -643,14 +660,28 @@ mod tests {
     fn unwritten_blocks_are_aligned_zero_runs() {
         let mut bytes = vec![7u8; 4 * BLOCK];
         // Content spanning [100, 1500): no zeros at all.
-        assert!(!shows_unwritten_block(&bytes, 100, 1500));
+        assert!(!shows_unwritten_block(&bytes, 100, 1500, 0));
         // A zero run that is not a whole aligned block inside the content.
         bytes[600..1000].fill(0);
-        assert!(!shows_unwritten_block(&bytes, 100, 1500));
+        assert!(!shows_unwritten_block(&bytes, 100, 1500, 0));
         // The block [1024, 1536) zero where it overlaps the content.
         bytes[1024..1500].fill(0);
-        assert!(shows_unwritten_block(&bytes, 100, 1500));
+        assert!(shows_unwritten_block(&bytes, 100, 1500, 0));
         // An empty content shows nothing.
-        assert!(!shows_unwritten_block(&bytes, 50, 50));
+        assert!(!shows_unwritten_block(&bytes, 50, 50, 0));
+        // The same bytes held from file offset 24: the zero run [1024,
+        // 1500) of the buffer is file bytes [1048, 1524), which is no whole
+        // aligned block's overlap with the content [124, 1524) of the file.
+        assert!(!shows_unwritten_block(&bytes, 100, 1500, 24));
+        // A base that is a multiple of 512 keeps the buffer's alignment.
+        assert!(shows_unwritten_block(&bytes, 100, 1500, 512));
+        // A buffer that starts mid-block: content [0, 300) of a buffer at
+        // file offset 400 overlaps block [0, 512) for its first 112 bytes.
+        let mut tail = vec![9u8; 300];
+        tail[..112].fill(0);
+        assert!(shows_unwritten_block(&tail, 0, 300, 400));
+        // At file offset 380 the block's overlap reaches 20 bytes past the
+        // zeros.
+        assert!(!shows_unwritten_block(&tail, 0, 300, 380));
     }
 }

@@ -2,3 +2,23 @@ Pragmatic
 Copyright 2026 Pragmatic Research, Inc.
 
 This product includes software developed by Pragmatic Research, Inc.
+
+The pragmatic-console crate bundles two typefaces, as unmodified Latin
+subsets, and embeds them in the pages it renders (and so do the pragmatic
+CLI and Pragmatic Server, which serve them):
+
+- EB Garamond, roman and italic, as Google Fonts distributes them
+  (crates/pragmatic-console/assets/fonts/eb-garamond-latin.woff2,
+  eb-garamond-italic-latin.woff2),
+  Copyright 2017 The EB Garamond Project Authors
+  (https://github.com/octaviopardo/EBGaramond12),
+  licensed under the SIL Open Font License, Version 1.1
+  (crates/pragmatic-console/assets/fonts/OFL-EBGaramond.txt).
+
+- IBM Plex Mono, regular and medium, as IBM distributes them in the
+  @ibm/plex-mono 2.5.0 package
+  (crates/pragmatic-console/assets/fonts/IBMPlexMono-Regular-Latin1.woff2,
+  IBMPlexMono-Medium-Latin1.woff2),
+  Copyright (c) 2017 IBM Corp. with Reserved Font Name "Plex",
+  licensed under the SIL Open Font License, Version 1.1
+  (crates/pragmatic-console/assets/fonts/OFL-IBMPlexMono.txt).

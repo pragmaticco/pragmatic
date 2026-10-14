@@ -35,7 +35,11 @@ pub enum EraseSelector {
     /// target (and with it every other ref to that target). Pairs that are
     /// already erased are skipped, so repeating an erasure is harmless.
     Slots(Vec<(Cursor, u8)>),
-    /// Every sealed slot whose content contains these bytes.
+    /// Every sealed slot whose content contains these bytes, and every
+    /// sealed slot holding a streamed model reply whose reassembled text
+    /// contains them ([`crate::redact::stream`]): a value the model
+    /// repeated back arrives split across token deltas, and a data subject
+    /// request must reach it there too. The whole slot is erased.
     Match(Vec<u8>),
     /// Every sealed slot (shredding a run).
     All,
@@ -166,6 +170,13 @@ impl Journal {
         })
     }
 
+    /// The sealed slots an erasure of `what` would erase, in order, without
+    /// erasing anything: what a confirmation lists before the erasure acts.
+    /// A ref names its target, as [`EraseSelector::Slots`] does.
+    pub fn erase_targets(&self, what: &EraseSelector) -> Result<Vec<(Cursor, u8)>, Fault> {
+        self.select(what).map(|s| s.into_iter().collect())
+    }
+
     /// The sealed slots `what` selects.
     fn select(&self, what: &EraseSelector) -> Result<BTreeSet<(Cursor, u8)>, Fault> {
         let mut out = BTreeSet::new();
@@ -196,7 +207,7 @@ impl Journal {
                     return Err(Fault::Unsupported("erase match text is empty".into()));
                 }
                 self.for_each_sealed(|c, s, bytes| {
-                    if contains(bytes, needle) {
+                    if contains(bytes, needle) || crate::redact::stream::contains(bytes, needle) {
                         out.insert((c, s));
                     }
                 });

@@ -1,0 +1,24 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pragmatic-server
+  labels:
+    app.kubernetes.io/name: pragmatic-server
+  annotations:
+    # Journals can be large; match max_request_bytes (256 MiB by default).
+    nginx.ingress.kubernetes.io/proxy-body-size: "256m"
+spec:
+  tls:
+    - hosts: ["pragmatic.example.com"]
+      secretName: pragmatic-tls
+  rules:
+    - host: pragmatic.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: pragmatic-server
+                port:
+                  name: http

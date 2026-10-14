@@ -1,138 +1,243 @@
-//! `pragmatic serve` - the replay console as a local web app, zero
-//! dependencies. Binds loopback only; every request re-reads the journal
-//! directory, so the console live-follows runs as they record.
+//! `pragmatic serve`: the console as a local web app, with no
+//! dependencies. It binds loopback only and re-reads the journal directory
+//! on every request, so it follows runs live as they record. It never
+//! writes to the directory.
 //!
 //! Routes:
-//! - `GET /`          run index (id, entries, verification, open intents)
-//! - `GET /run/<id>`  the full replay-console timeline for one run
-//! - `GET /healthz`   liveness probe
+//! - `GET /`                   the run index
+//! - `GET /run/<id>[?from=N]`  one run's page (the timeline page from N)
+//! - `GET /healthz`            liveness probe
+//!
+//! Binding to loopback is not enough on its own: a web page the user opens
+//! can point its own host name at 127.0.0.1 (DNS rebinding) and then read
+//! this console as if it were its own origin, prompts and personal data
+//! included. So every request must name this console in its `Host` header
+//! (`127.0.0.1`, `localhost` or `[::1]`, with this port or none), and a
+//! request a browser marks as coming from another site is refused.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 
-use pragmatic::journal::Journal;
-use pragmatic::sha256::hex;
+use pragmatic::Backend;
+use pragmatic_console::fonts::{self, Fonts};
+use pragmatic_console::html::{
+    dir_name, document, esc, masthead, solo_card, Crumb, Frame, Page, SERVE_POLICY,
+};
+use pragmatic_console::{render_index_of, render_run, RunRow, RunView};
 
-use crate::{export, view};
+use crate::journals::{backend, discover, open};
 
-fn open_journal(dir: &Path, run: &str, key: Option<&[u8]>) -> Result<Journal, String> {
-    crate::open(dir, run, key)
+/// Where this console serves its fonts.
+const ASSETS: &str = "/assets/";
+
+/// The frame of every page: fonts from this console, and links home to
+/// the index. The directory is the breadcrumb's first step.
+fn with_frame<T>(f: impl FnOnce(&Frame<'_>) -> T) -> T {
+    f(&Frame {
+        csp: SERVE_POLICY,
+        fonts: Fonts::Served(ASSETS),
+        home: Some("/"),
+        nav: "",
+        footer: "",
+    })
 }
 
 fn index_page(dir: &Path, key: Option<&[u8]>) -> String {
-    let runs = crate::discover(dir).unwrap_or_default();
-    let count = runs.len();
-    let mut total_steps: u64 = 0;
-    let mut verified = 0usize;
-    let mut open_intents = 0usize;
-    let mut rows = String::new();
+    let runs = discover(dir).unwrap_or_default();
+    let rows: Vec<RunRow> = runs
+        .iter()
+        .map(|run| match open(dir, run, key) {
+            Ok(j) => RunRow::from_journal(run, &j, &j.audit()).linked(&format!("/run/{run}")),
+            Err(e) => RunRow::unreadable(run, &e),
+        })
+        .collect();
+    let source = dir.display().to_string();
+    with_frame(|frame| render_index_of(&rows, Some(&source), Some(frame)))
+}
 
-    for run in &runs {
-        match open_journal(dir, run, key) {
-            Ok(j) => {
-                total_steps += j.len();
-                let chain_ok = j.audit().is_ok();
-                if chain_ok {
-                    verified += 1;
-                }
-                let d = view::open_intents(&j).len();
-                open_intents += d;
-                let draws = view::draws(&j);
-                let chain = if chain_ok {
-                    "verified".to_string()
-                } else {
-                    "<span class=\"alarm\">BROKEN</span>".to_string()
-                };
-                let effects = if d > 0 {
-                    format!("<span class=\"alarm\">{d} open</span>")
-                } else {
-                    "<span class=\"faint\">settled</span>".to_string()
-                };
-                let head = hex(&j.head())[..12].to_string();
-                rows.push_str(&format!(
-                    "<tr class=\"run\">\
-                       <td class=\"name\"><a href=\"/run/{run}\">{run}</a></td>\
-                       <td class=\"r\">{steps}</td>\
-                       <td class=\"r\">{draws}</td>\
-                       <td>{chain}</td><td>{effects}</td>\
-                       <td><span class=\"faint\">{head}</span></td>\
-                     </tr>\n",
-                    run = export::esc(run),
-                    steps = j.len(),
-                ));
-            }
-            Err(e) => {
-                rows.push_str(&format!(
-                    "<tr class=\"run\"><td class=\"name\">{}</td>\
-                     <td colspan=\"5\"><span class=\"alarm\">{}</span></td></tr>\n",
-                    export::esc(run),
-                    export::esc(&e),
-                ));
-            }
-        }
-    }
-    let table = if rows.is_empty() {
-        "<div class=\"empty\">no journals in this directory - point an agent's \
-         runtime here and runs appear as they record</div>"
-            .to_string()
+fn run_page(dir: &Path, run: &str, from: u64, key: Option<&[u8]>) -> Result<String, String> {
+    let journal = open(dir, run, key)?;
+    // The backend's report reads past corruption; the snapshot shows the
+    // valid prefix.
+    let report = backend(dir)?
+        .verify(run, key)
+        .unwrap_or_else(|_| journal.audit());
+    let source = dir.display().to_string();
+    let link = format!("/run/{run}?from=");
+    Ok(with_frame(|frame| {
+        let view = RunView {
+            source: Some(&source),
+            from: from.min(journal.len()),
+            page_link: Some(&link),
+            frame: Some(frame),
+            ..RunView::new(run, &journal, &report)
+        };
+        render_run(&view)
+    }))
+}
+
+/// The page for a run this directory does not hold, or holds and cannot
+/// open (a wrong key, a damaged file): it says which, and why.
+fn missing_page(dir: &Path, run: &str, why: &str) -> (&'static str, String) {
+    let source = dir.display().to_string();
+    let held = discover(dir).is_ok_and(|runs| runs.iter().any(|r| r == run));
+    let status = if held {
+        "500 Internal Server Error"
     } else {
-        format!(
-            "<table>\
-               <tr><th>run</th><th class=\"r\">steps</th><th class=\"r\">draws</th>\
-                   <th>chain</th><th>effects</th><th>head</th></tr>\
-               {rows}\
-             </table>"
+        "404 Not Found"
+    };
+    let html = with_frame(|frame| {
+        let (label, title, lede) = if held {
+            (
+                "Error 500",
+                format!(
+                    "Run <span class=\"m\">{}</span> could not be opened",
+                    esc(run)
+                ),
+                format!(
+                    "<p class=\"lede\">It is in <span class=\"m\">{}</span>, but reading it \
+                     failed: <span class=\"q\">\u{201c}{}\u{201d}</span></p>",
+                    esc(&source),
+                    esc(&pragmatic_console::gist::excerpt(why, 240))
+                ),
+            )
+        } else {
+            (
+                "Error 404",
+                format!("No run named <span class=\"m\">{}</span>", esc(run)),
+                format!(
+                    "<p class=\"lede\">There is no run with this id in <span class=\"m\">{}</span>. \
+                     The id may be mistyped, or the run may have been moved.</p>",
+                    esc(&source)
+                ),
+            )
+        };
+        let body =
+            format!("{lede}<p class=\"actions\"><a class=\"go\" href=\"/\">Back to runs</a></p>");
+        let mut crumbs: Vec<Crumb<'_>> = dir_name(&source)
+            .map(|d| Crumb::word(d, frame.home))
+            .into_iter()
+            .collect();
+        crumbs.push(Crumb::id(run, None));
+        document(
+            frame,
+            &Page {
+                title: if held {
+                    "Run not opened"
+                } else {
+                    "No such run"
+                },
+                masthead: masthead(frame.home, &crumbs, frame.nav),
+                main: solo_card(label, &title, &body),
+                ..Page::default()
+            },
         )
-    };
+    });
+    (status, html)
+}
 
-    let open = if open_intents > 0 {
-        format!("<div><span class=\"alarm\">{open_intents} OPEN INTENT(S)</span></div>")
-    } else {
-        String::new()
-    };
+/// The value of header `name` (case-insensitive) in a request head.
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().skip(1).find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+    })
+}
 
-    let body = format!(
-        r#"{mast}
-<div class="facts">
-  <div><b>{count}</b> runs</div>
-  <div><b>{total_steps}</b> journal entries</div>
-  <div>chains <b>{verified}/{count}</b> verified</div>
-  {open}
-  <div>dir <b>{dir}</b></div>
-</div>
-{table}"#,
-        mast = export::masthead("runs", "live - refresh to follow"),
-        dir = export::esc(&dir.display().to_string()),
-    );
-    export::page("pragmatic console", &body)
+/// Whether a `Host` header names this console: a loopback name, with this
+/// port or none.
+fn is_own_host(host: &str, port: u16) -> bool {
+    let host = host.to_ascii_lowercase();
+    let (name, given) = match host.rsplit_once(':') {
+        // `[::1]` alone has colons inside its brackets.
+        Some((n, p)) if !p.contains(']') => (n.to_string(), Some(p.to_string())),
+        _ => (host.clone(), None),
+    };
+    let named = matches!(name.as_str(), "127.0.0.1" | "localhost" | "[::1]");
+    named && given.is_none_or(|p| p == port.to_string())
+}
+
+/// Why a request is refused before it is routed, if it is.
+fn refusal(head: &str, port: u16) -> Option<(&'static str, &'static str)> {
+    match header(head, "host") {
+        Some(h) if is_own_host(h, port) => {}
+        _ => return Some(("421 Misdirected Request", "")),
+    }
+    // Browsers say where a request comes from; only this console's own
+    // pages, and a user typing the address, may read it.
+    match header(head, "sec-fetch-site") {
+        None => None,
+        Some(v) if v.eq_ignore_ascii_case("same-origin") || v.eq_ignore_ascii_case("none") => None,
+        Some(_) => Some(("403 Forbidden", "")),
+    }
 }
 
 fn respond(stream: &mut TcpStream, status: &str, content_type: &str, body: &str) {
-    let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: {content_type}; charset=utf-8\r\n\
-         content-length: {}\r\nconnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = stream.write_all(response.as_bytes());
+    let content_type = format!("{content_type}; charset=utf-8");
+    respond_bytes(stream, status, &content_type, "no-store", body.as_bytes());
 }
 
-fn handle(mut stream: TcpStream, dir: &Path, key: Option<&[u8]>) {
-    let mut buf = [0u8; 4096];
-    let n = match stream.read(&mut buf) {
-        Ok(n) if n > 0 => n,
-        _ => return,
-    };
-    let request = String::from_utf8_lossy(&buf[..n]);
-    let path = request
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .unwrap_or("/");
+fn respond_bytes(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    cache: &str,
+    body: &[u8],
+) {
+    let head = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\n\
+         content-security-policy: {SERVE_POLICY}\r\n\
+         x-content-type-options: nosniff\r\nreferrer-policy: same-origin\r\n\
+         cache-control: {cache}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(body);
+}
 
+fn handle(mut stream: TcpStream, dir: &Path, key: Option<&[u8]>, port: u16) {
+    // Read the request head (it may arrive in pieces), up to 8 KiB.
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    while buf.len() < 8192 && !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    if buf.is_empty() {
+        return;
+    }
+    let request = String::from_utf8_lossy(&buf);
+    if let Some((status, body)) = refusal(&request, port) {
+        respond(&mut stream, status, "text/plain", body);
+        return;
+    }
+    let mut line = request.lines().next().unwrap_or("").split_whitespace();
+    let (method, path) = (line.next().unwrap_or(""), line.next().unwrap_or("/"));
+    if method != "GET" {
+        respond(
+            &mut stream,
+            "405 Method Not Allowed",
+            "text/plain",
+            "GET only",
+        );
+        return;
+    }
     match path {
         "/healthz" => respond(&mut stream, "200 OK", "text/plain", "ok"),
         "/" => respond(&mut stream, "200 OK", "text/html", &index_page(dir, key)),
+        p if p.starts_with(ASSETS) => match fonts::served(&p[ASSETS.len()..]) {
+            Some(f) => respond_bytes(
+                &mut stream,
+                "200 OK",
+                fonts::FONT_TYPE,
+                fonts::FONT_CACHE,
+                f.bytes,
+            ),
+            None => respond(&mut stream, "404 Not Found", "text/plain", "not found"),
+        },
         p if p.starts_with("/run/") => {
             // Run ids are `[A-Za-z0-9._:-]{1,200}`; anything else is cut off.
             let run: String = p["/run/".len()..]
@@ -140,29 +245,27 @@ fn handle(mut stream: TcpStream, dir: &Path, key: Option<&[u8]>) {
                 .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
                 .take(200)
                 .collect();
-            match open_journal(dir, &run, key) {
-                Ok(journal) => respond(
-                    &mut stream,
-                    "200 OK",
-                    "text/html",
-                    &export::render(&run, &journal),
-                ),
-                Err(e) => respond(
-                    &mut stream,
-                    "404 Not Found",
-                    "text/plain",
-                    &format!("no such run '{run}': {e}"),
-                ),
+            let from = p
+                .split_once("?from=")
+                .and_then(|(_, n)| n.parse::<u64>().ok())
+                .unwrap_or(0);
+            match run_page(dir, &run, from, key) {
+                Ok(html) => respond(&mut stream, "200 OK", "text/html", &html),
+                Err(why) => {
+                    let (status, page) = missing_page(dir, &run, &why);
+                    respond(&mut stream, status, "text/html", &page)
+                }
             }
         }
         _ => respond(&mut stream, "404 Not Found", "text/plain", "not found"),
     }
 }
 
-/// Serve the console until killed. Loopback-only by design: the console
-/// exposes prompts and outcomes, so putting it on a network is an explicit
-/// reverse-proxy decision, not a default.
+/// Serve the console until killed. Loopback only by design: the console
+/// shows prompts and outcomes, so putting it on a network is an explicit
+/// reverse-proxy decision, never a default.
 pub fn serve(dir: PathBuf, key: Option<Vec<u8>>, port: u16) -> Result<(), String> {
+    backend(&dir)?;
     let listener = TcpListener::bind(("127.0.0.1", port))
         .map_err(|e| format!("cannot bind 127.0.0.1:{port}: {e}"))?;
     println!(
@@ -173,7 +276,63 @@ pub fn serve(dir: PathBuf, key: Option<Vec<u8>>, port: u16) -> Result<(), String
     for stream in listener.incoming().flatten() {
         let dir = dir.clone();
         let key = key.clone();
-        std::thread::spawn(move || handle(stream, &dir, key.as_deref()));
+        std::thread::spawn(move || handle(stream, &dir, key.as_deref(), port));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_this_console_is_served() {
+        for ok in [
+            "127.0.0.1",
+            "127.0.0.1:7171",
+            "localhost",
+            "LOCALHOST:7171",
+            "[::1]",
+            "[::1]:7171",
+        ] {
+            assert!(is_own_host(ok, 7171), "{ok}");
+        }
+        for bad in [
+            "attacker.example",
+            "attacker.example:7171",
+            "127.0.0.1:8080",
+            "localhost.attacker.example",
+            "127.0.0.1.nip.io:7171",
+            "[::1]:80",
+            "",
+        ] {
+            assert!(!is_own_host(bad, 7171), "{bad}");
+        }
+    }
+
+    #[test]
+    fn foreign_hosts_and_cross_site_requests_are_refused() {
+        let req = |extra: &str| format!("GET / HTTP/1.1\r\n{extra}\r\n");
+        assert_eq!(refusal(&req("Host: localhost:7171\r\n"), 7171), None);
+        assert_eq!(
+            refusal(&req("Host: evil.example:7171\r\n"), 7171).map(|r| r.0),
+            Some("421 Misdirected Request")
+        );
+        assert!(refusal(&req(""), 7171).is_some(), "no Host header");
+        assert_eq!(
+            refusal(
+                &req("host: 127.0.0.1\r\nSec-Fetch-Site: cross-site\r\n"),
+                7171
+            )
+            .map(|r| r.0),
+            Some("403 Forbidden")
+        );
+        assert_eq!(
+            refusal(
+                &req("host: 127.0.0.1\r\nsec-fetch-site: same-origin\r\n"),
+                7171
+            ),
+            None
+        );
+    }
 }

@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pragmatic-server
+  labels:
+    app.kubernetes.io/name: pragmatic-server
+spec:
+  serviceName: pragmatic-server
+  # One server per data volume: the server locks its data directory.
+  replicas: 1
+  # A new version starts only after the old pod is deleted, never beside it.
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pragmatic-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pragmatic-server
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: pragmatic-server
+          image: pragmatic-server:0.6.0
+          args: ["serve"]
+          env:
+            - name: PRAGMATIC_CONFIG
+              value: /etc/pragmatic/pragmatic.toml
+          ports:
+            - name: http
+              containerPort: 7272
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/pragmatic
+            - name: config
+              mountPath: /etc/pragmatic/pragmatic.toml
+              subPath: pragmatic.toml
+              readOnly: true
+            - name: signing-key
+              mountPath: /etc/pragmatic/server.ed25519
+              subPath: server.ed25519
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: pragmatic-config
+        - name: signing-key
+          secret:
+            secretName: pragmatic-signing-key
+            defaultMode: 0400
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # Use a KMS-encrypted storage class (see README.md).
+        storageClassName: encrypted-ssd
+        resources:
+          requests:
+            storage: 100Gi

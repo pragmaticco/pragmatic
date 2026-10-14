@@ -1,0 +1,67 @@
+# Fuzz targets for the core's pure modules (design 3.5 and 9), run with
+# cargo-fuzz on a nightly toolchain:
+#
+#   cargo +nightly fuzz run journal_parse -- -max_total_time=600
+#
+# Its own workspace, so the main build never needs libFuzzer or nightly.
+[package]
+name = "pragmatic-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pragmatic = { path = "../crates/pragmatic" }
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "journal_parse"
+path = "fuzz_targets/journal_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json"
+path = "fuzz_targets/json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tsp"
+path = "fuzz_targets/tsp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "evidence_from_json"
+path = "fuzz_targets/evidence_from_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ed25519"
+path = "fuzz_targets/ed25519.rs"
+test = false
+doc = false
+bench = false

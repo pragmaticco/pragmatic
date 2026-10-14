@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # release.yml runs this whole workflow before it publishes anything.
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,7 +25,11 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Core is zero-dependency
         run: cargo tree -p pragmatic --no-default-features --edges normal | tail -n +2 | grep -q . && exit 1 || echo "core has no runtime deps"
-      - name: Test (debug)
+      - name: OpenSSL for the time-stamp tests
+        run: openssl version && openssl ts -help 2>&1 | grep -q -- -partial_chain
+      - name: Build every crate
+        run: cargo build --workspace --all-targets
+      - name: Test (debug), every crate
         run: cargo test --workspace
       - name: Test (release, headline numbers)
         run: cargo test --workspace --release -- --nocapture
@@ -45,7 +51,7 @@ jobs:
           sleep 2
           curl -sf http://127.0.0.1:7171/healthz
           curl -sf http://127.0.0.1:7171/ | grep -q research-42
-          curl -sf http://127.0.0.1:7171/run/research-42 | grep -q "draw.result"
+          curl -sf http://127.0.0.1:7171/run/research-42 | grep -q "draw.ok"
           kill %1
 
   python:
@@ -64,13 +70,91 @@ jobs:
       - name: Build and install the package
         run: |
           python -m venv .venv
-          .venv/bin/pip install maturin pytest anthropic openai
+          .venv/bin/pip install maturin pytest anthropic openai httpx2
           cd crates/pragmatic-python
           VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv PATH=$GITHUB_WORKSPACE/.venv/bin:$PATH maturin develop
+      - name: Framework packages, where they install
+        # The framework tests skip any framework that is not installed, so
+        # one that does not install on this Python is reported, not fatal.
+        run: |
+          for pkg in openai-agents pydantic-ai langchain-anthropic langchain-openai langgraph; do
+            .venv/bin/pip install "$pkg" || echo "::warning::$pkg did not install on Python ${{ matrix.python }}; its tests skip"
+          done
       - name: Smoke test
         run: .venv/bin/python crates/pragmatic-python/tests/smoke.py
-      - name: SDK end-to-end tests (Anthropic + OpenAI clients, mock transport)
-        run: .venv/bin/python -m pytest crates/pragmatic-python/tests -q
+      - name: SDK tests (runtime, server store, HTTP layer, frameworks)
+        run: .venv/bin/python -m pytest crates/pragmatic-python/tests -q -rs
+      - name: Reference verifier and evidence attacks
+        run: |
+          cargo build -p pragmatic-cli
+          python -I tools/test_verify_evidence.py
+          python -I tools/test_evidence_attacks.py
+
+  no-network:
+    name: server and SDK tests with outbound network blocked
+    # Proves there is no telemetry and no hidden network dependency: the
+    # server, anchoring, console and SDK tests run in a network namespace
+    # whose only interface is loopback, after everything is built.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build everything while the network is open
+        run: |
+          cargo build --workspace --all-targets
+          cargo test --no-run -p pragmatic-server -p pragmatic-anchor -p pragmatic-console
+          python -m venv .venv
+          .venv/bin/pip install maturin pytest anthropic openai httpx2
+          cd crates/pragmatic-python
+          VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv PATH=$GITHUB_WORKSPACE/.venv/bin:$PATH maturin develop
+      - name: Allow network namespaces for the runner user
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Tests in a namespace with loopback only
+        run: |
+          unshare --map-root-user --net bash -euo pipefail -c '
+            ip link set lo up
+            if curl -sS --max-time 5 -o /dev/null https://example.com; then
+              echo "outbound network is reachable; refusing to run" >&2
+              exit 1
+            fi
+            cargo test --offline -p pragmatic-server -p pragmatic-anchor -p pragmatic-console
+            .venv/bin/python -m pytest crates/pragmatic-python/tests -q -rs
+            python -I tools/test_verify_evidence.py
+            PRAGMATIC_E2E_SKIP_BUILD=1 .venv/bin/python -m pytest tests/e2e -q
+          '
+
+  e2e:
+    name: end-to-end story and the demo
+    # The whole product story against real processes (tests/e2e): the
+    # server binary, the Python SDK under the real Anthropic and OpenAI
+    # SDKs, two local OpenSSL time-stamping authorities, the CLI and the
+    # reference verifier. Then the one-command demo, which tells the same
+    # story, so it cannot rot unnoticed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: Swatinem/rust-cache@v2
+      - name: OpenSSL for the time-stamping authorities and the verifiers
+        run: openssl version && openssl ts -help 2>&1 | grep -q -- -partial_chain
+      - name: Build the server, the CLI and the Python SDK
+        run: |
+          cargo build -p pragmatic-server -p pragmatic-cli
+          python -m venv .venv
+          .venv/bin/pip install maturin pytest anthropic openai httpx2
+          cd crates/pragmatic-python
+          VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv PATH=$GITHUB_WORKSPACE/.venv/bin:$PATH maturin develop
+      - name: End-to-end story
+        run: PRAGMATIC_E2E_SKIP_BUILD=1 .venv/bin/python -m pytest tests/e2e -v -s
+      - name: The demo, as a founder runs it
+        run: PRAGMATIC_DEMO_VENV=$GITHUB_WORKSPACE/.venv examples/demo/run.sh
 
   bindings:
     name: C++ / Java / Go / Node bindings smoke tests
@@ -118,6 +202,36 @@ jobs:
             cargo test -p pragmatic-anthropic -- --ignored
           fi
 
+  msrv:
+    name: every crate builds on the minimum supported Rust (1.89)
+    # rust-version in Cargo.toml is a promise; stable alone would let a
+    # dependency or a language feature that needs a newer rustc slip in.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-targets
+
+  load:
+    name: performance targets (design 4.16), release mode
+    # The load test against the design's numbers: 1,000 appends/s across
+    # 200 runs, p50 at most 5 ms and p99 at most 25 ms server-side, and
+    # startup with many runs, sized for a hosted runner. Not on pull
+    # requests, where a noisy neighbour would make it flaky to iterate on;
+    # on main and before every release.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Load test and startup at 200,000 runs
+        env:
+          PRAGMATIC_LOAD_STARTUP_RUNS: "200000"
+          PRAGMATIC_LOAD_STARTUP_LIMIT_SECS: "15"
+        run: cargo test -p pragmatic-server --release --test perf -- --ignored --nocapture
+
   msrv-and-min:
     name: core builds without default features
     runs-on: ubuntu-latest
@@ -142,4 +256,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p pragmatic --lib rand::
+      - run: cargo test -p pragmatic --lib "rand::"

@@ -1,0 +1,52 @@
+# Pragmatic Server as a systemd service (design 4.15).
+#
+#   install -m 0755 pragmatic-server /usr/local/bin/
+#   useradd --system --home-dir /var/lib/pragmatic --shell /usr/sbin/nologin pragmatic
+#   install -d -o pragmatic -g pragmatic -m 0700 /var/lib/pragmatic
+#   install -d -m 0755 /etc/pragmatic
+#   cp deploy/pragmatic.example.toml /etc/pragmatic/pragmatic.toml   # then edit
+#   sudo -u pragmatic pragmatic-server --config /etc/pragmatic/pragmatic.toml keygen
+#   cp pragmatic-server.service /etc/systemd/system/ && systemctl daemon-reload
+#   systemctl enable --now pragmatic-server
+#
+# The log key lives in /etc/pragmatic (outside the data directory),
+# readable only by the service user. keygen prints the log's origin and the
+# vkey auditors pin with `pragmatic verify-evidence --log-key`.
+
+[Unit]
+Description=Pragmatic Server
+Documentation=https://github.com/pragmaticco/pragmatic/blob/main/docs/server.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pragmatic
+Group=pragmatic
+Environment=PRAGMATIC_CONFIG=/etc/pragmatic/pragmatic.toml
+ExecStart=/usr/local/bin/pragmatic-server serve
+Restart=on-failure
+RestartSec=5
+# SIGTERM: stop accepting, flush meta.json files and the access log, exit.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+LimitNOFILE=1048576
+
+# Hardening: the service writes only its data directory.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/var/lib/pragmatic
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

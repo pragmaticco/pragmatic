@@ -40,6 +40,15 @@
 //! SSNs and IBANs may be separated by spaces, including the no-break
 //! spaces U+00A0 and U+202F that French and other locales use and that
 //! text copied from web pages and PDFs often carries.
+//!
+//! Binary attachments (images, documents, audio) are never scanned as
+//! text: [`binary`] finds them in JSON slots and describes each by media
+//! type, size and SHA-256 instead. A streamed model reply holds its text in
+//! deltas of a few characters, where no detector sees a value split across
+//! them: [`stream`] puts that text back together.
+
+pub mod binary;
+pub mod stream;
 
 use std::collections::HashMap;
 

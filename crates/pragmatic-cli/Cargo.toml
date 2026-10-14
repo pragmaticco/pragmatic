@@ -1,12 +1,14 @@
 [package]
 name = "pragmatic-cli"
-description = "Journal tooling for the Pragmatic durable-execution runtime: list, inspect, verify, and export run timelines."
+description = "Tooling for Pragmatic journals and evidence bundles: inspect, verify, erase and export runs, and verify evidence bundles offline against pinned trust roots."
 keywords = ["agents", "llm", "durable-execution", "cli"]
 categories = ["command-line-utilities"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+# The code is Apache-2.0; the bundled fonts (assets/fonts in
+# pragmatic-console) are under the SIL Open Font License 1.1.
+license = "Apache-2.0 AND OFL-1.1"
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
@@ -16,6 +18,12 @@ authors.workspace = true
 name = "pragmatic"
 path = "src/main.rs"
 
-# Zero dependencies beyond the core, like the core itself.
+# Zero dependencies beyond the core and the console, like the core itself:
+# the CLI verifies evidence for parties who trust nobody's supply chain.
 [dependencies]
-pragmatic = { version = "0.5.0", path = "../pragmatic", default-features = false }
+pragmatic = { version = "0.6.0", path = "../pragmatic", default-features = false }
+pragmatic-console = { version = "0.6.0", path = "../pragmatic-console" }
+
+# The integration tests seed journal directories with the runtime.
+[dev-dependencies]
+pragmatic = { path = "../pragmatic", default-features = false }

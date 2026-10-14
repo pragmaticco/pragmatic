@@ -61,8 +61,34 @@ use crate::json::Json;
 use crate::sha256::Digest;
 use crate::value::Value;
 
-/// Values delivered to a run's channels and not yet received.
-pub(crate) type Inbox = Arc<Mutex<HashMap<String, VecDeque<Value>>>>;
+/// A run's channel inbox, shared by the attempts of one process.
+pub(crate) type Inbox = Arc<Mutex<Mailbox>>;
+
+/// What a run's inbox holds: the values delivered to each channel and not
+/// yet received, and the receives whose persist failed with an unknown
+/// outcome.
+#[derive(Default)]
+pub(crate) struct Mailbox {
+    /// Undelivered values, oldest first, per channel.
+    queues: HashMap<String, VecDeque<Value>>,
+    /// Receives put back on their channels because their persist failed,
+    /// as `(cursor, channel, value)`. A failed persist does not prove that
+    /// nothing was written (a server can store frames and lose its answer),
+    /// so the next checkout looks for each one in the journal it loads, and
+    /// takes the value off its channel again if the `ChannelRecv` is there:
+    /// a message is never received twice.
+    in_doubt: Vec<(Cursor, String, Value)>,
+}
+
+impl Mailbox {
+    /// Deliver `value` at the back of `channel`.
+    pub(crate) fn deliver(&mut self, channel: &str, value: Value) {
+        self.queues
+            .entry(channel.to_string())
+            .or_default()
+            .push_back(value);
+    }
+}
 
 /// What an attempt does with the run's journal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -311,6 +337,23 @@ pub(crate) fn meta_outcome(meta: &str) -> Option<String> {
     doc.get("outcome")?.as_str().map(str::to_string)
 }
 
+/// The token counters of a draw's meta `usage` object (spec 2.6), for the
+/// attempt's `usage_fresh`. Counters that are not non-negative integers are
+/// skipped: meta is written by SDKs, and a sum is only meaningful over
+/// counts.
+fn draw_usage(meta: &str) -> Vec<(String, u64)> {
+    let Some(doc) = crate::journal::strict_json_field(meta) else {
+        return Vec::new();
+    };
+    let Some(usage) = doc.get("usage").and_then(Json::as_object) else {
+        return Vec::new();
+    };
+    usage
+        .iter()
+        .filter_map(|(k, v)| v.as_u64_strict().map(|n| (k.clone(), n)))
+        .collect()
+}
+
 /// Check the options of an attempt before anything is checked out or
 /// created, so a refused run leaves nothing behind.
 pub(crate) fn check_options(opts: &RunOptions) -> Result<(), Fault> {
@@ -387,6 +430,22 @@ pub struct Session {
     /// Refusals not journaled yet, in the order they happened, with their
     /// branches (see the module documentation).
     refusals: Vec<(Branch, Event)>,
+    /// Messages taken off the inbox whose `ChannelRecv` is appended but not
+    /// yet known to be durable: `(cursor, channel, value)`. Only a session
+    /// whose sink is detached has any (see [`detach_sink`]); they go back
+    /// to the front of their channels if the persist fails or the attempt
+    /// is abandoned.
+    ///
+    /// [`detach_sink`]: Session::detach_sink
+    unconfirmed: Vec<(Cursor, String, Value)>,
+    /// The token usage of the draws this attempt completed, summed per
+    /// counter from the `usage` object of each `DrawResult` meta, for
+    /// `attempt.end.usage_fresh`.
+    usage_fresh: BTreeMap<String, u64>,
+    /// Model calls the host's journaled clients let through unrecorded
+    /// (`outside="passthrough"` in Python), for
+    /// `attempt.end.passthrough_calls`.
+    passthrough_calls: u64,
 }
 
 impl fmt::Debug for Session {
@@ -457,8 +516,14 @@ impl Session {
             attempt: 0,
             faulted: HashSet::new(),
             refusals: Vec::new(),
+            unconfirmed: Vec::new(),
+            usage_fresh: BTreeMap::new(),
+            passthrough_calls: 0,
         };
         session.index();
+        if mode != Mode::Replay {
+            session.settle_in_doubt();
+        }
         Ok(session)
     }
 
@@ -586,7 +651,7 @@ impl Session {
             ]),
             None => Json::Null,
         };
-        let data = object(vec![
+        let mut members = vec![
             ("attempt", self.attempt.into()),
             ("host", crate::sys::host_name().into()),
             ("mode", self.mode.as_str().into()),
@@ -601,8 +666,18 @@ impl Session {
             ),
             ("torn_bytes", torn.map_or(0, |t| t.bytes).into()),
             ("traceparent", Json::Null),
-        ]);
-        note_event(note::ATTEMPT_START, data, Vec::new())
+        ];
+        // Present only when an SDK loosens matching, so an attempt that
+        // compares requests exactly carries no claim either way.
+        if !opts.normalization.is_empty() {
+            let rules = opts
+                .normalization
+                .iter()
+                .map(|r| Json::from(r.as_str()))
+                .collect();
+            members.push(("normalization", Json::Array(rules)));
+        }
+        note_event(note::ATTEMPT_START, object(members), Vec::new())
     }
 
     // -----------------------------------------------------------------
@@ -959,12 +1034,12 @@ impl Session {
         let upto = self.journal.len();
         match sink.persist(at, frames, &head) {
             Ok(()) => {
-                self.journal.mark_persisted(upto);
+                self.mark_persisted(upto);
                 Ok(())
             }
             Err(e) => {
                 let fault = e.into_fault(size);
-                self.failed = Some(fault.clone());
+                self.persist_failed(fault.clone());
                 Err(fault)
             }
         }
@@ -982,13 +1057,96 @@ impl Session {
     /// Record that the first `upto_entries` entries are durable.
     pub fn mark_persisted(&mut self, upto_entries: u64) {
         self.journal.mark_persisted(upto_entries);
+        self.unconfirmed.retain(|(c, _, _)| *c >= upto_entries);
     }
 
     /// Record that a persist done outside the session failed, which fails
-    /// the session exactly as an inline persist error would.
+    /// the session exactly as an inline persist error would. Messages whose
+    /// receives were not confirmed durable go back to the front of their
+    /// channels, so the next attempt receives them again (spec 3.1), unless
+    /// the journal that attempt checks out holds the receive after all (a
+    /// store can write frames and fail to say so; see [`Mailbox`]).
     pub fn persist_failed(&mut self, fault: Fault) {
         if self.failed.is_none() {
             self.failed = Some(fault);
+        }
+        self.requeue_unconfirmed(true);
+    }
+
+    /// Take the sink out of the session, for hosts that persist on a thread
+    /// of their own (spec 6.2: an async binding persists on a dedicated
+    /// executor so its event loop never blocks on storage).
+    ///
+    /// While the sink is detached, the primitives append their entries and
+    /// return without persisting: the host takes the frames with
+    /// [`unpersisted`](Self::unpersisted), persists them through the sink
+    /// outside any lock on the session, and reports the outcome with
+    /// [`mark_persisted`](Self::mark_persisted) or
+    /// [`persist_failed`](Self::persist_failed). The durability rule is then
+    /// the host's to keep: a step's value may be released only once
+    /// [`Journal::persisted_len`] covers the step's entries, and a draw or
+    /// effect may be performed only once its intent is durable. Reattach
+    /// the sink with [`attach_sink`](Self::attach_sink) before the attempt
+    /// finishes, so `attempt.end` is persisted inline.
+    ///
+    /// Returns `None` for a strict replay, which has no sink.
+    pub fn detach_sink(&mut self) -> Option<Box<dyn Sink>> {
+        self.sink.take()
+    }
+
+    /// Put back a sink taken with [`detach_sink`](Self::detach_sink).
+    pub fn attach_sink(&mut self, sink: Box<dyn Sink>) {
+        self.sink = Some(sink);
+    }
+
+    /// Put the messages of receives that never became durable back at the
+    /// front of their channels, newest first so the oldest ends up first.
+    /// `in_doubt` is true when a persist of them was tried and failed: the
+    /// next checkout then checks whether they were written after all.
+    pub(crate) fn requeue_unconfirmed(&mut self, in_doubt: bool) {
+        let Some(inbox) = &self.inbox else {
+            self.unconfirmed.clear();
+            return;
+        };
+        let mut inbox = lock_inbox(inbox);
+        for (cursor, channel, value) in self.unconfirmed.drain(..).rev() {
+            if in_doubt {
+                inbox
+                    .in_doubt
+                    .push((cursor, channel.clone(), value.clone()));
+            }
+            inbox.queues.entry(channel).or_default().push_front(value);
+        }
+    }
+
+    /// Settle the receives an earlier attempt put back in doubt (see
+    /// [`Mailbox`]) against this session's journal, which is the run's
+    /// durable state: a receive whose `ChannelRecv` is at its cursor was
+    /// written, so its message is taken off the channel again; any other
+    /// was not, and its message stays for the next receive.
+    fn settle_in_doubt(&self) {
+        let Some(inbox) = &self.inbox else {
+            return;
+        };
+        let mut inbox = lock_inbox(inbox);
+        for (cursor, channel, value) in std::mem::take(&mut inbox.in_doubt) {
+            let written = matches!(
+                self.journal.get(cursor).map(|e| &e.event),
+                Some(Event::ChannelRecv { channel: ch, value: v })
+                    if *ch == channel
+                        && match v {
+                            Content::Sealed(stored) => *stored == value,
+                            _ => true,
+                        }
+            );
+            if !written {
+                continue;
+            }
+            if let Some(queue) = inbox.queues.get_mut(&channel) {
+                if let Some(at) = queue.iter().position(|v| *v == value) {
+                    queue.remove(at);
+                }
+            }
         }
     }
 
@@ -1214,6 +1372,7 @@ impl Session {
             ));
         };
         let ok = outcome != "error";
+        let usage = draw_usage(&meta);
         let appended = self.append(
             &branch,
             Event::DrawResult {
@@ -1231,6 +1390,10 @@ impl Session {
         }
         self.open.remove(&intent);
         self.fresh += 1;
+        for (counter, n) in usage {
+            let total = self.usage_fresh.entry(counter).or_insert(0);
+            *total = total.saturating_add(n);
+        }
         self.sync()?;
         if ok {
             self.label(TraceLabel::Oracle {
@@ -1444,6 +1607,7 @@ impl Session {
         }
         let front = self.inbox.as_ref().and_then(|inbox| {
             lock_inbox(inbox)
+                .queues
                 .get(channel)
                 .and_then(VecDeque::front)
                 .cloned()
@@ -1459,11 +1623,19 @@ impl Session {
             },
         )?;
         // Durable now, so take it. Only the attempt holding the run receives
-        // on its inbox, so the front is still this message.
+        // on its inbox, so the front is still this message. With the sink
+        // detached the host persists later: the message is taken now (so a
+        // second receive gets the next one) and put back if that persist
+        // fails.
         if let Some(inbox) = &self.inbox {
             lock_inbox(inbox)
+                .queues
                 .get_mut(channel)
                 .and_then(VecDeque::pop_front);
+        }
+        if self.sink.is_none() && self.journal.persisted_len() <= cursor {
+            self.unconfirmed
+                .push((cursor, channel.to_string(), value.clone()));
         }
         self.label(TraceLabel::Recv {
             branch: b.clone(),
@@ -1640,8 +1812,11 @@ impl Session {
             .map_or(Ok(()), Err)
     }
 
-    /// [`join`](Self::join), with the check's result for every child.
-    pub(crate) fn join_each(
+    /// [`join`](Self::join), with the check's result for every child, in
+    /// child order. Hosts that run the children themselves combine these
+    /// with the children's own failures to raise the failure of the
+    /// lowest-index failed child (rule 4 of spec 2.7).
+    pub fn join_each(
         &mut self,
         parent: &Branch,
         children: &[Branch],
@@ -1821,9 +1996,28 @@ impl Session {
         self.peek(b).is_some()
     }
 
+    /// The cursor of the next recorded start event branch `b` will match,
+    /// or `None` at the end of the branch.
+    ///
+    /// For hosts that loosen draw matching (spec 6.6): a host compares its
+    /// normalized request with the normalized parts of this entry and, when
+    /// they agree, begins the draw with the recorded parts, so the core's
+    /// exact comparison holds while the journal keeps the bytes that were
+    /// actually sent.
+    pub fn next_start(&self, b: &Branch) -> Option<Cursor> {
+        self.peek(b)
+    }
+
     /// The entry at `cursor`.
     pub fn entry(&self, cursor: Cursor) -> Option<&Entry> {
         self.journal.get(cursor)
+    }
+
+    /// Count `calls` model calls a host's journaled client let through
+    /// without recording them (spec 6.5, `outside="passthrough"`), so that
+    /// `attempt.end` tells an auditor they happened.
+    pub fn count_passthrough(&mut self, calls: u64) {
+        self.passthrough_calls = self.passthrough_calls.saturating_add(calls);
     }
 
     /// The journal as this session sees it.
@@ -1921,15 +2115,20 @@ impl Session {
                 vec![Value::default(), Value::from(f.to_string())],
             ),
         };
+        let usage = self
+            .usage_fresh
+            .iter()
+            .map(|(k, n)| (k.clone(), Json::from(*n)))
+            .collect();
         let data = object(vec![
             ("attempt", self.attempt.into()),
             ("fault_cursor", cursor),
             ("fault_kind", kind),
             ("fresh", self.fresh.into()),
             ("outcome", outcome.into()),
-            ("passthrough_calls", 0u64.into()),
+            ("passthrough_calls", self.passthrough_calls.into()),
             ("replayed", self.replayed.into()),
-            ("usage_fresh", Json::Object(Vec::new())),
+            ("usage_fresh", Json::Object(usage)),
         ]);
         note_event(note::ATTEMPT_END, data, payload)
     }
@@ -1955,7 +2154,7 @@ impl Session {
     }
 }
 
-fn lock_inbox(inbox: &Inbox) -> std::sync::MutexGuard<'_, HashMap<String, VecDeque<Value>>> {
+fn lock_inbox(inbox: &Inbox) -> std::sync::MutexGuard<'_, Mailbox> {
     inbox.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -2166,6 +2365,103 @@ mod tests {
         assert_eq!(s.journal().len(), len);
     }
 
+    /// The data of the last note of `kind` in the session's journal.
+    fn note_data(s: &Session, kind: &str) -> Json {
+        let data = s
+            .journal
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|e| match &e.event {
+                Event::Note { kind: k, data, .. } if k == kind => Some(data.clone()),
+                _ => None,
+            })
+            .expect("note present");
+        Json::parse(&data).unwrap()
+    }
+
+    #[test]
+    fn attempt_end_sums_fresh_usage_and_counts_passthrough_calls() {
+        let (_b, mut s) = recording("u", &RunOptions::default());
+        let root = ROOT.to_vec();
+        let metas = [
+            r#"{"outcome":"ok","usage":{"input_tokens":10,"output_tokens":4}}"#,
+            r#"{"outcome":"partial","usage":{"input_tokens":5,"cache_read_tokens":2}}"#,
+            // Not counts: skipped rather than summed.
+            r#"{"outcome":"ok","usage":{"input_tokens":-1,"output_tokens":1.5}}"#,
+            r#"{"outcome":"error","status":429}"#,
+        ];
+        for meta in metas {
+            let DrawStart::Fresh(i) = s.draw_begin(&root, "p", vec![Value::from("q")]).unwrap()
+            else {
+                panic!()
+            };
+            s.draw_end(i, meta.into(), Value::default(), Value::default())
+                .unwrap();
+        }
+        s.count_passthrough(2);
+        s.count_passthrough(1);
+        s.end(Ok(Value::from("done"))).unwrap();
+        let end = note_data(&s, note::ATTEMPT_END);
+        assert_eq!(end.get("passthrough_calls").unwrap().as_u64(), Some(3));
+        assert_eq!(
+            end.get("usage_fresh").unwrap().canonical_string(),
+            r#"{"cache_read_tokens":2,"input_tokens":15,"output_tokens":4}"#
+        );
+    }
+
+    #[test]
+    fn attempt_start_names_normalization_rules_only_when_there_are_some() {
+        let (_b, s) = recording("exact", &RunOptions::default());
+        assert!(note_data(&s, note::ATTEMPT_START)
+            .get("normalization")
+            .is_none());
+        let opts = RunOptions::default().with_normalization(["agents-sdk:prompt_cache_key"]);
+        let (_b, s) = recording("loose", &opts);
+        assert_eq!(
+            note_data(&s, note::ATTEMPT_START)
+                .get("normalization")
+                .unwrap()
+                .canonical_string(),
+            r#"["agents-sdk:prompt_cache_key"]"#
+        );
+    }
+
+    #[test]
+    fn next_start_peeks_without_consuming() {
+        let (backend, mut s) = recording("n", &RunOptions::default());
+        let root = ROOT.to_vec();
+        let DrawStart::Fresh(i) = s.draw_begin(&root, "p", vec![Value::from("q")]).unwrap() else {
+            panic!()
+        };
+        s.draw_end(i, META_OK.into(), Value::default(), Value::from("a"))
+            .unwrap();
+        assert_eq!(
+            s.next_start(&root),
+            None,
+            "a recording branch is at its end"
+        );
+        s.end(Ok(Value::from("done"))).unwrap();
+        drop(s);
+        let journal = backend.snapshot("n", None).unwrap();
+        let mut r = Session::new(
+            "n",
+            Mode::Replay,
+            journal,
+            None,
+            &RunOptions::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(r.next_start(&root), Some(i));
+        assert_eq!(r.next_start(&root), Some(i), "peeking consumes nothing");
+        assert!(matches!(
+            r.draw_begin(&root, "p", vec![Value::from("q")]).unwrap(),
+            DrawStart::Replayed { .. }
+        ));
+        assert_eq!(r.next_start(&root), None);
+    }
+
     #[test]
     fn ends_of_unknown_intents_are_refused() {
         let (_b, mut s) = recording("e", &RunOptions::default());
@@ -2369,5 +2665,187 @@ mod tests {
             object(vec![("b", Json::from(1u8)), ("a", Json::Null)]),
             r#"{"a":null,"b":1}"#
         );
+    }
+
+    /// A recording session over a fresh in-memory run, with an inbox.
+    fn recording_with_inbox(run_id: &str) -> (MemoryBackend, Session, Inbox) {
+        let backend = MemoryBackend::new();
+        let co = backend.checkout(run_id, true, None).unwrap();
+        let inbox = Inbox::default();
+        let opts = RunOptions::default();
+        let mut s = Session::new(
+            run_id,
+            Mode::Run,
+            co.journal,
+            Some((co.sink, co.guard)),
+            &opts,
+            Some(inbox.clone()),
+        )
+        .unwrap();
+        s.start(&opts, None, None, false).unwrap();
+        (backend, s, inbox)
+    }
+
+    fn deliver(inbox: &Inbox, channel: &str, value: &str) {
+        lock_inbox(inbox).deliver(channel, Value::from(value));
+    }
+
+    fn queued(inbox: &Inbox, channel: &str) -> Vec<String> {
+        lock_inbox(inbox)
+            .queues
+            .get(channel)
+            .map(|q| q.iter().map(|v| v.as_str().into_owned()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_detached_sink_leaves_persistence_to_the_host() {
+        let (backend, mut s, _inbox) = recording_with_inbox("d");
+        let root = ROOT.to_vec();
+        let durable = s.journal().len();
+        let mut sink = s.detach_sink().expect("a recording session has a sink");
+        s.now(&root).unwrap();
+        let EffectStart::Fresh { intent, .. } =
+            s.effect_begin(&root, "send", Value::from("a")).unwrap()
+        else {
+            panic!("a fresh effect")
+        };
+        // Appended, not persisted: the host owns the sink now.
+        assert_eq!(s.journal().persisted_len(), durable);
+        assert_eq!(backend.snapshot("d", None).unwrap().len(), durable);
+        let (at, frames, head) = s.unpersisted().expect("two entries are pending");
+        assert_eq!(at, durable);
+        let upto = s.journal().len();
+        sink.persist(at, &frames, &head).unwrap();
+        s.mark_persisted(upto);
+        assert!(s.unpersisted().is_none());
+        assert_eq!(backend.snapshot("d", None).unwrap().len(), upto);
+        // Reattached, the end of the attempt persists inline again.
+        s.effect_end(intent, Ok(Value::from("r"))).unwrap();
+        s.attach_sink(sink);
+        s.end(Ok(Value::from("done"))).unwrap();
+        assert!(s.unpersisted().is_none());
+        assert_eq!(
+            backend.snapshot("d", None).unwrap().len(),
+            s.journal().len()
+        );
+    }
+
+    #[test]
+    fn receives_go_back_to_the_inbox_when_their_persist_fails() {
+        let (backend, mut s, inbox) = recording_with_inbox("q");
+        let root = ROOT.to_vec();
+        deliver(&inbox, "jobs", "first");
+        deliver(&inbox, "jobs", "second");
+        deliver(&inbox, "jobs", "third");
+        let _sink = s.detach_sink().unwrap();
+        // Two receives before any persist: each takes its own message.
+        assert_eq!(s.recv(&root, "jobs").unwrap().as_str(), "first");
+        assert_eq!(s.recv(&root, "jobs").unwrap().as_str(), "second");
+        assert_eq!(queued(&inbox, "jobs"), ["third"]);
+        s.persist_failed(Fault::Unavailable("server went away".into()));
+        // Neither receive became durable, so both messages are back, in
+        // order, for the next attempt.
+        assert_eq!(queued(&inbox, "jobs"), ["first", "second", "third"]);
+        assert_eq!(
+            s.recv(&root, "jobs").unwrap_err(),
+            Fault::Unavailable("server went away".into())
+        );
+        let stored = backend.snapshot("q", None).unwrap();
+        assert!(stored
+            .entries()
+            .iter()
+            .all(|e| !matches!(e.event, Event::ChannelRecv { .. })));
+    }
+
+    #[test]
+    fn durable_receives_stay_taken() {
+        let (_backend, mut s, inbox) = recording_with_inbox("k");
+        let root = ROOT.to_vec();
+        deliver(&inbox, "jobs", "first");
+        deliver(&inbox, "jobs", "second");
+        let mut sink = s.detach_sink().unwrap();
+        assert_eq!(s.recv(&root, "jobs").unwrap().as_str(), "first");
+        let (at, frames, head) = s.unpersisted().unwrap();
+        sink.persist(at, &frames, &head).unwrap();
+        s.mark_persisted(s.journal().len());
+        assert_eq!(s.recv(&root, "jobs").unwrap().as_str(), "second");
+        s.persist_failed(Fault::LeaseLost);
+        // Only the receive that never became durable is handed back.
+        assert_eq!(queued(&inbox, "jobs"), ["second"]);
+    }
+
+    #[test]
+    fn a_receive_written_despite_a_failed_persist_is_not_received_again() {
+        let (backend, mut s, inbox) = recording_with_inbox("doubt");
+        let root = ROOT.to_vec();
+        deliver(&inbox, "jobs", "first");
+        deliver(&inbox, "jobs", "second");
+        let mut sink = s.detach_sink().unwrap();
+        assert_eq!(s.recv(&root, "jobs").unwrap().as_str(), "first");
+        // The store writes the frames and then fails to say so (a server
+        // whose answer was lost): the session cannot tell, and hands the
+        // message back.
+        let (at, frames, head) = s.unpersisted().unwrap();
+        sink.persist(at, &frames, &head).unwrap();
+        s.persist_failed(Fault::Unavailable("the answer was lost".into()));
+        assert_eq!(queued(&inbox, "jobs"), ["first", "second"]);
+        drop(sink);
+        drop(s);
+        // The next checkout finds the receive in the journal and takes the
+        // message off the channel again.
+        let co = backend.checkout("doubt", false, None).unwrap();
+        let opts = RunOptions::default();
+        let _next = Session::new(
+            "doubt",
+            Mode::Resume,
+            co.journal,
+            Some((co.sink, co.guard)),
+            &opts,
+            Some(inbox.clone()),
+        )
+        .unwrap();
+        assert_eq!(queued(&inbox, "jobs"), ["second"]);
+    }
+
+    #[test]
+    fn a_receive_whose_persist_failed_unwritten_is_received_again() {
+        let (backend, mut s, inbox) = recording_with_inbox("lost");
+        let root = ROOT.to_vec();
+        deliver(&inbox, "jobs", "first");
+        let _sink = s.detach_sink().unwrap();
+        assert_eq!(s.recv(&root, "jobs").unwrap().as_str(), "first");
+        s.persist_failed(Fault::Unavailable("nothing was written".into()));
+        drop(s);
+        let co = backend.checkout("lost", false, None).unwrap();
+        let opts = RunOptions::default();
+        let _next = Session::new(
+            "lost",
+            Mode::Resume,
+            co.journal,
+            Some((co.sink, co.guard)),
+            &opts,
+            Some(inbox.clone()),
+        )
+        .unwrap();
+        assert_eq!(queued(&inbox, "jobs"), ["first"]);
+    }
+
+    #[test]
+    fn join_each_reports_every_child() {
+        let (_b, mut s) = recording("j", &RunOptions::default());
+        let root = ROOT.to_vec();
+        let children = s.fork(&root, 3).unwrap();
+        let EffectStart::Fresh { .. } = s
+            .effect_begin(&children[1], "left open", Value::from("x"))
+            .unwrap()
+        else {
+            panic!("a fresh effect")
+        };
+        let checks = s.join_each(&root, &children, &[true, true, false]);
+        assert_eq!(checks.len(), 3);
+        assert!(checks[0].is_ok());
+        assert!(matches!(checks[1], Err(Fault::DanglingIntent { .. })));
+        assert!(checks[2].is_ok(), "a failed child is exempt");
     }
 }

@@ -4,10 +4,16 @@
 ``Message``, an OpenAI ``ChatCompletion``, or an OpenAI Responses
 ``Response``, performs each one as a write-ahead journaled effect, and
 returns the messages to append to the conversation. On resume and replay
-the recorded results are reused and the tools are not called again.
+the recorded results are reused and the tools are not called again. A call
+a crash cut off is settled by the ``recover`` policy of ``rt.resume``, and
+the result it commits (a receipt, as text) is what the model receives as
+the tool's result.
 
 A tool that raises is recorded as an error result and reported back to the
-model, the way the provider APIs expect; the run keeps going.
+model, the way the provider APIs expect; the run keeps going. A tool that
+takes an ``idempotency_key`` argument gets the effect's key
+(``<run_id>/<branch>/<intent cursor>``), so a service it calls can
+deduplicate the retry of an effect a crash interrupted.
 """
 
 from __future__ import annotations
@@ -88,10 +94,23 @@ def tool_calls(response: Any) -> list[ToolCall]:
     return calls
 
 
-def _invoke(fn: Callable, arguments: Any) -> Any:
+def accepts_key(fn: Callable) -> bool:
+    """True if ``fn`` takes an ``idempotency_key`` argument by name."""
+    try:
+        param = inspect.signature(fn).parameters.get("idempotency_key")
+    except (TypeError, ValueError):
+        return False
+    return param is not None and param.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
+
+
+def _invoke(fn: Callable, arguments: Any, key: str) -> Any:
+    extra = {"idempotency_key": key} if accepts_key(fn) else {}
     if isinstance(arguments, dict):
-        return fn(**arguments)
-    return fn(arguments)
+        return fn(**arguments, **extra)
+    return fn(arguments, **extra)
 
 
 def _content(result: Any) -> str:
@@ -102,6 +121,29 @@ def _record(result: Any = None, error: BaseException | None = None) -> str:
     if error is not None:
         return canonical({"content": f"{type(error).__name__}: {error}", "is_error": True})
     return canonical({"content": _content(to_jsonable(result)), "is_error": False})
+
+
+def _recorded(stored: str) -> dict:
+    """The tool result a call's effect recorded, as ``{"content", "is_error"}``.
+
+    A perform records exactly that. A call a crash cut off is settled by the
+    ``recover`` policy instead, which commits what it found out (a receipt
+    from the service the tool called, in whatever form the service gives
+    it), not this record: that text reaches the model as the tool's
+    content. Both are decided from the recorded bytes alone, so a replay
+    sends the model what the recorded run sent."""
+    try:
+        doc = json.loads(stored)
+    except ValueError:
+        doc = None
+    if (
+        isinstance(doc, dict)
+        and set(doc) == {"content", "is_error"}
+        and isinstance(doc["content"], str)
+        and isinstance(doc["is_error"], bool)
+    ):
+        return doc
+    return {"content": stored, "is_error": False}
 
 
 def _messages(kind: str, calls: list[ToolCall], results: list[dict]) -> list[dict]:
@@ -144,9 +186,9 @@ def run_tools(ctx: "Ctx", response: Any, tools: Mapping[str, Callable]) -> list[
     for call in calls:
         fn = _lookup(tools, call)
 
-        def perform(_arg: str, fn=fn, call=call) -> str:
+        def perform(_arg: str, idempotency_key: str = "", fn=fn, call=call) -> str:
             try:
-                out = _invoke(fn, call.input)
+                out = _invoke(fn, call.input, idempotency_key)
             except Exception as e:  # reported to the model, not raised
                 return _record(error=e)
             if inspect.isawaitable(out):
@@ -154,7 +196,7 @@ def run_tools(ctx: "Ctx", response: Any, tools: Mapping[str, Callable]) -> list[
             return _record(out)
 
         stored = ctx.effect(f"tool:{call.name}", canonical({"id": call.id, "input": call.input}), perform)
-        results.append(json.loads(stored))
+        results.append(_recorded(stored))
     return _messages(kind, calls, results)
 
 
@@ -165,9 +207,9 @@ async def arun_tools(ctx: "Ctx", response: Any, tools: Mapping[str, Callable]) -
     for call in calls:
         fn = _lookup(tools, call)
 
-        async def perform(_arg: str, fn=fn, call=call) -> str:
+        async def perform(_arg: str, idempotency_key: str = "", fn=fn, call=call) -> str:
             try:
-                out = _invoke(fn, call.input)
+                out = _invoke(fn, call.input, idempotency_key)
                 if inspect.isawaitable(out):
                     out = await out
             except Exception as e:
@@ -177,5 +219,5 @@ async def arun_tools(ctx: "Ctx", response: Any, tools: Mapping[str, Callable]) -
         stored = await ctx.aeffect(
             f"tool:{call.name}", canonical({"id": call.id, "input": call.input}), perform
         )
-        results.append(json.loads(stored))
+        results.append(_recorded(stored))
     return _messages(kind, calls, results)

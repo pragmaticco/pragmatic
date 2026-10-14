@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pragmatic-config
+  labels:
+    app.kubernetes.io/name: pragmatic-server
+data:
+  pragmatic.toml: |
+    # See deploy/pragmatic.example.toml and docs/server.md for every key.
+    name = "pragmatic.example.com"
+    listen = "0.0.0.0:7272"
+    data_dir = "/var/lib/pragmatic"
+    # TLS terminates at the ingress.
+    allow_plain_http = true
+    # The ingress controller appends the client address here.
+    trusted_proxy_header = "x-forwarded-for"
+    public_url = "https://pragmatic.example.com"
+
+    [keys]
+    # The log key from `pragmatic-server keygen`, mounted from the Secret.
+    signing_key_file = "/etc/pragmatic/server.ed25519"
+
+    [bootstrap]
+    # From `pragmatic-server token bootstrap`; keep the token itself secret.
+    admin_token_sha256 = ""
+
+    [anchoring]
+    interval_secs = 600
+    # The pinned anchors ship in the image (deploy/tsa-roots/). Obtain
+    # written permission from each TSA operator before automated use.
+    tsa = [
+      { url = "http://timestamp.digicert.com", roots_pem = "/etc/pragmatic/tsa-roots/digicert.pem", operator = "digicert", name = "DigiCert" },
+      { url = "http://timestamp.sectigo.com", roots_pem = "/etc/pragmatic/tsa-roots/sectigo.pem", operator = "sectigo", name = "Sectigo" },
+    ]
+
+    [license]
+    licensee = ""

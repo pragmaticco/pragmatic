@@ -1,0 +1,26 @@
+[package]
+name = "pragmatic-console"
+description = "The Pragmatic console: HTML and CSV views of agent journals and evidence bundles, shared by the CLI and Pragmatic Server."
+keywords = ["agents", "llm", "audit", "journal", "evidence"]
+categories = ["development-tools", "visualization"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# The code is Apache-2.0; the bundled fonts (assets/fonts in
+# pragmatic-console) are under the SIL Open Font License 1.1.
+license = "Apache-2.0 AND OFL-1.1"
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+authors.workspace = true
+
+# Zero dependencies beyond the core, like the core and the CLI: the console
+# renders untrusted journal content, and every line of code it pulls in is
+# code that sees that content.
+[dependencies]
+pragmatic = { version = "0.6.0", path = "../pragmatic", default-features = false }
+
+# The tests render format 1 journals, which only the `testing` feature can
+# write.
+[dev-dependencies]
+pragmatic = { path = "../pragmatic", default-features = false, features = ["testing"] }

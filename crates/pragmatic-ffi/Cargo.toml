@@ -14,4 +14,4 @@ name = "pragmatic_ffi"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-pragmatic = { version = "0.5.0", path = "../pragmatic", default-features = false }
+pragmatic = { version = "0.6.0", path = "../pragmatic", default-features = false }
