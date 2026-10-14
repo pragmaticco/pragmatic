@@ -144,7 +144,28 @@ async fn the_console_signs_in_shows_runs_redacted_and_guards_its_forms() {
     assert_eq!(location(&resp), "/console/sign-in");
     // A sign-in from another site, or without the form's value, fails.
     let html = b.page("/console/sign-in").await;
-    assert!(html.contains("licensed to <b>Example Corp</b>"));
+    assert!(html.contains("Licensed to Example Corp"));
+    // The console's fonts are served to anyone, from its own origin,
+    // cached for good; the pages load nothing from anywhere else.
+    let name = html
+        .split("url(/console/assets/")
+        .nth(1)
+        .and_then(|r| r.split(')').next())
+        .unwrap()
+        .to_string();
+    let resp = b.get(&format!("/console/assets/{name}")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "font/woff2");
+    assert_eq!(
+        resp.headers()["cache-control"],
+        "public, max-age=31536000, immutable"
+    );
+    assert!(resp.bytes().await.unwrap().starts_with(b"wOF2"));
+    assert_eq!(
+        b.get("/console/assets/nope.woff2").await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert!(!html.contains("<script"));
     let csrf = csrf_of(&html);
     let resp = b
         .post(
@@ -174,22 +195,24 @@ async fn the_console_signs_in_shows_runs_redacted_and_guards_its_forms() {
         .unwrap()
         .to_string();
     assert!(csp.contains("default-src 'none'") && csp.contains("form-action 'self'"));
+    assert!(csp.contains("font-src 'self'") && !csp.contains("script-src"));
+    assert_eq!(resp.headers()["referrer-policy"], "same-origin");
     assert_eq!(resp.headers()["x-frame-options"], "DENY");
     assert_eq!(resp.headers()["cache-control"], "no-store");
     let html = resp.text().await.unwrap();
     assert!(html.contains("/console/runs/case-1"), "{html}");
-    assert!(html.contains("licensed to <b>Example Corp</b>"));
+    assert!(html.contains("Licensed to Example Corp"));
     assert!(
         !html.contains("/console/tokens"),
         "no admin links for an auditor"
     );
     let html = a.page("/console/runs/case-1").await;
-    assert!(html.contains("Content is shown redacted"));
+    assert!(html.contains("Content is redacted for you"));
     assert!(!html.contains("jane.doe@example.com"));
     assert!(html.contains("[email]"));
     assert!(!html.contains("<script>alert"));
     assert!(
-        html.contains("operator-only anchor"),
+        html.contains(">Signed by this server only</h2>"),
         "self-anchoring: the operator's signature only"
     );
     assert!(html.contains("/console/runs/case-1/evidence?redact=detectors"));
@@ -197,7 +220,16 @@ async fn the_console_signs_in_shows_runs_redacted_and_guards_its_forms() {
     assert!(!html.contains("/erase"));
     // A later page of the timeline.
     let html = a.page("/console/runs/case-1?from=3").await;
-    assert!(html.contains("Entries from #3 of"));
+    assert!(html.contains("Entries #3 to"));
+    assert!(html.contains("<a href=\"/console/runs/case-1?from=0\">First page</a>"));
+    // A run the token cannot see is a page that says so.
+    let resp = a.get("/console/runs/nope-1").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(resp.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/html"));
+    assert!(resp.text().await.unwrap().contains("No run named"));
     // The evidence download, as the API serves it: a bundle that carries
     // text unredacted needs view_raw, so this auditor gets detectors.
     assert_eq!(
@@ -222,11 +254,15 @@ async fn the_console_signs_in_shows_runs_redacted_and_guards_its_forms() {
         html.contains("/console/runs/{id}"),
         "the auditor's own reads"
     );
-    assert!(html.contains("[withheld]"));
-    assert_eq!(
-        a.get("/console/tokens").await.status(),
-        StatusCode::FORBIDDEN
-    );
+    assert!(html.contains("<span class=\"s dim\">withheld</span>"));
+    assert!(!html.contains("[withheld]"));
+    let resp = a.get("/console/tokens").await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(resp
+        .text()
+        .await
+        .unwrap()
+        .contains("This page is not open to your role"));
     // The agent may read the run but not download evidence.
     let mut g = Browser::new(&ts);
     g.sign_in(&agent).await;
@@ -240,7 +276,7 @@ async fn the_console_signs_in_shows_runs_redacted_and_guards_its_forms() {
     r.sign_in(&raw).await;
     let html = r.page("/console/runs/case-1").await;
     assert!(html.contains("jane.doe@example.com"));
-    assert!(!html.contains("Content is shown redacted"));
+    assert!(!html.contains("Content is redacted for you"));
 
     // An administrator's forms.
     b.sign_in(&ts.admin).await;
@@ -260,6 +296,11 @@ async fn the_console_signs_in_shows_runs_redacted_and_guards_its_forms() {
         )
         .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN, "no CSRF token");
+    assert!(resp
+        .text()
+        .await
+        .unwrap()
+        .contains("This form could not be accepted"));
     let resp = b.post("/console/holds", &hold, "cross-site").await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN, "from another site");
     let resp = b.post("/console/holds", &hold, "same-origin").await;
@@ -280,10 +321,11 @@ async fn the_console_signs_in_shows_runs_redacted_and_guards_its_forms() {
         .await;
     assert_eq!(location(&resp), "/console/runs/case-1?error=on_hold");
     let html = b.page("/console/runs/case-1?error=on_hold").await;
-    assert!(html.contains("The request was refused: on_hold."));
+    assert!(html.contains("The request was refused: the run is under a legal hold."));
     // Remove the hold, then erase.
     let holds: Value = ts.get("/v1/holds", &ts.admin).await.json().await.unwrap();
     let id = holds["holds"][0]["id"].as_str().unwrap().to_string();
+    // Removing a hold asks first; only the confirming post acts.
     let resp = b
         .post(
             &format!("/console/holds/{id}/remove"),
@@ -291,9 +333,35 @@ async fn the_console_signs_in_shows_runs_redacted_and_guards_its_forms() {
             "same-origin",
         )
         .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = resp.text().await.unwrap();
+    assert!(html.contains("Remove the hold"));
+    assert!(html.contains("name=\"confirm\" value=\"1\""));
+    assert_eq!(csrf_of(&html), csrf);
+    let resp = b
+        .post(
+            &format!("/console/holds/{id}/remove"),
+            &[("csrf", &csrf), ("confirm", "1")],
+            "same-origin",
+        )
+        .await;
     assert_eq!(location(&resp), "/console/holds?done=hold_removed");
+    // Erasure shows what it would erase, from the stored journal, and
+    // erases nothing until it is confirmed.
+    let before = stored(&ts, "case-1").len();
     let resp = b
         .post("/console/runs/case-1/erase", &erase, "same-origin")
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = resp.text().await.unwrap();
+    assert!(html.contains("Erase 1 slot from"), "{html}");
+    assert!(html.contains("#3 \u{b7} slot 0"));
+    assert!(html.contains("value=\"dsar\""));
+    assert_eq!(stored(&ts, "case-1").len(), before, "nothing erased yet");
+    let mut confirmed = erase.to_vec();
+    confirmed.push(("confirm", "1"));
+    let resp = b
+        .post("/console/runs/case-1/erase", &confirmed, "same-origin")
         .await;
     assert_eq!(location(&resp), "/console/runs/case-1?done=erased");
     let j = stored(&ts, "case-1");
@@ -301,6 +369,14 @@ async fn the_console_signs_in_shows_runs_redacted_and_guards_its_forms() {
     // Retention, and a token issued and revoked.
     let resp = b
         .post("/console/retention/run", &[("csrf", &csrf)], "same-origin")
+        .await;
+    assert!(resp.text().await.unwrap().contains("Run retention now?"));
+    let resp = b
+        .post(
+            "/console/retention/run",
+            &[("csrf", &csrf), ("confirm", "1")],
+            "same-origin",
+        )
         .await;
     assert_eq!(location(&resp), "/console/holds?done=retention");
     let resp = b
@@ -318,7 +394,7 @@ async fn the_console_signs_in_shows_runs_redacted_and_guards_its_forms() {
         .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let html = resp.text().await.unwrap();
-    assert!(html.contains("it is shown only this once"));
+    assert!(html.contains("It is shown only this once"));
     let value = html
         .split("<span class=\"secret\">")
         .nth(1)
@@ -338,6 +414,18 @@ async fn the_console_signs_in_shows_runs_redacted_and_guards_its_forms() {
             "same-origin",
         )
         .await;
+    assert!(resp
+        .text()
+        .await
+        .unwrap()
+        .contains(&format!("Revoke <span class=\"m\">{id}</span>?")));
+    let resp = b
+        .post(
+            &format!("/console/tokens/{id}/revoke"),
+            &[("csrf", &csrf), ("confirm", "1")],
+            "same-origin",
+        )
+        .await;
     assert_eq!(location(&resp), "/console/tokens?done=token_revoked");
     assert_eq!(
         ts.get("/v1/whoami", &value).await.status(),
@@ -351,8 +439,24 @@ async fn the_console_signs_in_shows_runs_redacted_and_guards_its_forms() {
     let resp = b
         .post("/console/sign-out", &[("csrf", &csrf)], "same-origin")
         .await;
+    assert_eq!(location(&resp), "/console/sign-in?notice=signed_out");
+    assert!(b
+        .page("/console/sign-in?notice=signed_out")
+        .await
+        .contains("You are signed out."));
+    let resp = b.get("/console").await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     assert_eq!(location(&resp), "/console/sign-in");
-    assert_eq!(b.get("/console").await.status(), StatusCode::SEE_OTHER);
+    // A session that ended on its own says so on the way to sign in.
+    ts.app()
+        .sessions
+        .age(std::time::Duration::from_secs(16 * 60));
+    let resp = a.get("/console").await;
+    assert_eq!(location(&resp), "/console/sign-in?notice=ended");
+    assert!(a
+        .page("/console/sign-in?notice=ended")
+        .await
+        .contains("Your session has ended"));
     let records = ts.audit().await;
     for action in ["sign_in", "sign_out"] {
         assert!(

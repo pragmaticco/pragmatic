@@ -118,7 +118,16 @@ crates.io.
   - Optional OpenTelemetry spans with `PRAGMATIC_OTEL=1`. Spans never
     carry content.
 - **The `pragmatic-console` crate:** the HTML and CSV views of runs and
-  evidence bundles, shared by the CLI and Pragmatic Server.
+  evidence bundles, shared by the CLI and Pragmatic Server, in the
+  website's design (EB Garamond and IBM Plex Mono on warm paper, the
+  brand's diamond as the only icon, terracotta only for trouble, light and
+  dark). A run's page is a run sheet beside Anchoring, Evidence check and
+  Run cards; each timeline row says in words what happened, from a step's
+  intent and its results together, with the recorded content as a quoted
+  excerpt or a gist of data, and opens to the entries. Pragmatic Server's
+  console asks for confirmation before erasing, removing a hold, revoking
+  a token or running retention, and answers failed requests with pages
+  instead of JSON.
 - **A one-command demo and an end-to-end suite.** `examples/demo/run.sh`
   tells the whole story on one machine against a real Pragmatic Server and
   two local timestamp authorities: a support agent crashes mid-refund and

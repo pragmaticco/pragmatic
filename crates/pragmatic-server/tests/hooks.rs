@@ -56,6 +56,10 @@ impl ConsoleRenderer for JsonConsole {
             ConsolePage::AccessLog { records, .. } => json!({"page": "access", "records": records}),
             ConsolePage::Holds { holds, .. } => json!({"page": "holds", "holds": holds}),
             ConsolePage::Tokens { tokens, .. } => json!({"page": "tokens", "tokens": tokens}),
+            ConsolePage::Confirm { action, .. } => json!({"page": "confirm", "action": action}),
+            ConsolePage::Error { status, code, .. } => {
+                json!({"page": "error", "status": status, "code": code})
+            }
         }
         .to_string())
     }

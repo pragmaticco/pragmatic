@@ -147,7 +147,12 @@ fn journal_commands_read_format_2_runs() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let html = std::fs::read_to_string(&out).unwrap();
     assert!(html.contains("Content-Security-Policy"));
-    assert!(html.contains("<span class=\"lane\"><i></i>0</span>"));
+    // The parallel region's children hang one lane deep.
+    assert!(html.contains(" d1\"><details>"));
+    assert!(
+        html.contains("font-src data:"),
+        "the file carries its fonts"
+    );
     assert!(!html.contains("<script"));
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -786,6 +791,15 @@ fn get(port: u16, path: &str) -> String {
     }
 }
 
+fn get_bytes(port: u16, path: &str) -> Vec<u8> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let request = format!("GET {path} HTTP/1.1\r\nhost: localhost\r\n\r\n");
+    s.write_all(request.as_bytes()).unwrap();
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).unwrap();
+    out
+}
+
 /// The CI "Console smoke test" greps the console's run page for a label;
 /// that label must be one the console renders for a model draw (it
 /// labels results `draw.<outcome>`), or the CI job fails on every push.
@@ -854,13 +868,32 @@ fn serve_renders_the_console_on_loopback() {
     let index = get(port, "/");
     let run = get(port, "/run/refund-1");
     let missing = get(port, "/run/<script>");
+    // The fonts come from the console itself, cached for good.
+    let name = run
+        .split("url(/assets/")
+        .nth(1)
+        .and_then(|r| r.split(')').next())
+        .unwrap()
+        .to_string();
+    let font = get_bytes(port, &format!("/assets/{name}"));
     let _ = child.kill();
     let _ = child.wait();
+    let head = String::from_utf8_lossy(&font[..font.len().min(400)]).to_string();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(head.contains("content-type: font/woff2"));
+    assert!(head.contains("cache-control: public, max-age=31536000, immutable"));
+    assert!(font.windows(4).any(|w| w == b"wOF2"));
     assert!(index.starts_with("HTTP/1.1 200"));
     assert!(index.contains("content-security-policy: default-src 'none'"));
-    assert!(index.contains("<a href=\"/run/refund-1\">refund-1</a>"));
-    assert!(run.contains("id=\"c0\""));
+    assert!(index.contains("<a class=\"m\" href=\"/run/refund-1\">refund-1</a>"));
+    assert!(index.contains("font-src 'self'"));
+    assert!(run.contains("<span id=\"c0\"></span>"));
+    assert!(run.contains("url(/assets/eb-garamond-latin."));
     assert!(missing.starts_with("HTTP/1.1 404"));
+    assert!(
+        missing.contains("No run named"),
+        "an HTML page, not plain text"
+    );
     assert!(!missing.contains("<script>"));
     std::fs::remove_dir_all(dir).unwrap();
 }

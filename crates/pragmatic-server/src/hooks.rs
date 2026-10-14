@@ -458,6 +458,54 @@ pub struct ConsoleViewer {
     pub csrf: String,
 }
 
+/// A sentence at the top of a console page after a form: fixed text of
+/// the server's, never text from the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsoleNotice {
+    pub text: String,
+    /// An error code to show after the text, in mono, for a refusal the
+    /// server has no sentence for (a short lowercase code, checked).
+    pub code: Option<String>,
+    /// A refusal (terracotta), rather than news (ink).
+    pub refused: bool,
+}
+
+/// One slot an erasure would erase, for its confirmation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErasePreviewSlot {
+    pub cursor: u64,
+    pub slot: u8,
+    /// `result of tool call lookup_order`.
+    pub what: String,
+    pub bytes: u64,
+}
+
+/// What a confirmation page asks about. Each carries the form fields the
+/// confirming post repeats (with `confirm=1` and the CSRF token).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConsoleConfirm {
+    Erase {
+        run_id: String,
+        /// The slots it would erase (at most 50 listed) and how many in all.
+        slots: Vec<ErasePreviewSlot>,
+        total: usize,
+        reason_code: String,
+        reason: String,
+        force: bool,
+        allow_unfinished: bool,
+        fields: Vec<(String, String)>,
+    },
+    RemoveHold {
+        hold: JsonValue,
+    },
+    RevokeToken {
+        token: JsonValue,
+    },
+    RunRetention {
+        policies: JsonValue,
+    },
+}
+
 /// The data of one console page, already filtered by scope for the viewer.
 /// List pages carry the JSON the API serves for the same thing
 /// (RunSummary, access-log records with personal fields withheld, holds,
@@ -467,6 +515,8 @@ pub struct ConsoleViewer {
 pub enum ConsolePage<'a> {
     SignIn {
         error: Option<&'a str>,
+        /// "You are signed out", "Your session has ended".
+        notice: Option<&'a str>,
         licensee: &'a str,
         /// The sign-in form's anti-forgery value (its cookie's value).
         csrf: &'a str,
@@ -488,7 +538,7 @@ pub enum ConsolePage<'a> {
         from: u64,
         /// Set when the viewer may not see content raw.
         redactor: Option<&'a Redactor>,
-        notice: Option<&'a str>,
+        notice: Option<&'a ConsoleNotice>,
     },
     AccessLog {
         viewer: &'a ConsoleViewer,
@@ -499,14 +549,37 @@ pub enum ConsolePage<'a> {
         viewer: &'a ConsoleViewer,
         holds: &'a [JsonValue],
         retention: &'a JsonValue,
-        notice: Option<&'a str>,
+        notice: Option<&'a ConsoleNotice>,
     },
     Tokens {
         viewer: &'a ConsoleViewer,
         tokens: &'a [JsonValue],
         /// A token just issued: its value (shown this once) and record.
         issued: Option<(&'a str, &'a JsonValue)>,
-        notice: Option<&'a str>,
+        notice: Option<&'a ConsoleNotice>,
+    },
+    /// An action that cannot be undone, or that opens the door to one: the
+    /// first post shows this page, and only its confirming post acts.
+    Confirm {
+        viewer: &'a ConsoleViewer,
+        /// Where the form posts again.
+        action: &'a str,
+        /// Where "Cancel" goes.
+        back: &'a str,
+        confirm: &'a ConsoleConfirm,
+    },
+    /// A console request that failed, as a page.
+    Error {
+        /// The signed-in viewer, if any.
+        viewer: Option<&'a ConsoleViewer>,
+        licensee: &'a str,
+        status: u16,
+        /// The API's error code (`not_found`, `forbidden`, ...).
+        code: &'a str,
+        /// The run the request named, if any.
+        run_id: Option<&'a str>,
+        /// The request posted a form (a refusal is then about the form).
+        form: bool,
     },
 }
 

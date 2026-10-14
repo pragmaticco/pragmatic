@@ -369,18 +369,30 @@ token ends its sessions at once. See [The console](#the-console).
 
 The console is at `/console`, rendered by the server with
 `pragmatic-console`, the renderer the CLI's `export` and `serve` use, so a
-run looks the same wherever it is read.
+run looks the same wherever it is read, and in the website's design: warm
+paper and ink, EB Garamond for words and IBM Plex Mono for data, and one
+colour, terracotta, kept for what stopped, failed or is about to be
+destroyed. It follows the browser's light or dark setting.
 
 - **Runs**, filtered by run id prefix, run id or label value, a label,
   program, status and update dates, a page at a time.
-- **A run**: its facts, attempts, the timeline (branches and parallel
-  regions as nested lanes, intents with their results, erased, withheld and
-  ref slots, notes, custody) a page at a time, its verification, and its
-  anchoring: independently anchored (with the operators and the time they
-  vouch for), anchored by the operator's signature only, or unanchored.
-  Without `view_raw`, content is shown through the same redaction as the
-  API. Auditors and administrators download evidence bundles from it;
-  administrators erase slots from it.
+- **A run**: the run sheet, with the run id and whether its journal
+  verifies, its facts (entries, attempts, model calls, tool calls, and
+  anything failed, erased or still open), its state (ended ok, running on
+  a live lease, or crashed) and its timeline, a page at a time. Each row
+  says in words what happened ("Model call → lookup_order", "Tool call
+  issue_refund · refund_id re_3f9c, status succeeded", "No end: crashed")
+  and lists the journal entries it is made of, the time and the entry
+  hash; it opens to the entries themselves, every slot with its address
+  for erasure (`slot 3:1`). Attempts are groups, parallel branches nested
+  lanes. Beside the sheet: its **anchoring** (independently anchored, with
+  each timestamp service and the time they vouch for; signed by this
+  server only; or not yet anchored), the **evidence check** (`pragmatic
+  verify`'s report, and for auditors and administrators the evidence
+  bundle downloads), the **run's** status, holds, labels, program, model,
+  token usage when recorded and attempts, and for administrators **Erase
+  content**. Without `view_raw`, content is shown through the same
+  redaction as the API, and the page says so.
 - **The access log**: every record for administrators, the records of
   in-scope runs for auditors, personal fields withheld without `view_raw`.
 - **Holds and retention** (administrators): place and remove holds, see
@@ -388,15 +400,26 @@ run looks the same wherever it is read.
 - **Tokens** (administrators): issue (the value is shown once) and revoke.
 - The footer names the viewer and the licensee (`[license] licensee`).
 
-Every page carries a Content-Security-Policy that loads and runs nothing
-(no script at all, styles inline, the one image a data URI) and lets forms
-submit only to the console itself; pages are never cached or framed. Every
-form that changes something carries the session's CSRF token, is refused
-when a browser marks it as sent from another site, and acts through the
-same operations as the API, so the access log and the erasure ledger
-record it the same way. The sign-in form carries an anti-forgery value of
-its own. Sign-in and sign-out are recorded in the access log. Console
-sessions live in memory: a restart signs everyone out.
+Erasing, removing a hold, revoking a token and running retention each
+show a confirmation first: an erasure lists the slots it would erase,
+found in the stored journal exactly as the erasure finds them, and only
+the confirming post acts. A request that fails is answered with a page
+that says why (no such run, a page your role cannot open, a form that
+could not be accepted, the server starting or paused), with the API's
+status code.
+
+Every page carries a Content-Security-Policy that runs no script at all
+and loads nothing but the console's own fonts, which the server serves
+from `/console/assets/` (no token needed; each file's name carries a hash
+of it, so browsers cache it for a year); styles are inline and the mark is
+inline SVG. Forms submit only to the console itself; pages are never
+cached or framed, and the referrer policy is `same-origin`. Every form
+that changes something carries the session's CSRF token, is refused when
+a browser marks it as sent from another site or names another origin, and
+acts through the same operations as the API, so the access log and the
+erasure ledger record it the same way. The sign-in form carries an
+anti-forgery value of its own. Sign-in and sign-out are recorded in the
+access log. Console sessions live in memory: a restart signs everyone out.
 
 ## Leases and appends
 

@@ -98,6 +98,77 @@ pub fn time(at: u64) -> String {
     format!("{}.{ms:03}Z", whole.trim_end_matches('Z'))
 }
 
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// The parts of an RFC 3339 UTC time (`YYYY-MM-DDTHH:MM:SS…`): year,
+/// month (1 to 12), day, and the time of day as written.
+fn parts(rfc: &str) -> Option<(&str, usize, &str, &str)> {
+    let b = rfc.as_bytes();
+    if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
+        return None;
+    }
+    let month: usize = rfc.get(5..7)?.parse().ok()?;
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    Some((rfc.get(0..4)?, month, rfc.get(8..10)?, rfc.get(11..)?))
+}
+
+/// A count with thousands separated: `182,004`.
+pub fn count(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The day of an entry time, `14 Oct 2026`.
+pub fn day(at: u64) -> String {
+    day_of(&time(at))
+}
+
+/// The day of an RFC 3339 time, `14 Oct 2026` (the text itself if it is
+/// not one).
+pub fn day_of(rfc: &str) -> String {
+    match parts(rfc) {
+        Some((y, m, d, _)) => format!("{} {} {y}", d.trim_start_matches('0'), MONTHS[m - 1]),
+        None => clip(rfc, 32),
+    }
+}
+
+/// The time of day of an entry time to the millisecond, `00:29:52.179`.
+pub fn clock_ms(at: u64) -> String {
+    time(at).get(11..23).unwrap_or("").to_string()
+}
+
+/// The time of day of an entry time to the second, `00:29:52`.
+pub fn clock(at: u64) -> String {
+    time(at).get(11..19).unwrap_or("").to_string()
+}
+
+/// An RFC 3339 time as a table shows it: `14 Oct 00:29`, with the year
+/// when it is not `this_year` (and with seconds when `seconds`). Text that
+/// is not RFC 3339 is shown clipped, as it is.
+pub fn short_time(rfc: &str, this_year: &str, seconds: bool) -> String {
+    let Some((y, m, d, t)) = parts(rfc) else {
+        return clip(rfc, 32);
+    };
+    let t = t.get(..if seconds { 8 } else { 5 }).unwrap_or(t);
+    let year = if y == this_year {
+        String::new()
+    } else {
+        format!(" {y}")
+    };
+    format!("{} {}{year} {t}", d.trim_start_matches('0'), MONTHS[m - 1])
+}
+
 /// The short event label of an entry.
 pub fn label(event: &Event) -> String {
     match event {
@@ -468,6 +539,63 @@ fn legacy_summary(l: &LegacyEvent, width: usize) -> String {
     }
 }
 
+/// The labels of an entry's slots: `request part 0`, `response body`,
+/// `argument`, `result`, `failure message`, `value`, `subjects`, `output`,
+/// `reason`.
+pub fn slot_labels(event: &Event) -> Vec<String> {
+    let n = event.slot_contents().len();
+    match event {
+        Event::DrawIntent { .. } => (0..n).map(|k| format!("request part {k}")).collect(),
+        Event::DrawResult { .. } => vec!["response head".into(), "response body".into()],
+        Event::ChannelRecv { .. } | Event::Random { .. } => vec!["value".into()],
+        Event::EffectIntent { .. } => vec!["argument".into()],
+        Event::EffectResult { outcome, .. } => vec![if *outcome == EffectOutcome::Failed {
+            "failure message".into()
+        } else {
+            "result".into()
+        }],
+        Event::Note { kind, .. } => (0..n)
+            .map(|k| match (kind.as_str(), k) {
+                ("run.start", 0) => "subjects".into(),
+                ("attempt.end", 0) => "output".into(),
+                ("attempt.end", 1) => "fault or error message".into(),
+                ("erasure", 0) => "reason".into(),
+                _ => format!("payload {k}"),
+            })
+            .collect(),
+        _ => (0..n).map(|k| format!("slot {k}")).collect(),
+    }
+}
+
+/// What slot `k` of the entry at `cursor` is, in words: `result of tool
+/// call lookup_order`, `response body of a model call`.
+pub fn slot_title(journal: &Journal, cursor: Cursor, k: usize) -> String {
+    let Some(e) = journal.get(cursor) else {
+        return format!("slot {k}");
+    };
+    let label = slot_labels(&e.event)
+        .get(k)
+        .cloned()
+        .unwrap_or_else(|| format!("slot {k}"));
+    let effect = |name: &str| match name.strip_prefix("tool:") {
+        Some(t) if !t.is_empty() => format!("tool call {}", clip(t, 48)),
+        _ => format!("effect {}", clip(name, 48)),
+    };
+    let of = match &e.event {
+        Event::DrawIntent { .. } | Event::DrawResult { .. } => "a model call".to_string(),
+        Event::EffectIntent { name, .. } => effect(name),
+        Event::EffectResult { intent, .. } => match journal.get(*intent).map(|i| &i.event) {
+            Some(Event::EffectIntent { name, .. }) => effect(name),
+            _ => "an effect".to_string(),
+        },
+        Event::ChannelRecv { channel, .. } => format!("a receive on {}", clip(channel, 48)),
+        Event::Random { .. } => "a random draw".to_string(),
+        Event::Note { kind, .. } => format!("the {} note", clip(kind, 32)),
+        _ => "the entry".to_string(),
+    };
+    format!("{label} of {of}")
+}
+
 /// The results recorded for each intent, by intent cursor, in cursor order.
 pub fn results_by_intent(journal: &Journal) -> HashMap<Cursor, Vec<Cursor>> {
     let mut out: HashMap<Cursor, Vec<Cursor>> = HashMap::new();
@@ -635,6 +763,27 @@ mod tests {
         assert_eq!(time(1_791_916_268_600_000_000), "2026-10-13T18:31:08.600Z");
         assert_eq!(time(1_791_916_268_000_123_000), "2026-10-13T18:31:08.000Z");
         assert_eq!(time(0), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn times_read_as_words() {
+        let at = 1_791_937_792_179_000_000; // 2026-10-14T00:29:52.179Z
+        assert_eq!(day(at), "14 Oct 2026");
+        assert_eq!(clock_ms(at), "00:29:52.179");
+        assert_eq!(clock(at), "00:29:52");
+        assert_eq!(
+            short_time("2026-10-14T00:29:58.5Z", "2026", false),
+            "14 Oct 00:29"
+        );
+        assert_eq!(
+            short_time("2025-01-04T10:00:01Z", "2026", true),
+            "4 Jan 2025 10:00:01"
+        );
+        assert_eq!(short_time("<b>", "2026", false), "<b>");
+        assert_eq!(day_of("2026-13-01T00:00:00Z"), "2026-13-01T00:00:00Z");
+        assert_eq!(count(0), "0");
+        assert_eq!(count(999), "999");
+        assert_eq!(count(1_204_113), "1,204,113");
     }
 
     #[test]

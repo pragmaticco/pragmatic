@@ -170,6 +170,13 @@ impl Journal {
         })
     }
 
+    /// The sealed slots an erasure of `what` would erase, in order, without
+    /// erasing anything: what a confirmation lists before the erasure acts.
+    /// A ref names its target, as [`EraseSelector::Slots`] does.
+    pub fn erase_targets(&self, what: &EraseSelector) -> Result<Vec<(Cursor, u8)>, Fault> {
+        self.select(what).map(|s| s.into_iter().collect())
+    }
+
     /// The sealed slots `what` selects.
     fn select(&self, what: &EraseSelector) -> Result<BTreeSet<(Cursor, u8)>, Fault> {
         let mut out = BTreeSet::new();

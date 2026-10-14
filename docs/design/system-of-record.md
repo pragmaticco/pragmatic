@@ -16,7 +16,8 @@ security, failure-handling and compliance review of the server (4.1 to
 6.5, 6.6, 6.7), and after the review of that layer (2.6, 2.7, 2.12, 3.1,
 4.6, 6.2 to 6.5), reconciled when the four were integrated (11), and
 amended when the server was wired to its components (4.1, 4.4, 4.7, 4.8,
-4.14, 4.17, 5.3, 11). This
+4.14, 4.17, 5.3, 11), and when the console took the website's design
+(4.14). This
 document is the contract
 between the components built for 0.6. Everything marked MUST is
 normative; where code and this document disagree, one of them is a bug.
@@ -1859,36 +1860,91 @@ core) renders these pages for the server and the CLI alike:
 `render_run(&RunView)` (and `render_run_page`, which also returns where
 the next page starts), `render_index(&[RunRow])`,
 `render_evidence(&Bundle, &EvidenceReport)` and
-`render_csv(&Bundle, &EvidenceReport)`. Pages carry a
-Content-Security-Policy that loads nothing and run no script; all journal
+`render_csv(&Bundle, &EvidenceReport)`. Pages run no script; all journal
 and bundle text is escaped, binary values are summarized, and slot text is
 cut at 64 KiB.
 
+- **One design.** The console has the website's design, so the home
+  page's picture of a run is a faithful picture of the console: warm
+  paper (`#f2efe6`) with lighter leaves on it, hairline rules, EB Garamond
+  for words and IBM Plex Mono for data, no bold, square corners, the
+  brand's diamond as the only icon, and one colour, terracotta, kept for
+  what stopped, failed or broke, or is about to be destroyed. It follows
+  `prefers-color-scheme` (no switch: a switch needs script) and prints in
+  the light scheme. Every state is said in words as well as by a marker.
+- **Rows, not entries.** The run page is a run sheet (the run id, a
+  verification badge, a facts line, a state line, the timeline and the
+  chain) beside an Anchoring, an Evidence check and a Run card, and for
+  administrators an Erase content card. The timeline's rows are built from
+  the journal by fixed rules: a step is one row from its intent and every
+  result recorded for it (its state follows the latest); `run.start` and
+  the first `attempt.start` are one row; each attempt is a group; a result
+  whose intent is on an earlier page, or that names no intent, is a row of
+  its own; every other entry is a row; and the console adds a row where an
+  attempt has no end ("No end: crashed" where a later attempt shows it, or
+  at the end of the run what is known: running on a live lease, crashed,
+  or for a local journal "running, or crashed"). Every entry of a page is
+  in exactly one row, and each row names all of its entries
+  (`draw.intent #2 · draw.ok #3`), the time of its first and the hash of
+  its last. Steps an attempt read back (its `replayed` equals the steps
+  completed before it) are marked so. A row expands (`<details>`, no
+  script) to its entries: what each means for replay, its fields, and each
+  slot with its address for erasure (`slot 3:1`).
+- **The console never makes things up.** A row's title is the console's
+  own phrase ("Model call", "Tool call", "Run started"), recorded data in
+  mono, and accents in the console's words. Recorded content reaches a
+  title only as a quoted excerpt of prose (in the console's curly quotes,
+  inside `<bdi>`) or a gist of data in mono (`charges ×2, status
+  delivered`: an object's members in recorded order, the SDKs' tool-call
+  envelopes unwrapped, and a result's members that repeat its input left
+  out). A model response names the tools it asks for, or excerpts its
+  reply, recognised by the same shape tests as the SDK's `tool_calls`.
+  Token counts appear only when draw meta records `usage`, never as 0.
+- **Fonts, and what the policy allows.** A single-file page (`export`,
+  `render-evidence`) carries its fonts inline as `data:` URIs, and its
+  policy is `default-src 'none'; img-src data:; font-src data:;
+  style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'`: it
+  loads nothing and makes no request. `pragmatic serve` and the server
+  serve the fonts from their own origin (`/assets/` and `/console/assets/`,
+  no credential, under names that carry a hash of the font, with
+  `Cache-Control: public, max-age=31536000, immutable`), and their
+  policies allow `font-src 'self'` and nothing else from anywhere. Every
+  face tries installed fonts first (`local()`), then the bundled file; the
+  crate bundles EB Garamond (SIL OFL 1.1, `assets/fonts/OFL.txt`), and
+  each further font is one line in `fonts::BUNDLED`.
 - **Pages are bounded.** A run's timeline is shown a page at a time: a
-  page ends after 5,000 entries, or before the entry whose row would take
-  the page past 16 MiB of HTML, whichever comes first, and links to the
-  next (`RunView.from` and `RunView.page_link`), so every entry is on some
-  page and no page grows with the journal (a 1 GiB journal would
-  otherwise be a multi-gigabyte page). A ref slot links to the slot it
-  repeats rather than showing its content again.
+  page ends after 5,000 entries, or before the entry whose detail would
+  take the page past 16 MiB of HTML, whichever comes first, and links to
+  the next (`RunView.from` and `RunView.page_link`; an exported file names
+  the `pragmatic export --from` command that writes the next), so every
+  entry is on some page and no page grows with the journal (a 1 GiB
+  journal would otherwise be a multi-gigabyte page). A ref slot links to
+  the slot it repeats rather than showing its content again.
 - **CSV carries its verdict.** `render_csv` takes the report: every row
   carries the verdict and whether the entry is independently anchored, and
   rows are decoded from the bundle's journal, never taken from its
   `records` as stated (only a journal that cannot be read falls back to
   them, with every row `FAILED`).
-- **Format 1 runs** are counted (commits as ok effects) and shown in full:
-  each recorded value in its own block, as a format 2 slot.
-- **In the server**, the run page is `render_run_page` with three
-  additions to `RunView`: a `Frame` (the policy, navigation, and a footer
-  naming the viewer and the licensee), a `SlotFilter` that shows every
-  present slot through the server's redaction (4.10) for a viewer without
-  `view_raw` (fields stay; refs resolve to their target first), and the
-  run's actions (evidence downloads for auditors and administrators,
-  erasure for administrators). The other pages (runs, access log, holds
-  and retention, tokens) are tables in the same frame. The server's policy
-  is the crate's with `form-action 'self'` (and `frame-ancestors
-  'none'`), sent as a header and in the page; it still loads and runs
-  nothing.
+- **Format 1 runs** are counted (commits as ok effects; format 1 records
+  no failures, and the page says so) and shown in full: each recorded
+  value in its own block, as a format 2 slot, under a `READ-ONLY` tag.
+- **In the server**, the run page is `render_run_page` with a `Frame`
+  (the policy, fonts, navigation, and a footer naming the viewer and the
+  licensee), a `SlotFilter` that shows every present slot through the
+  server's redaction (4.10) for a viewer without `view_raw` (fields stay;
+  refs resolve to their target first), and a `ServerRun`: the run's status
+  and holds, its notices, the evidence downloads (auditors and
+  administrators) and the Erase content card (administrators). The run's
+  anchoring lists each witness of its newest independent anchor (or its
+  newest anchor) with its kind and whether the server counts its operator.
+  The other pages (runs, access log, holds and retention, tokens) are
+  tables on leaves in the same frame, stacked as labelled rows on a narrow
+  screen. The server's policy is the crate's with `font-src 'self'` and
+  `form-action 'self'` (and `frame-ancestors 'none'`), sent as a header
+  and in the page; it still loads nothing from anywhere else and runs
+  nothing. Its referrer policy is `same-origin`: under `no-referrer` a
+  browser sends `Origin: null` with a form's post, which the origin check
+  below refuses.
 - **Forms.** Every console form that changes something (sign-out, holds,
   retention, erasure, tokens) carries the session's CSRF token, a random
   value kept with the session and compared in constant time, and is
@@ -1897,8 +1953,23 @@ cut at 64 KiB.
   `pragmatic_sign_in` cookie instead. Forms act through the same
   operations as the API, so the access log and the erasure ledger record
   them alike. A finished form redirects to its page with a fixed notice,
-  a refused one with its error code, never with text from the request; a
+  a refused one with its error code, never with text from the request
+  (known codes become sentences; an unknown one is shown as a code); a
   new token's value is shown on the page that answers, once.
+- **Confirmations.** An action that cannot be undone, or that opens the
+  door to one (erasure, removing a hold, revoking a token, running
+  retention), answers its first post with a confirmation page and changes
+  nothing; only the confirming post, which repeats the fields with
+  `confirm=1` and the CSRF token, acts. An erasure's confirmation lists the
+  slots it would erase, resolved from the stored journal exactly as the
+  erasure resolves them (`Journal::erase_targets`); a run under a hold is
+  refused before anything is asked.
+- **Errors are pages.** A console request that fails is answered with an
+  HTML page in the console's frame, with the API's status and
+  `Retry-After` (and, for 503 `starting` only, a reload after 5 seconds),
+  not with the API's JSON; the access log records it as before. A visitor
+  whose session ended is sent to sign in with a notice saying so, and
+  signing out says "You are signed out."
 
 ### 4.15 Deployment
 

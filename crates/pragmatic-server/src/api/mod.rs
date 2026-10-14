@@ -13,7 +13,8 @@
 //!   answers 403 for an out-of-scope id, because there is nothing to hide
 //!   about a run that would be created.
 //!
-//! `/healthz`, `/readyz` and `/metrics` need no token and are not logged.
+//! `/healthz`, `/readyz`, `/metrics` and the console's fonts
+//! (`/console/assets/`) need no token and are not logged.
 
 pub mod admin;
 pub mod anchors;
@@ -352,6 +353,7 @@ pub fn router(app: AppState) -> Router {
             middleware::access,
         ));
     let open: Router<AppState> = Router::new()
+        .route("/console/assets/{file}", get(console::asset))
         .route("/healthz", get(info::healthz))
         .route("/readyz", get(info::readyz))
         .route("/metrics", get(info::metrics));

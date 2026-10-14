@@ -247,12 +247,17 @@ fn fingerprint(credential: &[u8]) -> String {
     pragmatic::encoding::hex_encode(&pragmatic::sha256::sha256(credential)[..4])
 }
 
-/// Where the console sends a visitor who is not signed in.
-fn to_sign_in() -> Response {
+/// Where the console sends a visitor who is not signed in: the sign-in
+/// page, saying the session ended when the browser still sent one.
+fn to_sign_in(had_session: bool) -> Response {
     let mut resp = StatusCode::SEE_OTHER.into_response();
     resp.headers_mut().insert(
         header::LOCATION,
-        HeaderValue::from_static("/console/sign-in"),
+        HeaderValue::from_static(if had_session {
+            "/console/sign-in?notice=ended"
+        } else {
+            "/console/sign-in"
+        }),
     );
     resp
 }
@@ -280,7 +285,7 @@ pub async fn access(State(app): State<AppState>, mut req: Request, next: Next) -
                 app.metrics.token_rejected();
             }
             let resp = if console {
-                to_sign_in()
+                to_sign_in(fingerprint.is_some())
             } else {
                 ApiError::unauthorized(reason).into_response()
             };
@@ -288,22 +293,48 @@ pub async fn access(State(app): State<AppState>, mut req: Request, next: Next) -
         }
         Auth::Anonymous | Auth::Ok(..) if app.access.is_failed() => {
             let why = app.access.failure().unwrap_or_default();
-            return ApiError::storage_unavailable(format!(
+            let resp = ApiError::storage_unavailable(format!(
                 "the access log cannot be written ({why}); requests are refused until it can"
             ))
             .into_response();
+            return if console {
+                super::console::html_error(&app, None, None, cx.method == "POST", resp)
+            } else {
+                resp
+            };
         }
-        Auth::Anonymous => (next.run(req).await, None, None),
+        Auth::Anonymous => {
+            let form = cx.method == "POST";
+            let resp = next.run(req).await;
+            let resp = if console {
+                super::console::html_error(&app, None, None, form, resp)
+            } else {
+                resp
+            };
+            (resp, None, None)
+        }
         Auth::Ok(p, csrf) => {
-            if needs_index(&cx.route) && !app.is_ready() {
-                (ApiError::starting().into_response(), Some(p), None)
+            let resp = if needs_index(&cx.route) && !app.is_ready() {
+                ApiError::starting().into_response()
             } else {
                 req.extensions_mut().insert(Caller {
                     principal: p.clone(),
-                    csrf,
+                    csrf: csrf.clone(),
                 });
-                (next.run(req).await, Some(p), None)
-            }
+                next.run(req).await
+            };
+            // A console request that fails is a page, not JSON.
+            let resp = if console {
+                let run = match &cx.run {
+                    Some(PathRun::Valid(id)) => Some(id.as_str()),
+                    _ => None,
+                };
+                let form = cx.method == "POST";
+                super::console::html_error(&app, Some((&p, csrf.as_deref())), run, form, resp)
+            } else {
+                resp
+            };
+            (resp, Some(p), None)
         }
     };
     app.access
@@ -406,13 +437,34 @@ pub async fn fallback(State(app): State<AppState>, req: Request) -> Response {
         return (StatusCode::NOT_FOUND, "not found\n").into_response();
     }
     let cx = Context::of(&app, &req, "<unknown>".into());
-    let (resp, principal, fp) = match bearer_auth(&app, req.headers()) {
-        Auth::Ok(p, _) => {
+    let console = path.starts_with("/console");
+    let auth = if console {
+        console_auth(&app, req.headers(), "<unknown>")
+    } else {
+        bearer_auth(&app, req.headers())
+    };
+    let (resp, principal, fp) = match auth {
+        Auth::Ok(p, csrf) => {
             if app.access.is_failed() {
                 return ApiError::storage_unavailable("the access log cannot be written")
                     .into_response();
             }
-            (ApiError::not_found().into_response(), Some(p), None)
+            let resp = ApiError::not_found().into_response();
+            let resp = if console {
+                super::console::html_error(&app, Some((&p, csrf.as_deref())), None, false, resp)
+            } else {
+                resp
+            };
+            (resp, Some(p), None)
+        }
+        Auth::Failed {
+            fingerprint,
+            reason: _,
+        } if console => {
+            if fingerprint.is_some() {
+                app.metrics.token_rejected();
+            }
+            (to_sign_in(fingerprint.is_some()), None, fingerprint)
         }
         Auth::Failed {
             fingerprint,

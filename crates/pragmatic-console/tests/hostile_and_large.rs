@@ -14,6 +14,18 @@ use pragmatic_console::{
 
 const X: &str = "\"'><script>alert(1)</script><img src=x onerror=alert(2)><!--\u{1b}[2J";
 
+/// The tags the console writes.
+const OWN: &[&str] = &[
+    "!doctype", "html", "/html", "head", "/head", "meta", "title", "/title", "link", "style",
+    "/style", "body", "/body", "div", "/div", "span", "/span", "svg", "/svg", "rect", "a ", "/a",
+    "i ", "i>", "/i", "h1", "/h1", "h2", "/h2", "h3", "/h3", "p ", "p>", "/p", "pre", "/pre",
+    "table", "/table", "caption", "/caption", "thead", "/thead", "tbody", "/tbody", "tr", "/tr",
+    "th", "/th", "td", "/td", "details", "/details", "summary", "/summary", "section", "/section",
+    "article", "/article", "aside", "/aside", "header", "/header", "footer", "/footer", "main",
+    "/main", "nav", "/nav", "ol", "/ol", "ul", "/ul", "li", "/li", "dl", "/dl", "dt", "/dt", "dd",
+    "/dd", "code", "/code", "bdi", "/bdi",
+];
+
 fn j(x: &str) -> String {
     pragmatic::json::Json::String(x.into()).to_string()
 }
@@ -153,52 +165,6 @@ fn hostile() -> Journal {
 }
 
 fn assert_no_injection(html: &str) {
-    const OWN: &[&str] = &[
-        "!doctype",
-        "html",
-        "/html",
-        "head",
-        "/head",
-        "meta",
-        "title",
-        "/title",
-        "link",
-        "style",
-        "/style",
-        "body",
-        "/body",
-        "div",
-        "/div",
-        "span",
-        "/span",
-        "img src=\"data:",
-        "a ",
-        "/a",
-        "b>",
-        "b ",
-        "/b",
-        "i>",
-        "/i",
-        "h2",
-        "/h2",
-        "p ",
-        "p>",
-        "/p",
-        "pre",
-        "/pre",
-        "table",
-        "/table",
-        "tr",
-        "/tr",
-        "th",
-        "/th",
-        "td",
-        "/td",
-        "details",
-        "/details",
-        "summary",
-        "/summary",
-    ];
     for (i, _) in html.match_indices('<') {
         let rest = &html[i + 1..];
         assert!(
@@ -220,11 +186,26 @@ fn payload_in_every_field_is_inert() {
         independent: false,
         operators: vec![X.into()],
         time: Some(X.into()),
+        witnesses: vec![pragmatic_console::AnchorWitness {
+            operator: X.into(),
+            kind: X.into(),
+            trust: pragmatic_console::WitnessTrust::Failed,
+            root: Some(X.into()),
+        }],
+    };
+    let nav = pragmatic_console::html::source_note(X, true);
+    let frame = pragmatic_console::html::Frame {
+        csp: pragmatic_console::html::SERVE_POLICY,
+        fonts: pragmatic_console::html::Fonts::Served("/assets/"),
+        home: Some(X),
+        nav: &nav,
+        footer: "",
     };
     let view = RunView {
         anchor: Some(&anchor),
         source: Some(X),
-        home: Some(X),
+        frame: Some(&frame),
+        exported: Some(X),
         ..RunView::new(X, &jn, &report)
     };
     assert_no_injection(&render_run(&view));
@@ -239,7 +220,8 @@ fn payload_in_every_field_is_inert() {
         RunRow::from_journal(X, &jn, &report).linked(X),
         RunRow::unreadable(X, X),
     ];
-    assert_no_injection(&render_index_of(&rows, Some(X), Some(X)));
+    assert_no_injection(&render_index_of(&rows, Some(X), Some(&frame)));
+    assert_no_injection(&render_index_of(&rows, Some(X), None));
     let mut bundle = Bundle::local(&jn.to_bytes(), "evil", &Redact::None).unwrap();
     bundle.generator = X.into();
     bundle.requested_by = X.into();
@@ -293,10 +275,13 @@ fn format_1_facts_count_committed_effects() {
     let report = jn.audit();
     let html = render_run(&RunView::new("legacy", &jn, &report));
     assert!(
-        html.contains("effects <b>3</b> ok"),
+        html.contains("<dt>effects</dt><dd>3 ok \u{b7} 0 written off \u{b7} format 1 records no failures</dd>"),
         "format 1 page under-reports committed effects"
     );
-    assert!(html.contains("format 1 records no failures"));
+    assert!(
+        html.contains(">3</span> effects"),
+        "the facts count them too"
+    );
 }
 
 /// Format 1 values are shown as slots are: in full up to 64 KiB, with their
@@ -437,18 +422,22 @@ fn long_timelines_are_paged() {
     view.page_link = Some("/run/big?from=");
     let first = render_run_page(&view);
     assert_eq!(first.next, Some(PAGE_ENTRIES as u64));
-    assert!(first.html.contains("id=\"c0\""));
-    assert!(!first.html.contains(&format!("id=\"c{PAGE_ENTRIES}\"")));
-    assert!(first
+    assert!(first.html.contains("<span id=\"c0\"></span>"));
+    assert!(!first
         .html
-        .contains(&format!("<a href=\"/run/big?from={PAGE_ENTRIES}\">")));
+        .contains(&format!("<span id=\"c{PAGE_ENTRIES}\"></span>")));
+    assert!(first.html.contains(&format!(
+        "<a class=\"go\" href=\"/run/big?from={PAGE_ENTRIES}\">Next page</a>"
+    )));
     let mut seen = PAGE_ENTRIES as u64;
     let mut from = first.next;
     while let Some(f) = from {
         view.from = f;
         let page = render_run_page(&view);
-        assert!(page.html.contains(&format!("id=\"c{f}\"")));
-        assert!(page.html.contains("<a href=\"/run/big?from=0\">"));
+        assert!(page.html.contains(&format!("<span id=\"c{f}\"></span>")));
+        assert!(page
+            .html
+            .contains("<a href=\"/run/big?from=0\">First page</a>"));
         seen = page.next.unwrap_or(jn.len());
         from = page.next;
     }
@@ -456,7 +445,9 @@ fn long_timelines_are_paged() {
     // An exported page says where the next one starts.
     view.page_link = None;
     view.from = 0;
-    assert!(render_run(&view).contains(&format!("The next page starts at cursor {PAGE_ENTRIES}.")));
+    assert!(render_run(&view).contains(&format!(
+        "The next file: <span class=\"m\">pragmatic export big --from {PAGE_ENTRIES}</span>"
+    )));
 }
 
 /// Large slots end a page early, so a page stays within its budget

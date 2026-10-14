@@ -282,9 +282,11 @@ pub fn export(args: &Args) -> Result<(), Failure> {
     }
     let report = journal.audit();
     let source = dir.display().to_string();
+    let exported = pragmatic::evidence::time::now_rfc3339();
     let mut view = RunView::new(run, &journal, &report);
     view.source = Some(&source);
     view.from = from;
+    view.exported = Some(&exported);
     let page = render_run_page(&view);
     let out = args.path("--out").unwrap_or_else(|| {
         PathBuf::from(if from == 0 {

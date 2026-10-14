@@ -2,3 +2,10 @@ Pragmatic
 Copyright 2026 Pragmatic Research, Inc.
 
 This product includes software developed by Pragmatic Research, Inc.
+
+The pragmatic-console crate bundles EB Garamond
+(crates/pragmatic-console/assets/fonts/eb-garamond-latin.woff2),
+Copyright 2017 The EB Garamond Project Authors
+(https://github.com/octaviopardo/EBGaramond12), licensed under the SIL Open
+Font License, Version 1.1 (crates/pragmatic-console/assets/fonts/OFL.txt),
+and embeds it in the pages it renders.

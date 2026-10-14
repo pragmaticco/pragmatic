@@ -260,9 +260,11 @@ pragmatic export research-42 --dir ./journals -o run.html   # or a self-containe
 ```
 
 `serve` gives you a live console over your journal directory: every run, its
-chain status, dangling-effect warnings, and a full per-run timeline (every
-prompt, outcome, effect, and chain hash). `export` bakes one run into a single
-HTML file you can attach to an incident ticket - it opens anywhere.
+chain status, calls a crash left open, and a per-run timeline whose rows say
+in words what happened ("Model call → lookup_order", "No end: crashed") and
+open to every prompt, outcome, effect and chain hash. `export` bakes one run
+into a single HTML file, fonts included, that you can attach to an incident
+ticket - it opens anywhere and loads nothing.
 
 > Journals contain your prompts and completions in plaintext (they *are* the
 > audit trail), so `serve` binds to loopback only by default. See

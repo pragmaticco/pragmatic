@@ -20,10 +20,29 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 
 use pragmatic::Backend;
-use pragmatic_console::html::{esc, CONTENT_SECURITY_POLICY};
+use pragmatic_console::fonts::{self, Fonts};
+use pragmatic_console::html::{
+    document, esc, masthead, solo_card, source_note, Crumb, Frame, Page, SERVE_POLICY,
+};
 use pragmatic_console::{render_index_of, render_run, RunRow, RunView};
 
 use crate::journals::{backend, discover, open};
+
+/// Where this console serves its fonts.
+const ASSETS: &str = "/assets/";
+
+/// The frame of every page: fonts from this console, links home to the
+/// index, and the directory on the masthead.
+fn with_frame<T>(dir: &Path, f: impl FnOnce(&Frame<'_>) -> T) -> T {
+    let nav = source_note(&dir.display().to_string(), true);
+    f(&Frame {
+        csp: SERVE_POLICY,
+        fonts: Fonts::Served(ASSETS),
+        home: Some("/"),
+        nav: &nav,
+        footer: "",
+    })
+}
 
 fn index_page(dir: &Path, key: Option<&[u8]>) -> String {
     let runs = discover(dir).unwrap_or_default();
@@ -34,7 +53,10 @@ fn index_page(dir: &Path, key: Option<&[u8]>) -> String {
             Err(e) => RunRow::unreadable(run, &e),
         })
         .collect();
-    render_index_of(&rows, Some(&dir.display().to_string()), Some("/"))
+    let source = dir.display().to_string();
+    with_frame(dir, |frame| {
+        render_index_of(&rows, Some(&source), Some(frame))
+    })
 }
 
 fn run_page(dir: &Path, run: &str, from: u64, key: Option<&[u8]>) -> Result<String, String> {
@@ -46,14 +68,45 @@ fn run_page(dir: &Path, run: &str, from: u64, key: Option<&[u8]>) -> Result<Stri
         .unwrap_or_else(|_| journal.audit());
     let source = dir.display().to_string();
     let link = format!("/run/{run}?from=");
-    let view = RunView {
-        source: Some(&source),
-        home: Some("/"),
-        from: from.min(journal.len()),
-        page_link: Some(&link),
-        ..RunView::new(run, &journal, &report)
-    };
-    Ok(render_run(&view))
+    Ok(with_frame(dir, |frame| {
+        let view = RunView {
+            source: Some(&source),
+            from: from.min(journal.len()),
+            page_link: Some(&link),
+            frame: Some(frame),
+            ..RunView::new(run, &journal, &report)
+        };
+        render_run(&view)
+    }))
+}
+
+/// The page for a run this directory does not hold.
+fn missing_page(dir: &Path, run: &str) -> String {
+    with_frame(dir, |frame| {
+        let body = format!(
+            "<p class=\"lede\">There is no readable run with this id in <span class=\"m\">{}</span>. \
+             The id may be mistyped, or the run may have been moved.</p>\
+             <p class=\"actions\"><a class=\"go\" href=\"/\">Back to runs</a></p>",
+            esc(&dir.display().to_string())
+        );
+        document(
+            frame,
+            &Page {
+                title: "No such run",
+                masthead: masthead(
+                    frame.home,
+                    &[Crumb::word("Runs", frame.home), Crumb::id(run, None)],
+                    frame.nav,
+                ),
+                main: solo_card(
+                    "Error 404",
+                    &format!("No run named <span class=\"m\">{}</span>", esc(run)),
+                    &body,
+                ),
+                ..Page::default()
+            },
+        )
+    })
 }
 
 /// The value of header `name` (case-insensitive) in a request head.
@@ -93,14 +146,26 @@ fn refusal(head: &str, port: u16) -> Option<(&'static str, &'static str)> {
 }
 
 fn respond(stream: &mut TcpStream, status: &str, content_type: &str, body: &str) {
-    let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: {content_type}; charset=utf-8\r\n\
-         content-security-policy: {CONTENT_SECURITY_POLICY}\r\n\
-         x-content-type-options: nosniff\r\nreferrer-policy: no-referrer\r\n\
-         cache-control: no-store\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+    let content_type = format!("{content_type}; charset=utf-8");
+    respond_bytes(stream, status, &content_type, "no-store", body.as_bytes());
+}
+
+fn respond_bytes(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    cache: &str,
+    body: &[u8],
+) {
+    let head = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\n\
+         content-security-policy: {SERVE_POLICY}\r\n\
+         x-content-type-options: nosniff\r\nreferrer-policy: same-origin\r\n\
+         cache-control: {cache}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     );
-    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(body);
 }
 
 fn handle(mut stream: TcpStream, dir: &Path, key: Option<&[u8]>, port: u16) {
@@ -135,6 +200,16 @@ fn handle(mut stream: TcpStream, dir: &Path, key: Option<&[u8]>, port: u16) {
     match path {
         "/healthz" => respond(&mut stream, "200 OK", "text/plain", "ok"),
         "/" => respond(&mut stream, "200 OK", "text/html", &index_page(dir, key)),
+        p if p.starts_with(ASSETS) => match fonts::served(&p[ASSETS.len()..]) {
+            Some(f) => respond_bytes(
+                &mut stream,
+                "200 OK",
+                fonts::FONT_TYPE,
+                fonts::FONT_CACHE,
+                f.bytes,
+            ),
+            None => respond(&mut stream, "404 Not Found", "text/plain", "not found"),
+        },
         p if p.starts_with("/run/") => {
             // Run ids are `[A-Za-z0-9._:-]{1,200}`; anything else is cut off.
             let run: String = p["/run/".len()..]
@@ -148,11 +223,11 @@ fn handle(mut stream: TcpStream, dir: &Path, key: Option<&[u8]>, port: u16) {
                 .unwrap_or(0);
             match run_page(dir, &run, from, key) {
                 Ok(html) => respond(&mut stream, "200 OK", "text/html", &html),
-                Err(e) => respond(
+                Err(_) => respond(
                     &mut stream,
                     "404 Not Found",
-                    "text/plain",
-                    &format!("no such run '{}': {}", esc(&run), esc(&e)),
+                    "text/html",
+                    &missing_page(dir, &run),
                 ),
             }
         }

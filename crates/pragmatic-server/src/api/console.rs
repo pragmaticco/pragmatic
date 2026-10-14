@@ -9,7 +9,13 @@
 //! token and come from the console's own origin (see [`crate::console`]).
 //! A successful form redirects back to its page with a fixed notice; a
 //! refused one redirects with the error code (never with text from the
-//! request).
+//! request). A form whose action cannot be undone (erasure, removing a
+//! hold, revoking a token, running retention) answers its first post with
+//! a confirmation page; only the confirming post, which repeats the fields
+//! with `confirm=1` and the CSRF token, acts.
+//!
+//! A console request that fails is answered with an HTML page in the
+//! console's frame ([`html_error`]), not the API's JSON.
 //!
 //! Every console page carries a Content-Security-Policy that loads and
 //! runs nothing and lets forms submit only to the console, and is never
@@ -36,7 +42,9 @@ use crate::console::{
 };
 use crate::error::ApiError;
 use crate::holds::{HoldScope, NewHold};
-use crate::hooks::{ConsoleError, ConsolePage, ConsoleViewer};
+use crate::hooks::{
+    ConsoleConfirm, ConsoleError, ConsoleNotice, ConsolePage, ConsoleViewer, ErasePreviewSlot,
+};
 use crate::store::{ListQuery, Selector};
 use crate::timefmt;
 use crate::tokens::{IssueRequest, Role};
@@ -49,14 +57,22 @@ const FORM_LIMIT: u64 = 64 * 1024;
 const PAGE_ENTRIES: u64 = pragmatic_console::PAGE_ENTRIES as u64;
 
 fn viewer(app: &AppState, c: &Caller) -> ConsoleViewer {
-    let p = &c.principal;
+    viewer_of(app, &c.principal, c.csrf.as_deref())
+}
+
+/// The viewer of a page, from a principal and its session's CSRF token.
+pub fn viewer_of(
+    app: &AppState,
+    p: &crate::tokens::Principal,
+    csrf: Option<&str>,
+) -> ConsoleViewer {
     ConsoleViewer {
         token_id: p.token_id.clone(),
         name: p.name.clone(),
         role: p.role.as_str().into(),
         view_raw: p.view_raw,
         licensee: app.config.license.licensee.clone(),
-        csrf: c.csrf.clone().unwrap_or_default(),
+        csrf: csrf.unwrap_or_default().to_string(),
     }
 }
 
@@ -77,9 +93,12 @@ fn page_headers(resp: &mut Response) {
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
+    // `same-origin`, not `no-referrer`: under `no-referrer` a browser sends
+    // `Origin: null` with a form's post, which the console's origin check
+    // refuses. Nothing is sent to any other site either way.
     h.insert(
         header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
+        HeaderValue::from_static("same-origin"),
     );
 }
 
@@ -185,34 +204,202 @@ fn check_form(
     }
 }
 
+/// The sentence for a refusal code the console knows.
+fn refusal(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "on_hold" => "The request was refused: the run is under a legal hold.",
+        "run_locked" => {
+            "The request was refused: a live lease holds the run. Check \u{2018}Revoke a live \
+             lease\u{2019} to erase anyway."
+        }
+        "unfinished" => {
+            "The request was refused: the run did not finish. Check \u{2018}The run did not \
+             finish\u{2019} to erase anyway; it then can no longer resume."
+        }
+        "retention_locked" => {
+            "The request was refused: erasure is not allowed while the retention minimum applies."
+        }
+        "chain_broken" => {
+            "The request was refused: the stored journal is damaged, and an administrator must \
+             act first."
+        }
+        "run_deleted" => "The request was refused: the run was deleted.",
+        "bad_selector" => {
+            "The request was refused: give exactly one of slots, a text to match, or every slot."
+        }
+        "bad_slots" => {
+            "The request was refused: write each slot as cursor:slot, for example 5:0, and name \
+             only slots that exist."
+        }
+        "bad_reason_code" => {
+            "The request was refused: a reason code is 1 to 64 lowercase letters, digits and \
+             _ . : -"
+        }
+        "nothing_to_erase" => "Nothing was erased: no sealed slot matches.",
+        "bad_role" => "The request was refused: choose a role from the list.",
+        "not_found" => "The request was refused: what it names does not exist.",
+        "forbidden" => "The request was refused: your role cannot do this.",
+        _ => return None,
+    })
+}
+
 /// The notice for a `done=` or `error=` parameter: fixed text, never text
-/// from the request.
-fn notice(raw: Option<&str>) -> Option<String> {
+/// from the request (an unknown error code is shown as a code, checked to
+/// be short lowercase letters).
+fn notice(raw: Option<&str>) -> Option<ConsoleNotice> {
     let mut out = None;
+    let done = |text: &str| ConsoleNotice {
+        text: text.into(),
+        code: None,
+        refused: false,
+    };
     for (k, v) in query_pairs(raw) {
-        let text = match (k.as_str(), v.as_str()) {
-            ("done", "erased") => "Erased. The erasure note records who, why and when.".into(),
-            ("done", "hold_placed") => "The hold is placed.".into(),
-            ("done", "hold_removed") => "The hold is removed.".into(),
-            ("done", "retention") => "Retention ran. Its actions are in the erasure ledger.".into(),
-            ("done", "token_revoked") => "The token is revoked; its sessions are over.".into(),
+        let n = match (k.as_str(), v.as_str()) {
+            ("done", "erased") => done("Erased. The erasure note records who, why and when."),
+            ("done", "hold_placed") => done("The hold is placed."),
+            ("done", "hold_removed") => done("The hold is removed."),
+            ("done", "retention") => done("Retention ran. Its actions are in the erasure ledger."),
+            ("done", "token_revoked") => done("The token is revoked; its sessions are over."),
             ("error", code)
                 if code.len() <= 32
                     && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') =>
             {
-                format!("The request was refused: {code}.")
+                match refusal(code) {
+                    Some(text) => ConsoleNotice {
+                        text: text.into(),
+                        code: None,
+                        refused: code != "nothing_to_erase",
+                    },
+                    None => ConsoleNotice {
+                        text: "The request was refused:".into(),
+                        code: Some(code.to_string()),
+                        refused: true,
+                    },
+                }
             }
             _ => continue,
         };
-        out = Some(text);
+        out = Some(n);
     }
     out
 }
 
 /// Where a refused form goes: back to its page with the error code.
 fn refused(back: &str, e: &ApiError) -> Response {
+    let code = if e.extra.get("unfinished") == Some(&JsonValue::Bool(true)) {
+        "unfinished"
+    } else {
+        e.code
+    };
+    refused_with(back, code)
+}
+
+/// Back to the form's page with a console refusal code.
+fn refused_with(back: &str, code: &str) -> Response {
     let sep = if back.contains('?') { '&' } else { '?' };
-    see_other(&format!("{back}{sep}error={}", e.code))
+    see_other(&format!("{back}{sep}error={code}"))
+}
+
+/// True when the confirming post of a confirmation page sent the form.
+fn confirmed(form: &[(String, String)]) -> bool {
+    field(form, "confirm") == "1"
+}
+
+/// The sign-in page's notice, from its `notice=` parameter.
+fn sign_in_notice(raw: Option<&str>) -> Option<&'static str> {
+    query_pairs(raw)
+        .into_iter()
+        .find(|(k, _)| k == "notice")
+        .and_then(|(_, v)| match v.as_str() {
+            "signed_out" => Some("You are signed out."),
+            "ended" => Some(
+                "Your session has ended: sessions end after 15 minutes without a request, 12 \
+                 hours after sign-in, or when their token is revoked. Sign in again to go on.",
+            ),
+            _ => None,
+        })
+}
+
+/// `GET /console/assets/{file}`: the console's fonts, served from its own
+/// origin (its policy allows `font-src 'self'` and nothing else from
+/// anywhere). Each name carries a hash of the font, so it is cached for a
+/// year. Open to everyone: the sign-in page needs them too, and they are
+/// the same for every server.
+pub async fn asset(file: Result<Path<String>, PathRejection>) -> Response {
+    let font = file
+        .ok()
+        .and_then(|Path(name)| pragmatic_console::fonts::served(&name));
+    let Some(font) = font else {
+        return (StatusCode::NOT_FOUND, "not found\n").into_response();
+    };
+    let mut resp = (StatusCode::OK, font.bytes).into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(pragmatic_console::fonts::FONT_TYPE),
+    );
+    h.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(pragmatic_console::fonts::FONT_CACHE),
+    );
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        "cross-origin-resource-policy",
+        HeaderValue::from_static("same-origin"),
+    );
+    resp
+}
+
+/// A failed console request as an HTML page in the console's frame,
+/// keeping its status, its `Retry-After` and what the access log records
+/// of it. A response that is not an error, or that the renderer cannot
+/// draw (the 501 stand-in), is returned as it is.
+pub fn html_error(
+    app: &AppState,
+    who: Option<(&crate::tokens::Principal, Option<&str>)>,
+    run_id: Option<&str>,
+    form: bool,
+    mut resp: Response,
+) -> Response {
+    let status = resp.status();
+    if !(status.is_client_error() || status.is_server_error()) {
+        return resp;
+    }
+    let is_json = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"application/json"));
+    let Some(note) = resp.extensions().get::<super::ErrorNote>().cloned() else {
+        return resp;
+    };
+    if !is_json {
+        return resp;
+    }
+    let viewer = who.map(|(p, csrf)| viewer_of(app, p, csrf));
+    let page = ConsolePage::Error {
+        viewer: viewer.as_ref(),
+        licensee: &app.config.license.licensee,
+        status: status.as_u16(),
+        code: note.code,
+        run_id,
+        form,
+    };
+    let Ok(html) = app.hooks.console.render(&page) else {
+        return resp;
+    };
+    let mut out = (status, html).into_response();
+    page_headers(&mut out);
+    if let Some(v) = resp.headers().get(header::RETRY_AFTER) {
+        out.headers_mut().insert(header::RETRY_AFTER, v.clone());
+    }
+    if let Some(n) = resp.extensions_mut().remove::<AccessNote>() {
+        out.extensions_mut().insert(n);
+    }
+    out.extensions_mut().insert(note);
+    out
 }
 
 fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -225,10 +412,14 @@ fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 
 /// `GET /console/sign-in`: the form, with a fresh anti-forgery value in a
 /// cookie of its own.
-pub async fn sign_in_page(State(app): State<AppState>) -> Result<Response, ApiError> {
+pub async fn sign_in_page(
+    State(app): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, ApiError> {
     let value = random_hex()?;
     let page = ConsolePage::SignIn {
         error: None,
+        notice: sign_in_notice(raw.as_deref()),
         licensee: &app.config.license.licensee,
         csrf: &value,
     };
@@ -262,6 +453,7 @@ pub async fn sign_in(
         let fresh = random_hex()?;
         let page = ConsolePage::SignIn {
             error: Some("The sign-in form expired or was not sent from this console. Try again."),
+            notice: None,
             licensee: &app.config.license.licensee,
             csrf: &fresh,
         };
@@ -293,8 +485,13 @@ pub async fn sign_in(
                 Err(f) => f.fingerprint.clone(),
                 Ok(_) => String::new(),
             };
+            let error = match &result {
+                Ok(_) => "This token cannot open the console.",
+                Err(_) => "That token was not accepted.",
+            };
             let page = ConsolePage::SignIn {
-                error: Some("That token was not accepted."),
+                error: Some(error),
+                notice: None,
                 licensee: &app.config.license.licensee,
                 csrf: &expected,
             };
@@ -326,7 +523,7 @@ pub async fn sign_out(
     let who = value
         .and_then(|v| app.sessions.remove(&v))
         .and_then(|id| app.tokens.principal_by_id(&id, timefmt::now_unix_secs()));
-    let mut resp = see_other("/console/sign-in");
+    let mut resp = see_other("/console/sign-in?notice=signed_out");
     if let Ok(v) = HeaderValue::from_str(&clear_cookie(app.config.serves_https())) {
         resp.headers_mut().insert(header::SET_COOKIE, v);
     }
@@ -410,6 +607,31 @@ fn anchor_status(app: &AppState, run_id: &str) -> Option<pragmatic_console::Anch
         .find(|(_, w)| w.independent)
         .or_else(|| pairs.next_back())?;
     let (anchor, w) = pick;
+    use pragmatic::evidence::Witness;
+    use pragmatic_console::{AnchorWitness, WitnessTrust};
+    // The witnesses of that anchor: trusted when the server counts their
+    // operator towards independence, its own signature otherwise.
+    let witnesses = anchor
+        .witnesses
+        .iter()
+        .map(|wit| {
+            let (operator, kind) = match wit {
+                Witness::Rfc3161 { operator, .. } => (operator.clone(), "RFC 3161"),
+                Witness::Cosignature { name, .. } => (name.clone(), "cosignature"),
+            };
+            let trust = if w.independent && w.operators.contains(&operator) {
+                WitnessTrust::Trusted
+            } else {
+                WitnessTrust::Operator
+            };
+            AnchorWitness {
+                operator,
+                kind: kind.to_string(),
+                trust,
+                root: None,
+            }
+        })
+        .collect();
     Some(pragmatic_console::AnchorStatus {
         anchored_entries: pragmatic::evidence::Leaf::decode(&anchor.leaf)
             .map(|l| l.entries)
@@ -417,6 +639,7 @@ fn anchor_status(app: &AppState, run_id: &str) -> Option<pragmatic_console::Anch
         independent: w.independent,
         operators: w.operators.clone(),
         time: w.time.map(|t| timefmt::rfc3339(t as i64)),
+        witnesses,
     })
 }
 
@@ -469,7 +692,7 @@ pub async fn run(
             anchor: anchor.as_ref(),
             from,
             redactor: (!v.view_raw).then_some(a.redactor.as_ref()),
-            notice: notice.as_deref(),
+            notice: notice.as_ref(),
         };
         Ok((render(&a, &data, StatusCode::OK), shown))
     })
@@ -503,7 +726,9 @@ pub async fn evidence(
     super::runs::build_evidence(app, p, id, redact, false).await
 }
 
-/// `POST /console/runs/{id}/erase` (admin): the erasure form.
+/// `POST /console/runs/{id}/erase` (admin): the erasure form. Its first
+/// post shows what would be erased, from the stored journal, and erases
+/// nothing; the confirming post erases.
 pub async fn erase(
     State(app): State<AppState>,
     Extension(c): Extension<Caller>,
@@ -513,6 +738,7 @@ pub async fn erase(
 ) -> Result<Response, ApiError> {
     let id = path_id(id)?;
     need(&c.principal, &[Role::Admin])?;
+    super::in_scope(&c.principal, &id)?;
     let form = read_form(&app, &headers, body).await?;
     check_form(&app, &headers, &c, &form)?;
     let back = format!("/console/runs/{}", crate::console_ui::encode(&id));
@@ -529,18 +755,34 @@ pub async fn erase(
                 });
                 match parsed {
                     Some(p) => out.push(p),
-                    None => return Ok(refused(&back, &ApiError::bad_request("slots"))),
+                    None => return Ok(refused_with(&back, "bad_slots")),
                 }
             }
             Selector::Slots(out)
         }
         ("", m, false) if !m.is_empty() => Selector::Match(m.to_string()),
         ("", "", true) => Selector::All,
-        _ => return Ok(refused(&back, &ApiError::bad_request("selector"))),
+        _ => return Ok(refused_with(&back, "bad_selector")),
     };
+    let reason_code = field(&form, "reason_code").to_string();
+    let reason_ok = !reason_code.is_empty()
+        && reason_code.len() <= 64
+        && reason_code
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.:-".contains(&b));
+    if !reason_ok {
+        return Ok(refused_with(&back, "bad_reason_code"));
+    }
+    if !confirmed(&form) {
+        // A run under a hold is refused before anything is asked.
+        if !app.holds.matching(&id).is_empty() {
+            return Ok(refused_with(&back, "on_hold"));
+        }
+        return erase_confirmation(&app, &c, &id, &back, &form, &selector).await;
+    }
     let request = EraseRequest {
         selector,
-        reason_code: field(&form, "reason_code").to_string(),
+        reason_code,
         reason: field(&form, "reason").to_string(),
         force: checked(&form, "force"),
         allow_unfinished: checked(&form, "allow_unfinished"),
@@ -549,6 +791,109 @@ pub async fn erase(
         Ok(_) => see_other(&format!("{back}?done=erased")),
         Err(e) => refused(&back, &e),
     })
+}
+
+/// The confirmation of an erasure: the slots it would erase, resolved
+/// from the stored journal exactly as the erasure resolves them, and the
+/// form's fields to post again.
+async fn erase_confirmation(
+    app: &AppState,
+    c: &Caller,
+    id: &str,
+    back: &str,
+    form: &[(String, String)],
+    selector: &Selector,
+) -> Result<Response, ApiError> {
+    use pragmatic::journal::EraseSelector;
+    let wanted = match selector {
+        Selector::Slots(s) => EraseSelector::Slots(s.clone()),
+        Selector::Match(t) => EraseSelector::Match(t.as_bytes().to_vec()),
+        Selector::All => EraseSelector::All,
+    };
+    let (a, run) = (app.clone(), id.to_string());
+    let preview = blocking(move || {
+        let durable = a.store.durable_scaled(&run, 3)?;
+        let (journal, _) = Journal::audit_bytes(&durable.bytes, None)
+            .map_err(|e| ApiError::chain_broken(&e.to_string()))?;
+        drop(durable);
+        let targets = match journal.erase_targets(&wanted) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+        let slots: Vec<ErasePreviewSlot> = targets
+            .iter()
+            .take(50)
+            .map(|&(cursor, k)| ErasePreviewSlot {
+                cursor,
+                slot: k,
+                what: pragmatic_console::text::slot_title(&journal, cursor, k as usize),
+                bytes: journal
+                    .get(cursor)
+                    .and_then(|e| e.event.slot_contents().get(k as usize).copied())
+                    .and_then(|c| c.value())
+                    .map_or(0, |v| v.len() as u64),
+            })
+            .collect();
+        Ok(Some((slots, targets.len())))
+    })
+    .await?;
+    let Some((slots, total)) = preview else {
+        return Ok(refused_with(back, "bad_slots"));
+    };
+    if total == 0 {
+        return Ok(refused_with(back, "nothing_to_erase"));
+    }
+    let keep = [
+        "slots",
+        "match",
+        "all",
+        "reason_code",
+        "reason",
+        "force",
+        "allow_unfinished",
+    ];
+    let fields: Vec<(String, String)> = form
+        .iter()
+        .filter(|(k, _)| keep.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    let confirm = ConsoleConfirm::Erase {
+        run_id: id.to_string(),
+        slots,
+        total,
+        reason_code: field(form, "reason_code").to_string(),
+        reason: field(form, "reason").to_string(),
+        force: checked(form, "force"),
+        allow_unfinished: checked(form, "allow_unfinished"),
+        fields,
+    };
+    let v = viewer(app, c);
+    let action = format!("{back}/erase");
+    let page = ConsolePage::Confirm {
+        viewer: &v,
+        action: &action,
+        back,
+        confirm: &confirm,
+    };
+    Ok(render(app, &page, StatusCode::OK))
+}
+
+/// A confirmation page for a form with no fields of its own.
+fn confirmation(
+    app: &AppState,
+    c: &Caller,
+    action: &str,
+    back: &str,
+    confirm: ConsoleConfirm,
+) -> Response {
+    let v = viewer(app, c);
+    let page = ConsolePage::Confirm {
+        viewer: &v,
+        action,
+        back,
+        confirm: &confirm,
+    };
+    render(app, &page, StatusCode::OK)
 }
 
 /// `GET /console/access?after=`: the access log (admins: all; auditors:
@@ -604,7 +949,7 @@ pub async fn holds(
         viewer: &v,
         holds: &holds,
         retention: &retention,
-        notice: notice.as_deref(),
+        notice: notice.as_ref(),
     };
     Ok(render(&app, &data, StatusCode::OK))
 }
@@ -652,6 +997,19 @@ pub async fn remove_hold(
     need(&c.principal, &[Role::Admin])?;
     let form = read_form(&app, &headers, body).await?;
     check_form(&app, &headers, &c, &form)?;
+    if !confirmed(&form) {
+        let Some(hold) = app.holds.get(&id) else {
+            return Ok(refused_with("/console/holds", "not_found"));
+        };
+        let action = format!("/console/holds/{}/remove", crate::console_ui::encode(&id));
+        return Ok(confirmation(
+            &app,
+            &c,
+            &action,
+            "/console/holds",
+            ConsoleConfirm::RemoveHold { hold: json!(hold) },
+        ));
+    }
     Ok(
         match super::admin::lift_hold(&app, &c.principal, id).await {
             Ok(_) => see_other("/console/holds?done=hold_removed"),
@@ -670,6 +1028,17 @@ pub async fn retention(
     need(&c.principal, &[Role::Admin])?;
     let form = read_form(&app, &headers, body).await?;
     check_form(&app, &headers, &c, &form)?;
+    if !confirmed(&form) {
+        return Ok(confirmation(
+            &app,
+            &c,
+            "/console/retention/run",
+            "/console/holds",
+            ConsoleConfirm::RunRetention {
+                policies: json!(app.config.retention),
+            },
+        ));
+    }
     Ok(
         match super::admin::run_retention(&app, &c.principal).await {
             Ok(_) => see_other("/console/holds?done=retention"),
@@ -682,7 +1051,7 @@ fn token_page(
     app: &AppState,
     c: &Caller,
     issued: Option<(&str, &JsonValue)>,
-    notice: Option<&str>,
+    notice: Option<&ConsoleNotice>,
 ) -> Response {
     let tokens: Vec<JsonValue> = app.tokens.list().into_iter().map(|t| json!(t)).collect();
     let v = viewer(app, c);
@@ -703,7 +1072,7 @@ pub async fn tokens(
 ) -> Result<Response, ApiError> {
     need(&c.principal, &[Role::Admin])?;
     let notice = notice(raw.as_deref());
-    Ok(token_page(&app, &c, None, notice.as_deref()))
+    Ok(token_page(&app, &c, None, notice.as_ref()))
 }
 
 /// `POST /console/tokens` (admin): issue a token. The value is shown on
@@ -718,7 +1087,7 @@ pub async fn issue_token(
     let form = read_form(&app, &headers, body).await?;
     check_form(&app, &headers, &c, &form)?;
     let Some(role) = Role::parse(field(&form, "role")) else {
-        return Ok(refused("/console/tokens", &ApiError::bad_request("role")));
+        return Ok(refused_with("/console/tokens", "bad_role"));
     };
     let expires = field(&form, "expires_at").trim();
     let req = IssueRequest {
@@ -754,6 +1123,21 @@ pub async fn revoke_token(
     need(&c.principal, &[Role::Admin])?;
     let form = read_form(&app, &headers, body).await?;
     check_form(&app, &headers, &c, &form)?;
+    if !confirmed(&form) {
+        let Some(token) = app.tokens.list().into_iter().find(|t| t.id == id) else {
+            return Ok(refused_with("/console/tokens", "not_found"));
+        };
+        let action = format!("/console/tokens/{}/revoke", crate::console_ui::encode(&id));
+        return Ok(confirmation(
+            &app,
+            &c,
+            &action,
+            "/console/tokens",
+            ConsoleConfirm::RevokeToken {
+                token: json!(token),
+            },
+        ));
+    }
     Ok(match super::admin::revoke(&app, &c.principal, id).await {
         Ok(_) => see_other("/console/tokens?done=token_revoked"),
         Err(e) => refused("/console/tokens", &e),
@@ -766,15 +1150,37 @@ mod tests {
 
     #[test]
     fn notices_are_fixed_text() {
+        let text = |raw: &str| notice(Some(raw)).map(|n| (n.text, n.code, n.refused));
         assert_eq!(
-            notice(Some("done=erased")).as_deref(),
-            Some("Erased. The erasure note records who, why and when.")
+            text("done=erased"),
+            Some((
+                "Erased. The erasure note records who, why and when.".into(),
+                None,
+                false
+            ))
         );
         assert_eq!(
-            notice(Some("error=on_hold")).as_deref(),
-            Some("The request was refused: on_hold.")
+            text("error=on_hold"),
+            Some((
+                "The request was refused: the run is under a legal hold.".into(),
+                None,
+                true
+            ))
+        );
+        assert_eq!(
+            text("error=odd_code"),
+            Some((
+                "The request was refused:".into(),
+                Some("odd_code".into()),
+                true
+            ))
         );
         assert_eq!(notice(Some("error=%3Cscript%3E")), None);
         assert_eq!(notice(Some("done=whatever")), None);
+        assert_eq!(
+            sign_in_notice(Some("notice=signed_out")),
+            Some("You are signed out.")
+        );
+        assert_eq!(sign_in_notice(Some("notice=%3Cx%3E")), None);
     }
 }
