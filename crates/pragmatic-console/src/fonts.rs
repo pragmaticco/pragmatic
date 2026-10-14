@@ -8,9 +8,10 @@
 //! immutable cache (Pragmatic Server and `pragmatic serve`, whose policy
 //! then allows `font-src 'self'`).
 //!
-//! The crate bundles all four faces the design uses, as the Latin subsets
-//! Google Fonts serves, unmodified: EB Garamond roman and italic, and IBM
-//! Plex Mono regular and medium. Every face loads from its bundled file
+//! The crate bundles all four faces the design uses, as unmodified Latin
+//! subsets: EB Garamond roman and italic as Google Fonts serves them, and
+//! IBM Plex Mono regular and medium as IBM itself splits them (the
+//! `Latin1` files of the `@ibm/plex-mono` 2.5.0 package). Every face loads from its bundled file
 //! only, never from a copy installed on the reader's machine (which may be
 //! another version with other metrics), so a page looks the same
 //! everywhere, as the website does. While a file loads, Georgia (scaled to
@@ -85,14 +86,14 @@ pub static BUNDLED: &[BundledFont] = &[
         "IBM Plex Mono",
         "normal",
         400,
-        "ibm-plex-mono-400-latin.woff2",
+        "IBMPlexMono-Regular-Latin1.woff2",
         PLEX
     ),
     font!(
         "IBM Plex Mono",
         "normal",
         500,
-        "ibm-plex-mono-500-latin.woff2",
+        "IBMPlexMono-Medium-Latin1.woff2",
         PLEX
     ),
 ];

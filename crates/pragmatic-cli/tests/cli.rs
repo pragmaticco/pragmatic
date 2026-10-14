@@ -900,8 +900,8 @@ fn serve_renders_the_console_on_loopback() {
     for face in [
         "eb-garamond-latin.",
         "eb-garamond-italic-latin.",
-        "ibm-plex-mono-400-latin.",
-        "ibm-plex-mono-500-latin.",
+        "IBMPlexMono-Regular-Latin1.",
+        "IBMPlexMono-Medium-Latin1.",
     ] {
         assert!(run.contains(&format!("url(/assets/{face}")), "{face}");
     }

@@ -1971,9 +1971,9 @@ cut at 64 KiB.
   no credential, under names that carry a hash of the font, with
   `Cache-Control: public, max-age=31536000, immutable`), and their
   policies allow `font-src 'self'` and nothing else from anywhere. The
-  crate bundles all four faces, the unmodified Latin subsets Google Fonts
-  serves: EB Garamond roman and italic, and IBM Plex Mono regular and
-  medium (SIL OFL 1.1, `assets/fonts/OFL-EBGaramond.txt` and
+  crate bundles all four faces as unmodified Latin subsets: EB Garamond
+  roman and italic as Google Fonts serves them, and IBM Plex Mono regular
+  and medium as IBM splits them in `@ibm/plex-mono` 2.5.0 (SIL OFL 1.1, `assets/fonts/OFL-EBGaramond.txt` and
   `OFL-IBMPlexMono.txt`; Plex keeps its Reserved Font Name). Every face
   loads from its bundled file only, never from an installed copy that may
   be another version, so a page looks the same everywhere; Georgia and
