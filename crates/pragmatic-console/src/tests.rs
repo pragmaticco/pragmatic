@@ -347,13 +347,21 @@ fn refund_20417_reads_as_designed() {
         "title=\"{hash}\" aria-hidden=\"true\">{}</span>",
         &hash[..10]
     )));
-    // The full head, to copy, at the sheet's foot.
+    // The head at the sheet's foot: shown short, and whole in its title
+    // and when copied.
     let head = pragmatic::encoding::hex_encode(&j.head());
     assert!(html.contains(&format!(
-        "head <span class=\"hx\">{}<wbr>{}</span>",
-        &head[..32],
-        &head[32..]
+        "head <span class=\"hx\" title=\"{head}\">{head}</span>"
     )));
+    // The foot never offers the head a place to break, and the page cuts
+    // it to sixteen characters and an ellipsis, on one line.
+    let foot = &html[html.find("<p class=\"chain\">").unwrap()..];
+    let foot = &foot[..foot.find("</p>").unwrap()];
+    assert!(!foot.contains("<wbr>"), "{foot}");
+    assert!(html.contains(
+        ".chain .hx { display: inline-block; max-width: 17ch; overflow: hidden; \
+         text-overflow: ellipsis;\n             white-space: nowrap;"
+    ));
     // The side cards: the check as `pragmatic verify` prints it, with the
     // commands to repeat it set as commands, and the run with its
     // attempts. A local journal has no anchors, and its page says

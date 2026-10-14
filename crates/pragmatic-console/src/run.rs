@@ -1157,18 +1157,18 @@ fn chain_foot(report: &VerifyReport, j: &Journal) -> String {
     } else {
         String::new()
     };
-    // The full head, to copy: it breaks only at its middle.
+    // The head, shown short as the Evidence check card shows it, so the
+    // foot stays one line and no hash ever wraps. The whole head is in
+    // its title, and selecting it copies all of it.
     format!(
         "<p class=\"chain\">{}<span>Chain verified</span><span class=\"s\">\u{b7} {}</span>\
-         <span class=\"m hd\"><span class=\"d\">\u{b7} </span>head <span class=\"hx\">{}<wbr>{}</span></span>{extra}{torn}</p>",
+         <span class=\"m hd\"><span class=\"d\">\u{b7} </span>head <span class=\"hx\" title=\"{head}\">{head}</span></span>{extra}{torn}</p>",
         diamond(true, false),
         if j.len() == 1 {
             "1 entry".to_string()
         } else {
             format!("{} entries", text::count(j.len()))
         },
-        &head[..32],
-        &head[32..]
     )
 }
 

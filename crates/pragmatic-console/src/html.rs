@@ -389,10 +389,13 @@ pre .js { color: var(--ink-70); }
 .chain .dm { align-self: center; width: 7px; height: 7px; margin: 0 6px 0 3px; }
 .chain .s { color: var(--ink-70); }
 .chain .m { font-size: 12.5px; color: var(--ink-64); }
-.chain .hx { -webkit-user-select: all; user-select: all; }
-/* The full head takes a line of its own where the sheet cannot hold it
-   beside the rest. */
-@container sheet (max-width: 780px) {
+/* Sixteen characters of the head show, then an ellipsis; the title has
+   all of it, and a selection takes all of it. */
+.chain .hx { display: inline-block; max-width: 17ch; overflow: hidden; text-overflow: ellipsis;
+             white-space: nowrap; vertical-align: bottom; -webkit-user-select: all; user-select: all; }
+/* The head takes a line of its own where the sheet cannot hold it beside
+   the rest. */
+@container sheet (max-width: 460px) {
   .chain .hd { flex-basis: 100%; }
   .chain .hd .d { display: none; }
 }
