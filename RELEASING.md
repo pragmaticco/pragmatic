@@ -3,7 +3,15 @@
 Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes
 the Rust crates to crates.io and the `pragmatic-runtime` wheels (Linux
 x86_64/aarch64, macOS universal2, Windows x86_64, plus sdist) to PyPI, and
-builds the Pragmatic Server container image.
+builds the Pragmatic Server container image. Nothing is published until
+the whole CI workflow (the test suites, the end-to-end story, the load
+test) and the fuzz targets have passed on the tag.
+
+**Status.** No release has reached PyPI or crates.io yet. The `v0.4.0`
+tag's release job stopped because the registry tokens were missing. 0.5.0,
+the drop-in Python release, is on the `release/0.5.0` branch and has not
+been tagged. The workspace is at 0.6.0, the system-of-record release. The
+one-time setup below is needed before the first tag.
 
 Pragmatic Server (`crates/pragmatic-server`) and its anchoring library
 (`crates/pragmatic-anchor`) are commercial software under the Business
@@ -58,14 +66,17 @@ is pushed from a branch or a pull request.
    Pragmatic Server announces the oldest SDK it accepts as `min_sdk` in
    `/v1/info` (`crates/pragmatic-server/src/server.rs`); raise it when the
    server's API changes in a way older SDKs cannot follow.
-2. Move the `Unreleased` notes in `CHANGELOG.md` under the new version.
+2. In `CHANGELOG.md`, replace `Unreleased` in the version's heading with
+   the release date, and add the version's link at the bottom.
 3. Check locally:
    ```sh
    cargo test --workspace
+   python -m pytest tests/e2e -v        # or examples/demo/run.sh
    cargo publish --workspace --dry-run --exclude pragmatic-server --exclude pragmatic-anchor
    docker build -t pragmatic-server:X.Y.Z .
    ```
-4. Commit, then tag and push:
+4. Commit, then tag and push (from `main`, or from the release branch, such
+   as `release/0.5.0`, that the version is cut from):
    ```sh
    git tag vX.Y.Z && git push origin main vX.Y.Z
    ```

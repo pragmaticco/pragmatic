@@ -1,14 +1,20 @@
 # Quickstart
 
-Five minutes from `cargo add` to a crash-proof, replayable agent.
+Five minutes from an empty project to a crash-proof, replayable agent. For
+the whole product story in one command (Pragmatic Server, anchoring,
+erasure and an auditor's evidence check), run `examples/demo/run.sh` from a
+clone of this repository instead.
 
 ## 1. Install
+
+Pragmatic 0.6.0 is not on crates.io yet, so depend on the repository:
 
 ```toml
 # Cargo.toml
 [dependencies]
-pragmatic = "0.4"
-pragmatic-anthropic = "0.4"   # or implement Oracle for your own model client
+pragmatic = { git = "https://github.com/pragmaticco/pragmatic" }
+# or implement Oracle for your own model client
+pragmatic-anthropic = { git = "https://github.com/pragmaticco/pragmatic" }
 ```
 
 ## 2. Write the agent
@@ -54,9 +60,10 @@ let report = rt.run("research-42", research)?;
 println!("{}", report.output);
 ```
 
-Every oracle call's realized outcome now lands in
-`./journals/research-42.journal` - append-only, hash-chained, synced to disk
-as the run proceeds.
+Every oracle call's request and realized outcome now land in `./journals`,
+in one journal file per run (named by the SHA-256 of the run id), before
+the agent sees the outcome: append-only, hash-chained, synced to disk as the
+run proceeds.
 
 ## 4. Crash. Recover.
 
@@ -83,13 +90,15 @@ behavior included - for time-travel debugging and audit.
 ## 6. Inspect from the terminal - or the console
 
 ```sh
-cargo install pragmatic-cli
+cargo install --path crates/pragmatic-cli    # from a clone, until it is on crates.io
 
 pragmatic runs   --dir ./journals            # every run, chain status
 pragmatic show   research-42 --dir ./journals
-pragmatic verify --all --dir ./journals      # walk the tamper-evident chain
+pragmatic verify --all --dir ./journals      # the chain, every commitment, erasures
 pragmatic export research-42 --dir ./journals -o run.html   # replay console file
 pragmatic serve  --dir ./journals            # live console on 127.0.0.1:7171
+pragmatic evidence research-42 --dir ./journals -o run.evidence.json
+pragmatic verify-evidence run.evidence.json  # a local bundle is UNANCHORED
 ```
 
 ## Async agents
@@ -117,9 +126,14 @@ calls; every sync `Oracle` also works as-is.
 
 ## Python
 
+From a clone of the repository, until the package is on PyPI:
+
 ```sh
-pip install pragmatic-runtime
+pip install "./crates/pragmatic-python[anthropic]"   # or [openai]
 ```
+
+Most Python agents keep their SDK client and wrap it with `ctx.wrap(client)`
+(see the [Python guide](python.md)). The lower-level API mirrors Rust:
 
 ```python
 import pragmatic
@@ -143,6 +157,11 @@ every CLI command above.
 
 - [Concepts](concepts.md) - the execution model: Oracle, Journal, effects,
   faults, capabilities.
-- `examples/tool_use_retries.rs` - flaky tools under a Supervisor.
-- `examples/map_reduce.rs` - multi-run coordination with per-agent recovery.
+- `crates/pragmatic/examples/tool_use_retries.rs` - flaky tools under a
+  Supervisor.
+- `crates/pragmatic/examples/map_reduce.rs` - multi-run coordination with
+  per-agent recovery.
+- [`examples/demo`](../examples/demo/README.md) - the whole product story in
+  one command, also run as assertions by [`tests/e2e`](../tests/e2e/README.md).
+- [Usage guide](usage.md) - recovery policies, erasure and evidence bundles.
 - [Concepts](concepts.md) - the calculus and proofs underneath.

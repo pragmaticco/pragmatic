@@ -7,12 +7,20 @@ call your agent makes is journaled to an append-only, hash-chained log,
 streams included. Nothing else about your agent changes, and the agent
 frameworks built on those clients (the OpenAI Agents SDK, Pydantic AI,
 LangChain, LangGraph) are journaled the same way. A crashed run resumes
-where it stopped without re-paying for a single token or repeating a tool
-call, and any run replays exactly, for debugging or for an auditor, without
-touching the network.
+where it stopped without paying again for model answers already recorded
+or repeating tool calls whose results are on record, and any run replays
+exactly, for debugging or for an auditor, without touching the network.
+
+> **Status.** This is 0.6.0, the system-of-record release. It is not on
+> PyPI yet: install it from a clone of the repository (see
+> [Build from source](#build-from-source)). Release 0.5, the earlier
+> drop-in release, is on the `release/0.5.0` branch and is not on PyPI
+> either. Pragmatic Server, the optional store for runs on a server, is in
+> design-partner preview.
 
 ```sh
-pip install "pragmatic-runtime[anthropic]"    # or [openai]; needs anthropic>=1.0 / openai>=3.0
+pip install "./crates/pragmatic-python[anthropic]"   # from a clone; or [openai]; needs anthropic>=1.0 / openai>=3.0
+pip install "pragmatic-runtime[anthropic]"           # once it is published
 ```
 
 ## Your agent, journaled
@@ -68,7 +76,8 @@ report = rt.resume("research-42", research)
 audit = rt.replay("research-42", research)
 assert audit.output == report.output
 
-# Tamper evidence: any edit to the journal breaks the hash chain.
+# Tamper evidence: verify checks the hash chain and every commitment, and
+# returns a VerifyReport, truthy when the journal is intact.
 assert rt.verify("research-42")
 ```
 
@@ -174,7 +183,9 @@ it writes (renewed in the background, through slow model calls and tools),
 resends appends the server did not acknowledge, and verifies every journal
 it downloads. A resume on a server needs a `recover` policy for tools that
 crashed mid-call. `python -m pragmatic push DIR RUN` uploads journals
-recorded locally.
+recorded locally. See [Pragmatic Server](../../docs/server.md); the
+one-command demo, `examples/demo/run.sh`, runs an agent against one end to
+end.
 
 ## More controls
 

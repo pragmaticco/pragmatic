@@ -37,7 +37,12 @@ Either of these implements every check:
   independent programs agreeing on a bundle is stronger evidence than one.
 
 Both check everything, including the Ed25519 signatures of the log, the
-witnesses and the bundle, and both take the same flags.
+witnesses and the bundle, and both take the same flags. Neither is on a
+package registry yet: from a clone of the repository, install the first
+with `cargo install --path crates/pragmatic-cli`, and run the second as
+`python3 tools/verify_evidence.py`. To watch a bundle being produced by
+Pragmatic Server and checked both ways, including with the wrong roots and
+with one byte changed, run the demo (`examples/demo/run.sh`, step 6).
 
 Both need OpenSSL (version 3 or later) to check RFC 3161 time-stamps, and
 use the first `openssl` on your `PATH` that can. macOS ships LibreSSL as
@@ -60,9 +65,9 @@ independently. Gather:
 - **Time-stamp authority roots.** For each time-stamp authority (TSA) you
   are willing to rely on, its root certificate, from the authority's own
   website or your operating system's trust store, with the fingerprint
-  checked. Pragmatic Server's default TSAs are DigiCert (root "DigiCert
-  Trusted Root G4") and Sectigo (root "USERTrust RSA Certification
-  Authority"). Give each file the name of the company that runs it
+  checked. Pragmatic Server's example configuration uses DigiCert (root
+  "DigiCert Trusted Root G4") and Sectigo (root "USERTrust RSA
+  Certification Authority"). Give each file the name of the company that runs it
   (`--tsa-roots OPERATOR=FILE`; the name is required). Every certificate
   in the file is trusted as an anchor, so you can pin the CA that issues
   the authority's time-stamping certificates instead of its root, which
@@ -240,6 +245,6 @@ symbolic link that came with it.
 
 `pragmatic evidence RUN -o FILE` packages a run journaled to a local
 directory. Such a bundle is unsigned and has no anchors (local anchoring
-arrives in 0.7), so its verdict is always `UNANCHORED`: it shows the
+is planned for 0.7), so its verdict is always `UNANCHORED`: it shows the
 journal's integrity (chain, commitments, erasures, records), not when it
 existed.

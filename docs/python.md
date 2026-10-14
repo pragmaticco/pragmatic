@@ -1,6 +1,6 @@
 # Pragmatic for Python
 
-This guide covers the Python SDK (`pip install pragmatic-runtime`): how to
+This guide covers the Python SDK (`pragmatic-runtime`, 0.6.0): how to
 journal an agent's model calls and tool calls, what ends up in the journal,
 how streams, errors and retries are recorded, how crashed runs resume, and
 how to use it with agent frameworks. The design it implements is
@@ -8,10 +8,18 @@ how to use it with agent frameworks. The design it implements is
 
 ## Install
 
+This guide describes 0.6.0. It is not on PyPI yet, so install it from a
+clone of the repository (this needs a Rust toolchain):
+
 ```sh
-pip install "pragmatic-runtime[anthropic]"     # anthropic>=1.0
-pip install "pragmatic-runtime[openai]"        # openai>=3.0
+pip install "./crates/pragmatic-python[anthropic]"     # anthropic>=1.0
+pip install "./crates/pragmatic-python[openai]"        # openai>=3.0
 ```
+
+Once it is published, these become `pip install "pragmatic-runtime[anthropic]"`
+and `pip install "pragmatic-runtime[openai]"`. Release 0.5, the earlier
+drop-in release on the `release/0.5.0` branch, journals only `create` calls,
+and its journals (format 1) are read-only under 0.6.
 
 The journaled clients need `anthropic>=1.0` or `openai>=3.0`, the first
 releases built on `httpx2`. Clients from older releases raise
@@ -474,7 +482,9 @@ if ctx.patched("validate-input"):         # new runs take the new path,
 ```
 
 Replay refuses a changed program unless called with
-`on_code_change="continue"`.
+`on_code_change="continue"`. `run` and `resume` continue under changed code
+by default and record the change in the journal as a `program.change`
+note; pass `on_code_change="refuse"` to stop them instead.
 
 ## Other journaled inputs
 
@@ -496,7 +506,8 @@ A report is never truthy for a journal the server says is missing or
 damaged (`report.missing`, `report.damaged`), whether the journal was
 checked here or the server's own report was returned.
 
-`python -m pragmatic push DIR RUN` uploads a local run to a server. It
+`python -m pragmatic push DIR RUN` uploads a local run to a server
+([Pragmatic Server](server.md), in design-partner preview). It
 refuses, before anything is created on the server, a journal the server
 would refuse from a client: format 1, keyed, and one erased locally with
 `pragmatic erase` (the server records erasures only through its own erase

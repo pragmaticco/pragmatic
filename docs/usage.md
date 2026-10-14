@@ -45,24 +45,41 @@ cargo run --example tool_use_retries    # flaky tools under a Supervisor
 cargo run --example map_reduce          # many runs, per-agent recovery
 ```
 
+To see the whole product instead (Pragmatic Server, anchoring, erasure and
+an evidence bundle checked by an auditor's tools), run the one-command
+demo, `examples/demo/run.sh`. It needs Rust, Python 3.10 or later and
+OpenSSL 3; see [examples/demo](../examples/demo/README.md).
+
 ---
 
 ## 2. Install it in your own project
+
+Pragmatic is not on crates.io or PyPI yet, so for now every install comes
+from this repository. This page describes 0.6.0, which is what `main`
+builds.
 
 ### Rust
 
 ```toml
 # Cargo.toml
 [dependencies]
-pragmatic = "0.4"
-pragmatic-anthropic = "0.4"   # optional: Claude as an Oracle. Skip it to bring your own model.
+pragmatic = { git = "https://github.com/pragmaticco/pragmatic" }
+# optional: Claude as an Oracle. Skip it to bring your own model.
+pragmatic-anthropic = { git = "https://github.com/pragmaticco/pragmatic" }
 ```
+
+Once they are published, these become `pragmatic = "0.6"` and
+`pragmatic-anthropic = "0.6"`.
 
 ### Python
 
+From a clone of the repository (this needs a Rust toolchain):
+
 ```sh
-pip install pragmatic-runtime
+pip install "./crates/pragmatic-python[anthropic]"   # or [openai]
 ```
+
+Once it is published, that becomes `pip install "pragmatic-runtime[anthropic]"`.
 
 ```python
 import pragmatic   # the import name is `pragmatic`, the package is `pragmatic-runtime`
@@ -71,7 +88,7 @@ import pragmatic   # the import name is `pragmatic`, the package is `pragmatic-r
 ### The CLI (optional, for inspecting journals)
 
 ```sh
-cargo install pragmatic-cli    # installs the `pragmatic` command
+cargo install --path crates/pragmatic-cli    # installs the `pragmatic` command
 ```
 
 ---
@@ -117,8 +134,11 @@ fn main() -> Result<(), Fault> {
 }
 ```
 
-Run it and look in `./journals/` - you'll find `research-42.journal`, an
-append-only, hash-chained record of every step.
+Run it and look in `./journals/`: you'll find a `.journal` file named by
+the SHA-256 of the run id (so any run id is a safe file name), with a
+`.lock` file beside it that stops a second process on this machine from
+writing the same run. The journal is an append-only, hash-chained record
+of every step; `pragmatic runs --dir ./journals` lists it by run id.
 
 ### Swap in a real model
 
@@ -185,7 +205,8 @@ let audit   = rt.replay("research-42", research)?;  // reproduce, model never ca
 - **`replay`** reproduces a completed run bit-for-bit for debugging or audit.
   The model is *never* called - the oracle is replaced by one that refuses, so
   "no model calls on replay" is enforced, not hoped for. `audit.trace` equals
-  the original `report.trace`.
+  the original `report.trace`. Replay reads a snapshot and writes nothing,
+  so it can audit a run that is still recording.
 
 The run id is the handle. Use a stable, meaningful one (a job id, a request
 id) - that's how you find and resume the run later.
@@ -203,11 +224,17 @@ closure)`. Pragmatic journals the *intent* before your closure runs and the
 - On **replay**, the closure never runs at all; the recorded result is
   returned.
 
-If a crash lands in the narrow window *between* intent and commit (the effect
-may or may not have happened), the runtime flags a **dangling intent** on
-resume rather than guessing. You resolve it explicitly - commit the known
-result if the effect did happen (or is idempotent), or compensate and let the
-resumed run redo it. See [Concepts → Durable effects](concepts.md#durable-effects-and-the-crash-window).
+If a crash lands in the narrow window *between* intent and result (the effect
+may or may not have happened), resume has to decide what happened.
+`rt.resume` writes the effect off and performs it again; a runtime backed by
+Pragmatic Server refuses with `DanglingEffect` instead, until you decide.
+`rt.resume_with` takes a recovery policy: commit the known result if the
+effect did happen (`Recover::Commit`), or write it off so the resumed run
+performs it again (`Recover::Compensate`). Every decision is written to the
+journal as a `recovery` note. An effect made with `ctx.effect_keyed`
+receives an idempotency key, `<run_id>/<branch>/<intent cursor>`, that is
+the same on every retry, so the service it calls can recognize the repeat.
+See [Concepts → Durable effects](concepts.md#durable-effects-and-the-crash-window).
 
 Rule of thumb: **reads** (fetching a web page, a DB query you don't mind
 repeating) can be plain code; **writes** (charging a card, sending an email,
@@ -222,7 +249,7 @@ inserting a row) belong in `ctx.effect`.
 ```sh
 pragmatic runs   --dir ./journals              # list every run + chain status
 pragmatic show   research-42 --dir ./journals  # full timeline of one run
-pragmatic verify --all --dir ./journals        # walk the tamper-evident hash chain
+pragmatic verify --all --dir ./journals        # the chain, every commitment, erasures
 ```
 
 ### In the browser
@@ -253,14 +280,22 @@ pragmatic verify-evidence research-42.evidence.json
 and records an `erasure` note; every chain hash still verifies. `evidence`
 packages a run as an evidence bundle (a local bundle is unanchored: it
 proves integrity, not time), and `verify-evidence` checks a bundle against
-the trust roots you pin. See [evidence.md](evidence.md).
+the trust roots you pin. Bundles exported from Pragmatic Server carry
+anchors from independent timestamp authorities. See
+[evidence.md](evidence.md).
 
 ---
 
 ## 7. Using it from Python
 
-The Python API mirrors the Rust one. Your "oracle" is just a function from a
-prompt string to a completion string - wrap any model client you like:
+Most Python agents keep their Anthropic or OpenAI client and wrap it with
+`ctx.wrap(client)`, which journals every call at the SDK's HTTP layer,
+streams and frameworks included; tool calls go through `ctx.run_tools`.
+That path is in the [README](../README.md#your-agent-journaled) and the
+[Python guide](python.md).
+
+The lower-level API mirrors the Rust one. Your "oracle" is just a function
+from a prompt string to a completion string - wrap any model client you like:
 
 ```python
 import pragmatic
@@ -282,14 +317,14 @@ report = rt.resume("research-42", research)  # crash-recover, no re-sampling
 audit  = rt.replay("research-42", research)  # bit-for-bit, model never called
 
 assert audit.trace == report.trace
-assert rt.verify("research-42")              # tamper-evident chain intact
+assert rt.verify("research-42")              # a VerifyReport, truthy when intact
 ```
 
-The `report` object exposes `output`, `trace`, `journal_len`,
-`replayed_steps`, `fresh_steps`, and `chain_head`. Journals written from
-Python are byte-compatible with the Rust runtime and every CLI command above -
-record in Python, inspect with `pragmatic serve`, replay in Rust, all on the
-same files.
+The `report` object exposes `run_id`, `output`, `trace`, `journal_len`,
+`replayed_steps`, `fresh_steps`, `chain_head` and `program_changes`. Journals
+written from Python are byte-compatible with the Rust runtime and every CLI
+command above - record in Python, inspect with `pragmatic serve`, replay in
+Rust, all on the same files.
 
 ---
 
@@ -312,23 +347,33 @@ from; it only cares that it gets journaled.
 
 **Do I need a server or a cloud account?** No. The runtime is a library that
 links into the process you already run, and journals are files on local disk.
-There is nothing to provision. (A hosted backend for shared journals and a
-team console is a separate, optional commercial layer - it changes operations,
-not the semantics on this page.)
+There is nothing to provision. Pragmatic Server is an optional, self-hosted
+commercial store (in design-partner preview) that adds a single writer per
+run across machines, anchoring, retention, access control and evidence
+export; it changes operations, not the semantics on this page. See
+[server.md](server.md).
 
 **What happens if I change my agent's code and replay an old journal?**
-`#[pragmatic::durable]` hashes your function's source and journals it as step
-zero. Replaying an old journal under changed code fails fast with a
-`JournalDesync` fault at cursor 0 - it will not silently misreplay.
+`#[pragmatic::durable]` hashes your function's source and journals it before
+the agent's first step. Replaying an old journal under changed code fails
+fast with a `JournalDesync` fault at that entry, before any step can
+misreplay, unless you opt in with
+`on_code_change: Some(OnCodeChange::Continue)` in `RunOptions`. `run` and `resume` under changed code carry on by default
+and record the change as a `program.change` note. For a deliberate change,
+`ctx.patched(name)` lets new runs take the new path while recorded runs keep
+the old one.
 
 **Is replay actually free of model calls?** Yes, by construction. Strict
 replay swaps in an oracle that refuses to sample, so a stray draw is an error,
 not a silent API call. This is Theorem T1, proved on paper and checked
 empirically by the test suite (1000/1000 runs replay byte-identically).
 
-**How much does journaling cost?** An append is O(1) - roughly 0.44 µs at a
-million entries on an Apple M5 Pro, including full SHA-256 chaining, and flat
-from a thousand to a million entries.
+**How much does journaling cost?** An append is O(1): about 2.2 µs at a
+million entries on an Apple M5 Pro in release mode, flat from a thousand to
+a million entries (journal format 2, in memory, before the disk sync). That
+includes a fresh random salt and a SHA-256 commitment for every content slot
+and the chain hash. Measure it with
+`cargo test --release -p pragmatic --test e3_journal_overhead -- --nocapture`.
 
 **Where are my secrets?** Journals store prompts and completions in
 plaintext by design - they are the audit trail. Treat the journal directory
@@ -343,6 +388,11 @@ like you'd treat your logs, and read [SECURITY.md](../SECURITY.md).
   faults, capabilities, information flow.
 - [`crates/pragmatic/examples/`](../crates/pragmatic/examples) - four runnable
   programs, no API key required.
+- [`examples/demo`](../examples/demo/README.md) - the whole product story in
+  one command, and [`tests/e2e`](../tests/e2e/README.md), the same steps as
+  assertions.
+- [Python](python.md), [Pragmatic Server](server.md) and
+  [evidence for auditors](evidence.md).
 - [`crates/pragmatic-anthropic/examples/tool_loop.rs`](../crates/pragmatic-anthropic/examples/tool_loop.rs)
   - a real Messages-API tool-use agent, durable end to end: `Conversation`
   in, `Turn` out, every tool call a write-ahead journaled effect.

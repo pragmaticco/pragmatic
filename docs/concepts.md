@@ -33,10 +33,11 @@ Every step your agent takes runs in one of two modes, chosen per step:
 
 | | record (`[O-rec]`) | replay (`[O-rep]`) |
 |---|---|---|
-| `ctx.oracle(p)` | sample the model, append `OracleDraw` | read the recorded outcome; model not called |
-| `ctx.effect(n, a, f)` | append intent → run `f` → append commit | return recorded commit; world not touched |
+| `ctx.oracle(p)` | append `DrawIntent` → sample the model → append `DrawResult` | read the recorded outcome; model not called |
+| `ctx.effect(n, a, f)` | append `EffectIntent` → run `f` → append `EffectResult` | return the recorded result; world not touched |
 | `ctx.recv(c)` | pop inbox, append `ChannelRecv` | read the recorded value |
 | `ctx.now()` | read clock, append `Clock` | read the recorded time |
+| `ctx.random(...)` | draw from the OS, append `Random` | read the recorded value |
 
 A **resumed** run starts in replay against its surviving journal and falls
 through to record exactly where the journal ends (`[O-resume]`). A **strict
@@ -51,12 +52,22 @@ Append-only, per-run, cursor-keyed. The key of an entry is just its position
 record and replay land on the same entry (paper Lemma 5.1; no hashes or
 program counters in keys).
 
-Entries form a hash chain: `h_i = H(h_{i-1} ‖ cursor ‖ payload)` with
-SHA-256, or HMAC-SHA-256 under a runtime key (`Runtime::with_key`). Any
-post-hoc edit breaks the chain at that cursor; `pragmatic verify` walks it.
-On disk the journal is a length-prefixed append-only file; a crash mid-write
-leaves a torn tail that is detected and truncated on open - after a crash,
-the journal *is* its durable prefix (paper Def. 3.12).
+Each entry (journal format 2) separates structure from content. *Fields*
+(the step kind, branch, tool name, model, token usage) never hold personal
+data. *Slots* (prompts, responses, tool arguments and results) are sealed
+with a fresh random salt, and only their commitment,
+`SHA-256("pragmatic/v2/slot" ‖ salt ‖ len ‖ content)`, enters the chain:
+`h_i = H(h_{i-1} ‖ cursor ‖ skeleton_i)`, where the skeleton is the fields
+plus every slot's commitment, with SHA-256, or HMAC-SHA-256 under a runtime
+key (`Runtime::with_key`). Any post-hoc edit breaks the chain or a
+commitment at that cursor; `pragmatic verify` checks both. The full format
+is section 2 of the [design](design/system-of-record.md).
+
+On disk the journal is a length-prefixed append-only file. A crash
+mid-write leaves a torn tail: only torn, unacknowledged frames at the end
+are truncated, after their bytes are moved aside, so after a crash the
+journal *is* its durable prefix (paper Def. 3.12). Damage anywhere else is
+reported as corruption and never truncated.
 
 ## Durable effects and the crash window
 
@@ -64,26 +75,54 @@ External writes use a three-phase write-ahead discipline:
 
 1. `EffectIntent` journaled **before** the world can change;
 2. your closure performs the effect;
-3. `EffectCommit` journaled with the result.
+3. `EffectResult` journaled with the outcome: `ok` with the result,
+   `failed` with the error, or `compensated`.
 
 A crash between 1 and 3 leaves a **dangling intent** - the runtime knows the
-effect *may* have happened but not whether it completed. On resume you
-resolve it explicitly (`Runtime::resume_with`):
+effect *may* have happened but not whether it completed. On resume it is
+decided, and the decision is journaled as a `recovery` note.
+`Runtime::resume` writes it off and performs it again (a server-backed
+runtime refuses with `DanglingEffect` instead); `Runtime::resume_with`
+decides with your policy:
 
 - `Recover::Commit(result)` - you checked the world (or the effect is
   idempotent and you re-ran it); replay will reuse this result.
 - `Recover::Compensate` - write it off; the resumed run performs it fresh.
 
-No effect is ever silently orphaned, and strict replay refuses to guess:
-that's the **no-orphaned-effect** property (paper L4).
+`ctx.effect_keyed` hands the effect an idempotency key that is the same on
+every retry, so the service it calls can recognize a repeat. No effect is
+ever silently orphaned, and strict replay refuses to guess: that's the
+**no-orphaned-effect** property (paper L4).
 
 ## Program identity (assumption A2, enforced)
 
 T1 assumes the *same program* is replayed. `#[pragmatic::durable]` turns
 that assumption into a check: it hashes the function's source tokens and
-journals `Program { name, hash }` as step zero. Deploy a changed agent and
-try to replay an old journal, and you get a `JournalDesync` fault at cursor
-0 - before a single step can misreplay.
+journals `Program { name, hash }` before the agent's first step. Deploy a
+changed agent and try to replay an old journal, and you get a
+`JournalDesync` fault at that entry - before a single step can misreplay -
+unless you opt in with `OnCodeChange::Continue`. `run` and `resume` under
+changed code continue by default and record the change in a
+`program.change` note, and `ctx.patched(name)` lets new runs take a new
+path while recorded runs keep the old one.
+
+## Notes, erasure and anchoring
+
+Besides the agent's steps, a journal holds **notes** on a separate meta
+branch that program replay does not read: the run's start (labels and data
+subjects), each attempt's start and end, recovery decisions, accepted code
+changes, erasures and custody.
+
+**Erasure** removes a slot's content and salt. Its commitment stays, so
+every chain hash still verifies, and an `erasure` note records which slots,
+who erased them and why. A replay that reaches erased content raises
+`Erased`.
+
+**Anchoring** (Pragmatic Server) adds each run's length and chain head to an
+append-only Merkle log whose checkpoints are time-stamped and cosigned by
+independent operators. An evidence bundle carries those anchors, so an
+auditor can check offline that a journal prefix existed no later than a
+given time; see [evidence.md](evidence.md).
 
 ## Faults, the Supervisor, and capabilities
 
@@ -117,11 +156,14 @@ holds identically everywhere because the mode check runs *before* the
 fresh-sample path, not because an oracle was swapped out. Journals are
 byte-compatible across all three surfaces and the CLI.
 
-## What's deliberately out of scope (v0.4)
+## What's deliberately out of scope (0.6)
 
-- **Distributed journals**: one process, local files. The managed/cloud
-  backend (hosted journaling, shared console, alerting) is the commercial
-  layer on top.
+- **More than one writer per run**: a file lock stops a second writer on
+  one machine, and Pragmatic Server's lease stops one on any machine. A
+  network file system gives no exclusion across hosts, and Pragmatic Server
+  runs as one replica per deployment.
+- **What happens outside the journaled interfaces**: anything the agent
+  does without going through `ctx` or a journaled client is not recorded.
 - **Lean mechanization**: T1/T2/T3 are proved on paper and enforced in the
   runtime. The Lean 4 development formalizes the model and states T1, but no
   theorem is machine-checked yet.

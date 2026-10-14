@@ -6,11 +6,21 @@ evidence, erase for privacy law and keep or delete by policy. This guide
 covers installing it, configuring it, issuing tokens, sizing, backups and
 upgrades.
 
+> **Status.** Pragmatic Server 0.6.0 is in design-partner preview and is
+> not generally available. Everything on this page, anchoring, evidence
+> bundles and the console included, is implemented in this repository;
+> `examples/demo/run.sh` runs it end to end on one machine, and
+> `tests/e2e` asserts the same story against the real binary. To join as
+> a design partner, contact me@aniketh.net.
+
 Pragmatic Server is licensed under the Business Source License 1.1. You may
 use it for development, testing and evaluation. Production use needs a
 commercial license from Pragmatic Research, Inc. Each version becomes
-Apache-2.0 four years after its release. The SDKs, the CLI and the journal
-format are Apache-2.0.
+Apache-2.0 four years after its release. Its anchoring library,
+`crates/pragmatic-anchor`, is under the same terms. Neither crate is
+published to crates.io: the server is built from this repository as a
+binary or a container image (see [Install](#install)). The SDKs, the CLI,
+the verifier and the journal format are Apache-2.0.
 
 Contents: [How it works](#how-it-works) ·
 [Anchoring and evidence](#anchoring-and-evidence) · [The console](#the-console) ·
