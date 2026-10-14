@@ -461,6 +461,31 @@ fn entries_of(d: &crate::store::Durable) -> u64 {
     d.entries
 }
 
+/// The independently anchored leaves of a run, `(entries, head)`, for
+/// deciding what of a run that was accepted or resumed is still anchored.
+pub(crate) fn independent_leaves(app: &AppState, run_id: &str) -> Vec<(u64, [u8; 32])> {
+    let Ok(anchors) = app.hooks.anchoring.run_anchors(run_id) else {
+        return Vec::new();
+    };
+    anchors
+        .anchors
+        .iter()
+        .zip(&anchors.witnessing)
+        .filter(|(_, w)| w.independent)
+        .filter_map(|(a, _)| pragmatic::evidence::Leaf::decode(&a.leaf).ok())
+        .map(|l| (l.entries, l.head))
+        .collect()
+}
+
+/// Whether a bundle redacted with `mode` carries text slots unredacted:
+/// `none`, and `binary`, which withholds attachments only. Such a bundle
+/// discloses content a token without `view_raw` may not read (design 4.3
+/// and 4.10), so it needs `view_raw` and is a raw read, logged durably
+/// before it is served.
+fn raw_bundle(mode: &str) -> bool {
+    matches!(mode, "none" | "binary")
+}
+
 /// Shared by the API and the console.
 pub async fn build_evidence(
     app: AppState,
@@ -475,8 +500,11 @@ pub async fn build_evidence(
             "redact must be none, detectors, binary or all",
         ));
     }
-    if redact == "none" && !p.view_raw {
-        return Err(ApiError::forbidden("an unredacted bundle needs view_raw"));
+    if raw_bundle(&redact) && !p.view_raw {
+        return Err(ApiError::forbidden(format!(
+            "a bundle with redact={redact} carries text slots unredacted, which needs view_raw; \
+             ask for redact=detectors or redact=all"
+        )));
     }
     let a = app.clone();
     let run = id.clone();
@@ -496,15 +524,31 @@ pub async fn build_evidence(
         })
         .await?;
     }
-    if redact == "none" {
+    if raw_bundle(&redact) {
         raw_read(&app, &p, &id, "evidence").await?;
     }
     let a = app.clone();
     let run = id.clone();
+    // The latest checkpoint is noted before the journal is read, and the
+    // bundle's anchors run through it: every leaf in its tree was placed
+    // before the read, so the journal must hold what each covers, and no
+    // leaf of a later batch (which may cover appends made after the read)
+    // sits inside the bundle's latest tree (design 4.17).
+    //
     // A bundle holds the journal again in base64 and decoded as records:
     // its share of the byte budget for journals held whole is taken with
     // the journal and kept until the bundle has been sent.
-    let durable = blocking(move || a.store.durable_scaled(&run, 4)).await?;
+    let (through, durable) = blocking(move || {
+        let through = a.hooks.anchoring.latest_seq();
+        let durable = a.store.durable_scaled(&run, 4)?;
+        Ok((through, durable))
+    })
+    .await?;
+    if let Some(why) = &durable.damaged {
+        // A signed bundle stands for the run's history, which the server
+        // knows this journal no longer holds whole.
+        return Err(ApiError::chain_broken(why));
+    }
     let a = app.clone();
     let mode = redact.clone();
     let (built, entries, room) = blocking(move || {
@@ -516,6 +560,7 @@ pub async fn build_evidence(
             run_id: &id,
             journal: &journal,
             journal_bytes: &durable.bytes,
+            anchors_through: through,
             requested_by: &p.token_id,
             redact: &mode,
             redactor: &a.redactor,
@@ -547,7 +592,7 @@ pub async fn build_evidence(
     Ok(noted(
         resp,
         AccessNote {
-            raw: redact == "none",
+            raw: raw_bundle(&redact),
             cursor_from: Some(0),
             cursor_to: Some(entries),
             extra: [
@@ -709,8 +754,17 @@ pub async fn accept_regression(
     need(&p, &[Role::Admin])?;
     durable_intent(&app, intent("accept_regression", &p, Some(&id), json!({}))).await?;
     let run = id.clone();
-    let (entries, before) = blocking(move || app.store.accept_regression(&run)).await?;
-    Ok(ok(
-        json!({ "run_id": id, "entries": entries, "anchored_entries_before": before }),
-    ))
+    let (entries, before, after) = blocking(move || {
+        let anchored = independent_leaves(&app, &run);
+        let (entries, before) = app.store.accept_regression(&run, &anchored)?;
+        let after = app.store.find(&run)?.lock().meta.anchored_entries;
+        Ok((entries, before, after))
+    })
+    .await?;
+    Ok(ok(json!({
+        "run_id": id,
+        "entries": entries,
+        "anchored_entries_before": before,
+        "anchored_entries": after,
+    })))
 }

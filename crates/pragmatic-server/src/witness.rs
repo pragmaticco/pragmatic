@@ -36,9 +36,28 @@
 //! consistency checks is a fork attempt by the log, and the refusal is
 //! evidence: it is recorded, in the same append, as a `witness.reject`
 //! note `{origin, old_size, tree_size, root, reason}` with the submitted
-//! note as its payload. A damaged record refuses writes, so the witness
-//! stops cosigning for that origin rather than start a record that has
-//! forgotten what it cosigned.
+//! note as its payload.
+//!
+//! # A record that may have forgotten
+//!
+//! The witness stops cosigning for an origin (503) rather than cosign from
+//! a record that may have forgotten what it cosigned, which would let it
+//! cosign a fork of a tree it already vouched for:
+//!
+//! - a damaged record (`chain_broken`);
+//! - a record that is `regressed`: it holds less than its last leaf in the
+//!   server's own anchor log, or was restored from a backup (a restore
+//!   holds every witness record, since nothing on the host can say what was
+//!   cosigned after the backup);
+//! - a record that is gone while the anchor log holds a leaf for it: it is
+//!   `missing`, and never begun afresh.
+//!
+//! An administrator resumes such a record with the latest checkpoint the
+//! witness cosigned for the origin, taken from outside the host (the
+//! witnessed log keeps its cosignatures, and a witness log streamed off the
+//! host has them too): `pragmatic-server witness-resume` checks the log's
+//! signature and this witness's cosignature on it and appends it to the
+//! record as a `witness.resume` note, and cosigning continues from it.
 //!
 //! The record is anchored in the server's own log like any run, so the
 //! witness's history is time-stamped by its own TSAs, and
@@ -47,6 +66,7 @@
 use std::cell::Cell;
 
 use pragmatic::encoding::{hex_decode_exact, hex_encode};
+use pragmatic::note::{self, Checkpoint, Note};
 use pragmatic::sha256::Digest;
 use pragmatic::{Event, Value};
 use pragmatic_anchor::witness::AddCheckpointError;
@@ -55,6 +75,7 @@ use serde_json::{json, Value as JsonValue};
 
 use crate::config::Config;
 use crate::error::ApiError;
+use crate::hooks::Anchoring;
 use crate::keys;
 use crate::store::Store;
 use crate::timefmt;
@@ -65,13 +86,20 @@ pub const COSIGN_KIND: &str = pragmatic_anchor::witness::COSIGN_NOTE;
 /// The note kind of a refused fork attempt in the witness record.
 pub const REJECT_KIND: &str = pragmatic_anchor::witness::REJECT_NOTE;
 
+/// The note kind of a checkpoint an administrator resumed a held record
+/// from: one this witness cosigned, taken from outside the host.
+pub const RESUME_KIND: &str = "witness.resume";
+
 /// The most record entries one `GET /v1/witness/log/{origin}` reads.
 pub const LOG_PAGE: u64 = 1000;
+
+/// The prefix of every witness record's run id.
+pub const RECORD_PREFIX: &str = "pragmatic:witness:";
 
 /// The run that records what the witness cosigned for the origin entry
 /// named `name`.
 pub fn record_run_id(name: &str) -> String {
-    format!("pragmatic:witness:{name}")
+    format!("{RECORD_PREFIX}{name}")
 }
 
 /// A refusal in the protocol's terms.
@@ -105,7 +133,7 @@ fn last_cosigned(journal: &pragmatic::Journal, origin: &str) -> Option<(u64, Dig
         let Event::Note { kind, data, .. } = &e.event else {
             continue;
         };
-        if kind != COSIGN_KIND {
+        if kind != COSIGN_KIND && kind != RESUME_KIND {
             continue;
         }
         let Ok(doc) = serde_json::from_str::<JsonValue>(data) else {
@@ -174,19 +202,27 @@ impl Witness {
 
     /// Handle one `add-checkpoint` for the origin entry named `name` (the
     /// caller's bound origin). Returns the cosignature line,
-    /// newline-terminated.
+    /// newline-terminated. `anchoring` says whether the server's anchor
+    /// log holds a leaf for the record: if it does and the record is gone,
+    /// nothing is cosigned (see the module documentation).
     pub fn add_checkpoint(
         &self,
         store: &Store,
+        anchoring: &dyn Anchoring,
         name: &str,
         body: &[u8],
     ) -> Result<String, WitnessError> {
         let sub = self.core.check(name, body)?;
+        let record = record_run_id(name);
+        let may_create = store.get(&record).is_some()
+            || !anchoring
+                .has_leaf(&record)
+                .map_err(|e| AddCheckpointError::Unavailable(e.to_string()))?;
         // What decide refused with nothing to record (a conflict, or a
         // failure to sign): nothing is appended, and the refusal is
         // answered.
         let unrecorded: Cell<Option<AddCheckpointError>> = Cell::new(None);
-        let decided = store.internal_append(&record_run_id(name), |journal| {
+        let decided = store.internal_append(&record, may_create, |journal| {
             let latest = last_cosigned(journal, &sub.origin.origin);
             let now = timefmt::now_unix_secs().max(0) as u64;
             match self.core.decide(&sub, latest, now) {
@@ -239,6 +275,92 @@ impl Witness {
         }
     }
 
+    /// Resume the held record of the origin entry `name` (see the module
+    /// documentation) from `checkpoint`: the latest checkpoint this witness
+    /// cosigned for the origin, as the signed note with this witness's
+    /// cosignature line, taken from outside this host. It must carry a
+    /// valid log signature and a valid cosignature from this witness's key,
+    /// and must not be older than, or conflict with, a cosignature the
+    /// record still holds. `anchored` lists the record's independently
+    /// anchored leaves. Returns what was recorded.
+    pub fn resume(
+        &self,
+        store: &Store,
+        anchored: &[(u64, Digest)],
+        name: &str,
+        checkpoint: &str,
+    ) -> Result<JsonValue, ApiError> {
+        let origin = self.core.origin(name).ok_or_else(ApiError::not_found)?;
+        let mut text = checkpoint.to_string();
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        let signed =
+            Note::parse(&text).map_err(|e| ApiError::bad_request(format!("checkpoint: {e}")))?;
+        let cp = Checkpoint::parse(&signed.body)
+            .map_err(|e| ApiError::bad_request(format!("checkpoint: {e}")))?;
+        if cp.origin != origin.origin {
+            return Err(ApiError::bad_request(format!(
+                "the checkpoint is for origin {:?}, not {:?}",
+                cp.origin, origin.origin
+            )));
+        }
+        note::verify_note(&signed, &origin.log_keys).map_err(|e| {
+            ApiError::bad_request(format!("the log's signature does not verify: {e}"))
+        })?;
+        let own = [self.core.cosigner().verifier_key()];
+        let timestamp = note::verify_note(&signed, &own)
+            .ok()
+            .and_then(|v| v.first().and_then(|s| s.timestamp))
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    "the checkpoint carries no valid cosignature from this witness: resume only \
+                     from a checkpoint this witness cosigned",
+                )
+            })?;
+        let (recorded, cursor) =
+            store.resume_record(&record_run_id(name), anchored, |journal| {
+                let last = last_cosigned(journal, &origin.origin);
+                if let Some((size, root)) = last {
+                    if size > cp.tree_size {
+                        return Err(ApiError::bad_request(format!(
+                            "the record still holds a cosignature of size {size}, newer than this \
+                         checkpoint (size {}): resume from the latest checkpoint cosigned",
+                            cp.tree_size
+                        )));
+                    }
+                    if size == cp.tree_size && root != cp.root {
+                        return Err(ApiError::new(
+                            409,
+                            "conflict",
+                            format!(
+                            "the record holds a cosignature of another tree of size {size}: this \
+                             witness cosigned two trees of one size, which is evidence to keep, \
+                             not resume from"
+                        ),
+                        ));
+                    }
+                }
+                let data = json!({
+                    "origin": origin.origin,
+                    "old_size": last.map_or(0, |(size, _)| size),
+                    "tree_size": cp.tree_size,
+                    "root": hex_encode(&cp.root),
+                    "timestamp": timestamp,
+                });
+                Ok((
+                    RESUME_KIND.to_string(),
+                    data.to_string(),
+                    vec![Value::from(text.clone())],
+                    data,
+                ))
+            })?;
+        let mut out = recorded;
+        out["cursor"] = cursor.into();
+        out["origin_name"] = name.into();
+        Ok(out)
+    }
+
     /// The cosigned history of the origin entry `name` after cursor
     /// `after`: at most [`LOG_PAGE`] entries of the record, read from disk,
     /// and the cursor to continue after when more follow. Each record's
@@ -268,10 +390,11 @@ impl Witness {
                 let Event::Note { kind, data, .. } = &e.event else {
                     continue;
                 };
-                if kind != COSIGN_KIND {
+                if kind != COSIGN_KIND && kind != RESUME_KIND {
                     continue;
                 }
                 let mut doc: JsonValue = serde_json::from_str(data).unwrap_or(JsonValue::Null);
+                doc["resumed"] = (kind == RESUME_KIND).into();
                 doc["cursor"] = e.cursor.into();
                 doc["at"] = timefmt::rfc3339_ns(e.at).into();
                 doc["checkpoint"] = read

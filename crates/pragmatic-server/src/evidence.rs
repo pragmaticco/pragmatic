@@ -13,25 +13,33 @@
 //!    with its commitment only, and the journal, records and
 //!    `redacted_slots` are rebuilt from the withheld journal; chain hashes
 //!    do not change, so every anchor still applies;
-//! 3. the run's anchors: its whole leaf chain (each leaf with its inclusion
-//!    proof, checkpoint, anchor digest, consistency proof to the latest
-//!    checkpoint and witness results), cut at the journal's length in case
-//!    a batch anchored appends made after the journal was read, with the
-//!    run's `anchor_id` under HMAC run ids;
+//! 3. the run's anchors: its leaf chain (each leaf with its inclusion
+//!    proof, checkpoint, anchor digest, consistency proof to the bundle's
+//!    latest checkpoint and witness results), through the checkpoint that
+//!    was the latest when the journal was read, which is also the bundle's
+//!    `latest_checkpoint`, with the run's `anchor_id` under HMAC run ids.
+//!    The cut is by checkpoint, never by entries: a batch that anchored
+//!    appends made after the read is left out whole (its leaf could not be
+//!    checked against the journal, and a later latest checkpoint would
+//!    contain a leaf the bundle omits, which the full-log audit rightly
+//!    fails), while every leaf placed before the read stays in, so a run
+//!    rolled back after it was anchored carries the leaf its journal
+//!    contradicts and fails verification instead of hiding the regression;
 //! 4. `generator`, `requested_by` (the token id), `redaction` (the mode,
 //!    and for `detectors` the detectors and the digest of the configured
-//!    patterns), `independent` and `verification_spec` (the procedure that
-//!    ships with this version, by URL and SHA-256);
+//!    patterns), `independent` (true only when an external witness is
+//!    configured and one of the bundle's anchors is independently
+//!    witnessed) and `verification_spec` (the procedure that ships with
+//!    this version, by URL and SHA-256);
 //! 5. the signature: Ed25519 with the log key over SHA-256 of the canonical
 //!    bundle without `signature`, carrying the 4-byte note key id and the
 //!    full public key.
 //!
 //! Access control happened before: the requester may see the run, and a
-//! viewer without `view_raw` never gets `redact=none`.
+//! viewer without `view_raw` never gets `redact=none` or `redact=binary`
+//! (both carry text slots unredacted).
 
-use pragmatic::evidence::{
-    Bundle, BundleSignature, Leaf as EvidenceLeaf, Redact, Redaction, VerificationSpec,
-};
+use pragmatic::evidence::{Bundle, BundleSignature, Redact, Redaction, VerificationSpec};
 use pragmatic::journal::{Journal, SlotState};
 use pragmatic::sha256::sha256;
 
@@ -108,25 +116,17 @@ impl BundleBuilder {
         }
         let anchors = req
             .anchoring
-            .run_anchors(req.run_id)
+            .run_anchors_through(req.run_id, req.anchors_through)
             .map_err(|e| EvidenceError::Internal(format!("anchoring: {e}")))?;
-        let entries = bundle.journal.entries;
-        // The leaf chain up to the journal that was read: a batch may have
-        // anchored appends made since, and a leaf past the journal could
-        // not be checked against it.
-        let kept: Vec<_> = anchors
-            .anchors
-            .into_iter()
-            .take_while(|a| EvidenceLeaf::decode(&a.leaf).is_ok_and(|l| l.entries <= entries))
-            .collect();
-        if !kept.is_empty() {
+        let witnessed = anchors.witnessing.iter().any(|w| w.independent);
+        if !anchors.anchors.is_empty() {
             bundle.anchor_id = anchors.anchor_id;
             bundle.latest_checkpoint = anchors.latest_checkpoint;
         }
-        bundle.anchors = kept;
+        bundle.anchors = anchors.anchors;
         bundle.generator = req.generator.to_string();
         bundle.requested_by = req.requested_by.to_string();
-        bundle.independent = req.independent;
+        bundle.independent = req.independent && witnessed;
         bundle.redaction = if req.redact == "detectors" {
             Redaction {
                 mode: "detectors".into(),

@@ -39,9 +39,9 @@ All notable changes to this project are documented here. The format follows
 ### Changed
 - **License: Apache-2.0.** The runtime, SDKs, bindings, CLI and journal
   format are now open source under the Apache License 2.0, replacing the
-  Business Source License 1.1 used by 0.4.0. 0.4.0 was never published to
-  a package registry, so 0.5.0 is the first published release and is
-  Apache-2.0 from the start. Contributions require a DCO sign-off.
+  Business Source License 1.1 used by 0.4.0. Neither 0.4.0 nor 0.5.0 was
+  published to a package registry, so the open-source license applies
+  from the first published release. Contributions require a DCO sign-off.
 - The Python package is now a mixed Rust/Python package: the extension
   moved to `pragmatic._native` and the public API lives in pure Python.
   `import pragmatic` and the existing `Runtime`/`ctx.oracle`/`ctx.effect`
@@ -51,7 +51,7 @@ All notable changes to this project are documented here. The format follows
   hosts that perform model and tool calls themselves.
 - PyPI publishing uses trusted publishing (no API token). The v0.4.0
   release never reached PyPI or crates.io because the registry tokens were
-  missing; 0.5.0 is the first published release.
+  missing, and 0.5.0 was not published either.
 - Roadmap reordered in `docs/STRATEGY.md`: installable drop-in Python
   first, then the hosted console, then the TypeScript SDK.
 

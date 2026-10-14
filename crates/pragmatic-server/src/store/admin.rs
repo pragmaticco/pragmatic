@@ -49,7 +49,8 @@ use pragmatic::journal::{EraseSelector, ErasureNote};
 use pragmatic::Journal;
 use serde_json::{json, Value as JsonValue};
 
-use super::{EndReason, LeafRef, RunState, Store, Tombstone, VerifyCache, Writer};
+use super::write::refuse_if_unwritable;
+use super::{EndReason, LeafRef, Run, RunState, Store, Tombstone, VerifyCache, Writer};
 use crate::access_log::{AccessLog, AccessRecord};
 use crate::config::RetentionPolicy;
 use crate::error::ApiError;
@@ -290,6 +291,7 @@ impl Store {
             report,
             entries: journal.len(),
             checked_at: timefmt::now_rfc3339(),
+            damaged: st.broken.clone(),
         });
         if let Ok(handle) = OpenOptions::new().read(true).write(true).open(&path) {
             st.writer = Some(Writer {
@@ -401,8 +403,32 @@ impl Store {
 
     /// `accept-regression`: clear the flag, accepting the stored journal as
     /// the run's history from here on. Returns `(entries, anchored before)`.
-    pub fn accept_regression(&self, run_id: &str) -> Result<(u64, u64), ApiError> {
+    ///
+    /// `anchored` lists the run's independently anchored leaves (`entries`,
+    /// `head`). Acceptance claims nothing new about anchoring: the run's
+    /// `anchored_entries` becomes the largest of those the current journal
+    /// still holds (its entry `entries - 1` hashes to the leaf's head),
+    /// often 0, and the anchoring lag keeps counting from the oldest append
+    /// that is not (design 4.7: `anchored_entries` advances only with
+    /// independently anchored leaves).
+    ///
+    /// A witness record is never accepted this way: a record that lost
+    /// cosignatures would cosign forks of what it forgot. It is resumed
+    /// with the latest checkpoint it cosigned ([`Store::resume_record`]).
+    pub fn accept_regression(
+        &self,
+        run_id: &str,
+        anchored: &[(u64, [u8; 32])],
+    ) -> Result<(u64, u64), ApiError> {
+        if run_id.starts_with(crate::witness::RECORD_PREFIX) {
+            return Err(ApiError::bad_request(
+                "a witness record is not accepted as it is: it may have forgotten cosignatures. \
+                 Resume it with the latest checkpoint it cosigned for its origin \
+                 (`pragmatic-server witness-resume`)",
+            ));
+        }
         let run = self.find(run_id)?;
+        let _file = run.file.read().unwrap_or_else(|e| e.into_inner());
         let mut guard = run.lock();
         let st: &mut RunState = &mut guard;
         if !st.meta.regressed {
@@ -411,10 +437,100 @@ impl Store {
         let before = st.meta.anchored_entries;
         st.meta.regressed = false;
         st.meta.regression_accepted = true;
-        st.meta.anchored_entries = st.meta.entries;
-        st.meta.unanchored_since = None;
+        st.meta.anchored_entries = self.still_anchored(&run, st, anchored)?;
+        self.restart_lag(st);
         self.write_meta(&run, st)?;
         Ok((st.meta.entries, before))
+    }
+
+    /// The largest `entries` among `anchored` (independently anchored
+    /// leaves) that the stored journal still holds: entry `entries - 1`
+    /// hashes to the leaf's head. Call with the file lock held shared and
+    /// the state lock held.
+    fn still_anchored(
+        &self,
+        run: &Run,
+        st: &RunState,
+        anchored: &[(u64, [u8; 32])],
+    ) -> Result<u64, ApiError> {
+        let mut best = 0;
+        for &(entries, head) in anchored {
+            if entries == 0 || entries > st.meta.entries || entries <= best {
+                continue;
+            }
+            if self.stored_hash(run, st, entries - 1)? == Some(head) {
+                best = entries;
+            }
+        }
+        Ok(best)
+    }
+
+    /// After `anchored_entries` was lowered: the lag counts from now for
+    /// the entries no longer anchored (their append time is not known), or
+    /// keeps counting from when it started.
+    fn restart_lag(&self, st: &mut RunState) {
+        if st.meta.entries > st.meta.anchored_entries {
+            st.meta
+                .unanchored_since
+                .get_or_insert_with(timefmt::now_unix_secs);
+        } else {
+            st.meta.unanchored_since = None;
+        }
+    }
+
+    /// A new anchor log begins (the held one was retired by
+    /// `confirm-anchors --new-log`): every run's last leaf and anchored
+    /// length referred to the retired log, whose leaves no bundle carries
+    /// any more, so each run is offered to the new log afresh, claims no
+    /// anchoring until the new log's witnesses vouch for it, and its lag
+    /// counts from now. Returns how many runs were reset.
+    pub fn forget_anchoring(&self) -> usize {
+        let now = timefmt::now_unix_secs();
+        let mut n = 0;
+        for run in self.all() {
+            let mut guard = run.lock();
+            let st: &mut RunState = &mut guard;
+            if st.deleted {
+                continue;
+            }
+            st.meta.last_anchor_leaf = None;
+            st.meta.anchored_entries = 0;
+            st.meta.regression_accepted = false;
+            st.meta.unanchored_since = (st.meta.entries > 0).then_some(now);
+            let _ = self.write_meta(&run, st);
+            n += 1;
+        }
+        n
+    }
+
+    /// Hold every server-written record whose id starts with `prefix`
+    /// (witness records, after a restore): it is marked `regressed`, so it
+    /// takes no write, and the `regressed` webhook fires. A restored record
+    /// is as old as the backup: whatever it recorded after the backup is
+    /// gone, and nothing on this host can tell what (design 4.13). Returns
+    /// the ids held.
+    pub fn hold_records(&self, prefix: &str, reason: &str) -> Vec<String> {
+        let mut held = Vec::new();
+        for run in self.all() {
+            if !run.id.starts_with(prefix) {
+                continue;
+            }
+            let mut guard = run.lock();
+            let st: &mut RunState = &mut guard;
+            if st.deleted {
+                continue;
+            }
+            st.meta.regressed = true;
+            st.meta.regression_accepted = false;
+            self.webhook(
+                "regressed",
+                &run.id,
+                json!({"entries": st.meta.entries, "reason": reason}),
+            );
+            let _ = self.write_meta(&run, st);
+            held.push(run.id.clone());
+        }
+        held
     }
 
     /// The tips of every run that changed since its last leaf (design 4.7),
@@ -487,7 +603,12 @@ impl Store {
         let Some(run) = self.get(run_id) else { return };
         let mut guard = run.lock();
         let st: &mut RunState = &mut guard;
-        if st.meta.regressed || st.meta.regression_accepted || st.deleted {
+        if st.meta.regressed
+            || st.meta.regression_accepted
+            || st.deleted
+            || st.missing
+            || st.broken.is_some()
+        {
             return;
         }
         st.meta.regressed = true;
@@ -505,9 +626,42 @@ impl Store {
 
     /// Raise each run's last leaf to what the anchor log holds (at
     /// startup): the log is the durable record, and `meta.json` may lag it
-    /// by a crash.
+    /// by a crash. A run that holds fewer entries than its last leaf, or as
+    /// many with another head, contradicts a signed leaf: it is marked
+    /// `regressed` now rather than at the next batch, so no append extends
+    /// the rolled-back history in between (and grows it past the leaf,
+    /// where a batch would no longer see the contradiction).
     pub fn apply_last_leaves(&self, leaves: &[LeafPlaced]) {
         self.record_leaves(leaves);
+        for leaf in leaves {
+            let Some(id) = &leaf.run_id else { continue };
+            let Some(run) = self.get(id) else { continue };
+            let reason = {
+                let st = run.lock();
+                if st.deleted || st.missing || st.broken.is_some() {
+                    continue;
+                }
+                if st.meta.entries < leaf.entries {
+                    Some(format!(
+                        "the journal holds {} entries, but its last leaf in the anchor log \
+                         covers {}: it was rolled back after it was anchored",
+                        st.meta.entries, leaf.entries
+                    ))
+                } else if st.meta.entries == leaf.entries && st.meta.head != hex_encode(&leaf.head)
+                {
+                    Some(format!(
+                        "the journal's head after {} entries is not the head its last leaf in \
+                         the anchor log records: it was rewritten after it was anchored",
+                        leaf.entries
+                    ))
+                } else {
+                    None
+                }
+            };
+            if let Some(reason) = reason {
+                self.mark_contradicted(id, leaf.entries, &reason);
+            }
+        }
     }
 
     /// Runs became independently anchored up to these lengths.
@@ -518,7 +672,7 @@ impl Store {
             let st: &mut RunState = &mut guard;
             if *entries > st.meta.anchored_entries {
                 st.meta.anchored_entries = *entries;
-                if st.meta.entries < st.meta.anchored_entries && !st.meta.regressed {
+                if st.meta.entries < st.meta.anchored_entries && !st.meta.regressed && !st.missing {
                     st.meta.regressed = true;
                     self.webhook(
                         "regressed",
@@ -579,61 +733,59 @@ impl Store {
 
     /// Append a note to a run the server itself writes (reserved
     /// `pragmatic:` ids, such as a witness log), creating the run with its
-    /// `run.start` note if needed. `decide` sees the journal so far and
-    /// returns the note to append, or an error to append nothing; the
-    /// decision and the append happen under the run's lock. Returns the
-    /// decision's value and the note's cursor.
+    /// `run.start` note if needed and `may_create` allows it. `decide` sees
+    /// the journal so far and returns the note to append, or an error to
+    /// append nothing; the decision and the append happen under the run's
+    /// lock. Returns the decision's value and the note's cursor.
+    ///
+    /// Such a record is the server's memory of what it did (a witness
+    /// record is what it cosigned), so it refuses every write while it may
+    /// have forgotten something (design 4.8): when it is `regressed`
+    /// (rolled back after it was anchored, or restored from a backup),
+    /// damaged (`chain_broken`) or `missing`, and while it holds fewer
+    /// entries than its last leaf in the anchor log unless an administrator
+    /// resumed it ([`Store::resume_record`]). The caller passes `may_create
+    /// = false` when the anchor log holds a leaf for the id: a record that
+    /// was anchored and is gone was lost, not never written, and is never
+    /// begun afresh.
     pub fn internal_append<T>(
         &self,
         run_id: &str,
+        may_create: bool,
         decide: impl FnOnce(&Journal) -> Result<(String, String, Vec<pragmatic::Value>, T), ApiError>,
     ) -> Result<(T, u64), ApiError> {
-        let run = match self.get(run_id) {
-            Some(r) => r,
-            None => {
-                let who = crate::tokens::Principal::system("internal");
-                match self.create_run(&who, run_id, None) {
-                    Ok(_)
-                    | Err(ApiError {
-                        code: "run_exists", ..
-                    }) => {}
-                    Err(e) => return Err(e),
+        let run =
+            match self.get(run_id) {
+                Some(r) => r,
+                None if !may_create => return Err(ApiError::chain_broken(
+                    "the record is missing: the anchor log holds a leaf for it, so its history \
+                     was lost, not never written",
+                )),
+                None => {
+                    let who = crate::tokens::Principal::system("internal");
+                    match self.create_run(&who, run_id, None) {
+                        Ok(_)
+                        | Err(ApiError {
+                            code: "run_exists", ..
+                        }) => {}
+                        Err(e) => return Err(e),
+                    }
+                    let run = self.find(run_id)?;
+                    let mut guard = run.lock();
+                    let st: &mut RunState = &mut guard;
+                    st.lease = None;
+                    if st.meta.entries == 0 {
+                        self.start_record(&run, st)?;
+                    }
+                    drop(guard);
+                    run
                 }
-                let run = self.find(run_id)?;
-                let mut guard = run.lock();
-                let st: &mut RunState = &mut guard;
-                st.lease = None;
-                if st.meta.entries == 0 {
-                    let data = serde_json::json!({
-                        "format": 2,
-                        "labels": {},
-                        "nonce": random_nonce()?,
-                        "run_id": run_id,
-                        "sdk": "pragmatic-server",
-                        "sdk_version": env!("CARGO_PKG_VERSION"),
-                    })
-                    .to_string();
-                    let w = self.writer(&run, st)?;
-                    w.journal
-                        .append(
-                            pragmatic::journal::META,
-                            pragmatic::Event::Note {
-                                kind: "run.start".into(),
-                                data,
-                                payload: Vec::new(),
-                            },
-                        )
-                        .map_err(|f| ApiError::storage_unavailable(f.to_string()))?;
-                    self.persist(&run, st, true)?;
-                }
-                drop(guard);
-                run
-            }
-        };
+            };
         let mut guard = run.lock();
         let st: &mut RunState = &mut guard;
-        if let Some(why) = &st.broken {
-            return Err(ApiError::chain_broken(why));
+        refuse_if_unwritable(st)?;
+        if behind_leaf(st) && !st.meta.regression_accepted {
+            return Err(ApiError::regressed());
         }
         let w = self.writer(&run, st)?;
         let (kind, data, payload, value) = decide(&w.journal)?;
@@ -652,6 +804,104 @@ impl Store {
             .map_err(|f| ApiError::bad_request(f.to_string()))?;
         let cursor = w.journal.len() - 1;
         self.persist(&run, st, true)?;
+        Ok((value, cursor))
+    }
+
+    /// Write the `run.start` note of a server-written record whose journal
+    /// is empty.
+    fn start_record(&self, run: &Run, st: &mut RunState) -> Result<(), ApiError> {
+        let data = serde_json::json!({
+            "format": 2,
+            "labels": {},
+            "nonce": random_nonce()?,
+            "run_id": run.id,
+            "sdk": "pragmatic-server",
+            "sdk_version": env!("CARGO_PKG_VERSION"),
+        })
+        .to_string();
+        let w = self.writer(run, st)?;
+        w.journal
+            .append(
+                pragmatic::journal::META,
+                pragmatic::Event::Note {
+                    kind: "run.start".into(),
+                    data,
+                    payload: Vec::new(),
+                },
+            )
+            .map_err(|f| ApiError::storage_unavailable(f.to_string()))?;
+        self.persist(run, st, true)
+    }
+
+    /// Resume a held server-written record (a witness record that is
+    /// `regressed`, `missing`, or behind its last leaf) with a note an
+    /// administrator vouches for: `decide` sees the record and returns the
+    /// note (for a witness, the latest checkpoint it cosigned for the
+    /// origin, from outside this host), appended under the record's lock.
+    /// A missing record is begun again first (header and `run.start`). The
+    /// record then takes writes again: it is no longer `regressed`, and is
+    /// not reported as contradicting its last leaf until it grows past it.
+    /// `anchored` lists its independently anchored leaves, as for
+    /// [`Store::accept_regression`]. A damaged record (`chain_broken`) is
+    /// not resumed: its files must be repaired or moved aside first.
+    pub fn resume_record<T>(
+        &self,
+        run_id: &str,
+        anchored: &[(u64, [u8; 32])],
+        decide: impl FnOnce(&Journal) -> Result<(String, String, Vec<pragmatic::Value>, T), ApiError>,
+    ) -> Result<(T, u64), ApiError> {
+        let run = self.get(run_id).ok_or_else(|| {
+            ApiError::bad_request(
+                "there is no record to resume: nothing was ever recorded under it",
+            )
+        })?;
+        let _file = run.file.read().unwrap_or_else(|e| e.into_inner());
+        let mut guard = run.lock();
+        let st: &mut RunState = &mut guard;
+        if st.deleted {
+            return Err(ApiError::run_deleted());
+        }
+        if let Some(why) = &st.broken {
+            return Err(ApiError::chain_broken(why));
+        }
+        let held =
+            st.meta.regressed || st.missing || (behind_leaf(st) && !st.meta.regression_accepted);
+        if !held {
+            return Err(ApiError::bad_request(
+                "the record is not held: it takes writes, so there is nothing to resume",
+            ));
+        }
+        if st.missing {
+            st.missing = false;
+            st.meta.created_by = Some("server:internal".into());
+            if let Err(e) = self.recreate_files(&run, st) {
+                st.missing = true;
+                return Err(e);
+            }
+            self.start_record(&run, st)?;
+        }
+        let w = self.writer(&run, st)?;
+        let (kind, data, payload, value) = decide(&w.journal)?;
+        w.journal
+            .append(
+                pragmatic::journal::META,
+                pragmatic::Event::Note {
+                    kind,
+                    data,
+                    payload: payload
+                        .into_iter()
+                        .map(pragmatic::Content::Sealed)
+                        .collect(),
+                },
+            )
+            .map_err(|f| ApiError::bad_request(f.to_string()))?;
+        let cursor = w.journal.len() - 1;
+        self.persist(&run, st, true)?;
+        st.meta.regressed = false;
+        st.meta.regression_accepted = true;
+        st.meta.anchored_entries = self.still_anchored(&run, st, anchored)?;
+        self.restart_lag(st);
+        self.write_meta(&run, st)?;
         Ok((value, cursor))
     }
 
@@ -758,6 +1008,13 @@ impl Store {
         }
         (ended, failed)
     }
+}
+
+/// The run holds fewer entries than its last leaf in the anchor log.
+fn behind_leaf(st: &RunState) -> bool {
+    st.meta
+        .last_anchor_leaf
+        .is_some_and(|l| l.entries > st.meta.entries)
 }
 
 fn random_nonce() -> Result<String, ApiError> {

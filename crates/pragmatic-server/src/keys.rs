@@ -292,6 +292,25 @@ pub fn ensure_current(data_dir: &Path, key: &ServerKey) -> io::Result<Vec<KeyEnt
     Ok(keys)
 }
 
+/// Close the validity window of every key in the ring but `current`, and
+/// make sure `current` is in it: a new anchor log began under `current`
+/// (`confirm-anchors --new-log`), and the other keys signed only the
+/// retired log.
+pub fn retire_others(data_dir: &Path, current: &ServerKey) -> io::Result<()> {
+    let mut keys = read_key_ring(data_dir)?;
+    let public = hex_encode(&current.public_key());
+    let now = timefmt::now_rfc3339();
+    for k in &mut keys {
+        if k.public_key != public && k.not_after.is_none() {
+            k.not_after = Some(now.clone());
+        }
+    }
+    if !keys.iter().any(|k| k.public_key == public) {
+        keys.push(entry_for(current, now));
+    }
+    write_key_ring(data_dir, keys)
+}
+
 /// Close `old`'s window and open `new`'s in the ring. Returns the
 /// `key.rotate` record for the access log: the anchoring library's
 /// [`KeyRotation`], which both keys sign and which binds both key ids to

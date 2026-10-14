@@ -786,6 +786,51 @@ fn get(port: u16, path: &str) -> String {
     }
 }
 
+/// The CI "Console smoke test" greps the console's run page for a label;
+/// that label must be one the console renders for a model draw (it
+/// labels results `draw.<outcome>`), or the CI job fails on every push.
+#[test]
+fn the_ci_console_smoke_test_greps_what_the_console_renders() {
+    let ci = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/ci.yml"),
+    )
+    .unwrap();
+    let line = ci
+        .lines()
+        .find(|l| l.contains("/run/research-42") && l.contains("grep -q"))
+        .expect("the console smoke step");
+    let term = line
+        .rsplit("grep -q ")
+        .next()
+        .unwrap()
+        .trim()
+        .trim_matches('"');
+    let dir = seeded("ci-grep");
+    let port = TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut child = Command::new(bin())
+        .args([
+            "serve",
+            "--dir",
+            dir.to_str().unwrap(),
+            "--port",
+            &port.to_string(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let run = get(port, "/run/refund-1");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(run.starts_with("HTTP/1.1 200"));
+    assert!(run.contains(term), "ci.yml greps for {term:?}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn serve_renders_the_console_on_loopback() {
     let dir = seeded("serve");

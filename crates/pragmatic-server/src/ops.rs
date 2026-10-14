@@ -38,6 +38,28 @@
 //! than were anchored (by the backup's own records, the ledger or the
 //! anchor log) are marked `regressed`. The restore is recorded in the
 //! access log.
+//!
+//! # The anchor log and witness records after a restore
+//!
+//! The backup's anchor log is as old as the backup, and the server signed
+//! checkpoints after it: under the same key and origin, a restored server
+//! that went on anchoring would sign other trees under sequence numbers
+//! and sizes it had already signed, a fork of its own log that every
+//! checkpoint handed out since (in bundles, to TSAs and witnesses)
+//! contradicts. So a restore either takes the anchor log that survived
+//! the disaster (`--anchors DIR`, which must continue the backup's log:
+//! every checkpoint of the backup's is in it, unchanged), or *holds*
+//! anchoring: no checkpoint is signed until `confirm-anchors` shows the
+//! restored log is the newest one published (`--checkpoint FILE`, the
+//! newest checkpoint the log handed out, from a witness or a bundle), or
+//! retires it and starts a new log under a new key, whose first batch
+//! anchors the access-log record that links the two (`--new-log`).
+//!
+//! In witness mode, every restored witness record is held as well
+//! (`regressed`): a record restored from a backup has forgotten every
+//! cosignature made after it, and would cosign forks of logs it already
+//! cosigned past. Each is resumed with the latest checkpoint it cosigned,
+//! taken from outside the host (`witness-resume`).
 
 use std::fs;
 use std::io;
@@ -516,7 +538,7 @@ fn offline_store(config: &Config, layout: &Layout) -> Result<Arc<Store>, String>
 
 /// `restore --from DIR [--erasure-ledger FILE]` (see the module
 /// documentation), trusting the configured signing key and the keys it
-/// replaced. Returns a report.
+/// replaced, and holding anchoring. Returns a report.
 pub fn restore(
     config: &Config,
     from: &Path,
@@ -535,8 +557,40 @@ pub fn restore_trusting(
     anchoring: &dyn Anchoring,
     extra: &[String],
 ) -> Result<JsonValue, String> {
-    let trusted = trusted_keys(config, extra)?;
+    let options = RestoreOptions {
+        ledger_file,
+        trust_keys: extra,
+        anchors_from: None,
+    };
+    restore_with(config, from, &options, anchoring)
+}
+
+/// What `restore` takes besides the backup.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RestoreOptions<'a> {
+    /// The erasure ledger kept off the host (`--erasure-ledger`).
+    pub ledger_file: Option<&'a Path>,
+    /// Public keys to trust as the backup's signer (`--trust-key`).
+    pub trust_keys: &'a [String],
+    /// The anchor log that survived the disaster (`--anchors`): restored
+    /// in place of the backup's, which it must continue. Without it,
+    /// anchoring is held (see the module documentation).
+    pub anchors_from: Option<&'a Path>,
+}
+
+/// `restore` (see the module documentation).
+pub fn restore_with(
+    config: &Config,
+    from: &Path,
+    options: &RestoreOptions<'_>,
+    anchoring: &dyn Anchoring,
+) -> Result<JsonValue, String> {
+    let ledger_file = options.ledger_file;
+    let trusted = trusted_keys(config, options.trust_keys)?;
     let manifest = verify_backup(from, &trusted)?;
+    if let Some(dir) = options.anchors_from {
+        check_anchors_continue(&from.join("anchors"), dir)?;
+    }
     let layout = Layout::new(config.data_dir.clone());
     let _lock = lock_data_dir(&layout).map_err(|e| e.0)?;
     if !layout::is_fresh(&layout.data_dir).map_err(|e| e.to_string())? {
@@ -547,6 +601,36 @@ pub fn restore_trusting(
     }
     copy_backup(&manifest, from, &layout)?;
     layout::check_format(&layout)?;
+    let anchors = crate::anchoring::anchors_dir(&layout.data_dir);
+    let held = match options.anchors_from {
+        Some(dir) => {
+            fs::remove_dir_all(&anchors).or_else(|e| {
+                if e.kind() == io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(format!("{}: {e}", anchors.display()))
+                }
+            })?;
+            copy_dir(dir, &anchors).map_err(|e| format!("--anchors {}: {e}", dir.display()))?;
+            None
+        }
+        None => {
+            let latest = latest_checkpoint_file(&anchors)?;
+            let hold = crate::anchoring::Hold {
+                reason: format!(
+                    "the data directory was restored from the backup taken at {}, whose anchor \
+                     log is as old as the backup; the server may have signed checkpoints after \
+                     it, and signing on would fork the log",
+                    manifest.created_at
+                ),
+                since: timefmt::now_rfc3339(),
+                latest_seq: latest.map(|(seq, _)| seq),
+                latest_tree_size: latest.map_or(0, |(_, size)| size),
+            };
+            crate::anchoring::write_hold(&layout.data_dir, &hold)?;
+            Some(hold.reason)
+        }
+    };
     let access = AccessLog::open(&access_log::path(&layout.data_dir)).map_err(|e| e.to_string())?;
     let begin = access
         .durable_blocking(AccessRecord::new(
@@ -555,6 +639,10 @@ pub fn restore_trusting(
         ))
         .map_err(|e| e.0)?;
     let store = offline_store(config, &layout)?;
+    let witness_records = store.hold_records(
+        crate::witness::RECORD_PREFIX,
+        "restored from a backup: cosignatures made after the backup are not in it",
+    );
     let (leases_ended, lease_failures) = store.end_restored_leases();
     let restored_path = Ledger::path(&layout.data_dir);
     let records = match ledger_file {
@@ -593,6 +681,11 @@ pub fn restore_trusting(
         "leases_ended": leases_ended,
         "lease_notes_failed": capped(lease_failures.into_iter().map(|(r, _)| r).collect()).0,
         "regressed": capped(regressed).0,
+        "anchors": match options.anchors_from {
+            Some(dir) => json!({"from": dir.display().to_string(), "held": false}),
+            None => json!({"from": "backup", "held": true, "reason": held}),
+        },
+        "witness_records_held": capped(witness_records).0,
         "errors": errors,
         "errors_dropped": errors_dropped,
     });
@@ -600,6 +693,255 @@ pub fn restore_trusting(
         .durable_blocking(AccessRecord::new("restore", report.clone()))
         .map_err(|e| e.0)?;
     Ok(report)
+}
+
+/// The `(seq, tree size)` of the latest checkpoint file in an anchors
+/// directory, if it has one.
+fn latest_checkpoint_file(anchors: &Path) -> Result<Option<(u64, u64)>, String> {
+    let seqs = checkpoint_files(anchors)?;
+    match seqs.last() {
+        None => Ok(None),
+        Some(&(seq, ref path)) => {
+            let stored = read_checkpoint(path)?;
+            Ok(Some((seq, stored.tree_size())))
+        }
+    }
+}
+
+/// Every checkpoint file (`sth/<seq>.json`) of an anchors directory, by
+/// sequence number.
+fn checkpoint_files(anchors: &Path) -> Result<Vec<(u64, PathBuf)>, String> {
+    let dir = anchors.join("sth");
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {e}", dir.display())),
+    };
+    let mut out = Vec::new();
+    for e in entries {
+        let e = e.map_err(|e| format!("{}: {e}", dir.display()))?;
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(stem) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if stem.len() == 20 && stem.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(seq) = stem.parse::<u64>() {
+                out.push((seq, e.path()));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// One checkpoint file.
+fn read_checkpoint(path: &Path) -> Result<pragmatic_anchor::StoredCheckpoint, String> {
+    let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let doc = pragmatic::json::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    pragmatic_anchor::StoredCheckpoint::from_json(&doc)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The surviving anchors directory `survivor` continues the backup's anchor
+/// log (`backup`): every checkpoint of the backup's is in it, naming the
+/// same tree. Read only: nothing in either directory is changed.
+fn check_anchors_continue(backup: &Path, survivor: &Path) -> Result<(), String> {
+    if !survivor.join("log.leaves").is_file() {
+        return Err(format!(
+            "--anchors {}: not an anchors directory (no log.leaves)",
+            survivor.display()
+        ));
+    }
+    let theirs: std::collections::HashMap<u64, PathBuf> =
+        checkpoint_files(survivor)?.into_iter().collect();
+    for (seq, path) in checkpoint_files(backup)? {
+        let ours = read_checkpoint(&path)?;
+        let continued = match theirs.get(&seq) {
+            Some(p) => {
+                let c = read_checkpoint(p)?;
+                c.tree_size() == ours.tree_size()
+                    && c.root() == ours.root()
+                    && c.signed.checkpoint.origin == ours.signed.checkpoint.origin
+            }
+            None => false,
+        };
+        if !continued {
+            return Err(format!(
+                "--anchors {}: it does not continue the backup's anchor log (checkpoint {seq} is \
+                 missing or names another tree)",
+                survivor.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Copy a directory tree (regular files only), each file fsynced and each
+/// directory fsynced after its entries.
+fn copy_dir(from: &Path, to: &Path) -> io::Result<()> {
+    fsutil::create_dir_durable(to)?;
+    for e in fs::read_dir(from)? {
+        let e = e?;
+        let kind = e.file_type()?;
+        let dest = to.join(e.file_name());
+        if kind.is_dir() {
+            copy_dir(&e.path(), &dest)?;
+        } else if kind.is_file() {
+            let mut src = fs::File::open(e.path())?;
+            copy_stream(&mut src, &dest)?;
+        }
+    }
+    fsutil::fsync_dir(to)
+}
+
+/// How `confirm-anchors` re-establishes a held anchor log.
+#[derive(Debug, Clone)]
+pub enum ConfirmAnchors {
+    /// The newest checkpoint the log published (a signed note, from a
+    /// witness's log or the newest evidence bundle): it must be the
+    /// restored log's latest, so nothing was signed after it.
+    Checkpoint(PathBuf),
+    /// Retire the held log and begin a new one under a new key (a new
+    /// origin), which the configuration must already name.
+    NewLog,
+}
+
+/// `confirm-anchors` (server stopped): lift the hold on the anchor log
+/// (see the module documentation). The confirmation is recorded in the
+/// access log, which the next batch anchors.
+pub fn confirm_anchors(config: &Config, how: &ConfirmAnchors) -> Result<String, String> {
+    let layout = Layout::new(config.data_dir.clone());
+    let _lock = lock_data_dir(&layout).map_err(|e| e.0)?;
+    layout::check_format(&layout)?;
+    let Some(hold) = crate::anchoring::read_hold(&layout.data_dir)? else {
+        return Ok("anchoring is not held; nothing to confirm\n".into());
+    };
+    let key = ServerKey::load(&config.keys.signing_key_file).map_err(|e| e.to_string())?;
+    let anchors = crate::anchoring::anchors_dir(&layout.data_dir);
+    let latest = latest_checkpoint_file(&anchors)?;
+    let latest_note = match latest {
+        Some((seq, _)) => Some(read_checkpoint(
+            &anchors.join("sth").join(format!("{seq:020}.json")),
+        )?),
+        None => None,
+    };
+    let access = AccessLog::open(&access_log::path(&layout.data_dir)).map_err(|e| e.to_string())?;
+    match how {
+        ConfirmAnchors::Checkpoint(path) => {
+            let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let note = pragmatic::note::Note::parse(&text)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            let given = pragmatic::note::Checkpoint::parse(&note.body)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            if given.origin != key.origin() {
+                return Err(format!(
+                    "the checkpoint is for origin {}, this log's is {}",
+                    given.origin,
+                    key.origin()
+                ));
+            }
+            let ring = keys::read_key_ring(&layout.data_dir).unwrap_or_default();
+            let keys = crate::anchoring::log_keys(&key, &ring);
+            pragmatic::note::verify_note(&note, &keys)
+                .map_err(|e| format!("the checkpoint is not signed by this log's keys: {e}"))?;
+            let Some(ours) = latest_note else {
+                return Err(format!(
+                    "the restored log has no checkpoint, but this one names {} leaves: restore \
+                     with --anchors from the anchors directory that holds them, or start a new \
+                     log (--new-log)",
+                    given.tree_size
+                ));
+            };
+            if given.tree_size > ours.tree_size() {
+                return Err(format!(
+                    "the log published a tree of {} leaves, and the restored log holds {}: it \
+                     signed checkpoints after the backup that are lost here. Restore with \
+                     --anchors from the anchors directory that holds them, or start a new log \
+                     (--new-log)",
+                    given.tree_size,
+                    ours.tree_size()
+                ));
+            }
+            if given.tree_size < ours.tree_size() {
+                return Err(format!(
+                    "this checkpoint ({} leaves) is older than the restored log's latest ({}): \
+                     give the newest checkpoint the log published",
+                    given.tree_size,
+                    ours.tree_size()
+                ));
+            }
+            if given.root != ours.root() {
+                return Err(format!(
+                    "the log published another tree of {} leaves than the restored log holds: \
+                     its history forked; start a new log (--new-log)",
+                    given.tree_size
+                ));
+            }
+            access
+                .durable_blocking(AccessRecord::new(
+                    "anchors.confirmed",
+                    json!({
+                        "hold": hold.reason,
+                        "checkpoint": text,
+                        "tree_size": given.tree_size,
+                    }),
+                ))
+                .map_err(|e| e.0)?;
+            crate::anchoring::clear_hold(&layout.data_dir)?;
+            Ok(format!(
+                "anchoring resumes: the restored log's latest checkpoint ({} leaves) is the newest \
+                 the log published\n",
+                given.tree_size
+            ))
+        }
+        ConfirmAnchors::NewLog => {
+            let old_origin = latest_note
+                .as_ref()
+                .map(|c| c.signed.checkpoint.origin.clone());
+            if old_origin.as_deref() == Some(key.origin()) {
+                return Err(format!(
+                    "--new-log needs a new log key, whose origin starts the new log: the \
+                     configured key is for {}, the held log's origin. Generate one with \
+                     `pragmatic-server keygen` into a new key file, point keys.signing_key_file \
+                     at it, and run this again",
+                    key.origin()
+                ));
+            }
+            let retired = layout.data_dir.join(format!(
+                "anchors.retired-{}",
+                timefmt::now_unix_ns() / 1_000_000
+            ));
+            access
+                .durable_blocking(AccessRecord::new(
+                    "anchors.new_log",
+                    json!({
+                        "hold": hold.reason,
+                        "old_origin": old_origin,
+                        "old_latest_checkpoint": latest_note.as_ref().map(|c| c.signed.note.clone()),
+                        "new_origin": key.origin(),
+                        "retired_to": retired.file_name().map(|n| n.to_string_lossy().into_owned()),
+                    }),
+                ))
+                .map_err(|e| e.0)?;
+            fs::rename(&anchors, &retired).map_err(|e| format!("{}: {e}", anchors.display()))?;
+            fsutil::fsync_dir(&layout.data_dir).map_err(|e| e.to_string())?;
+            match fs::remove_file(access_log::leaf_path(&layout.data_dir)) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.to_string()),
+                _ => {}
+            }
+            keys::retire_others(&layout.data_dir, &key).map_err(|e| e.to_string())?;
+            let store = offline_store(config, &layout)?;
+            let runs = store.forget_anchoring();
+            store.flush_meta(true);
+            Ok(format!(
+                "the held log was moved to {}; a new log begins under {} with the next batch, \
+                 and {runs} runs are anchored in it afresh. Onboard the new origin at every \
+                 witness that cosigned the old one\n",
+                retired.display(),
+                key.origin()
+            ))
+        }
+    }
 }
 
 /// Copy every file of a verified backup into the data directory, checking
@@ -702,13 +1044,14 @@ pub fn verify_data_offline(
     layout::check_format(&layout)?;
     let store = offline_store(config, &layout)?;
     let (checked, failing) = store.verify_all();
-    let (failing_ids, failing_dropped) = capped(store.failing_run_ids());
+    let runs_failing = failing.len();
+    let (failing_ids, failing_dropped) = capped(failing);
     let log_path = access_log::path(&layout.data_dir);
     let access_log = access_log::verify_file(&log_path, None);
     let anchors = anchoring.verify().unwrap_or_else(|e| json!({"error": e.0}));
     let result = json!({
         "runs_checked": checked,
-        "runs_failing": failing,
+        "runs_failing": runs_failing,
         "failing_run_ids": failing_ids,
         "failing_run_ids_dropped": failing_dropped,
         "access_log": access_log,

@@ -88,6 +88,10 @@ pub struct LeafPlaced {
     pub run_id: Option<String>,
     pub entries: u64,
     pub leaf_index: u64,
+    /// The chain head after `entries` entries, as the signed leaf records
+    /// it. At startup the access log is checked against this, not against
+    /// `audit/anchor.json`, which is only a cache of it.
+    pub head: Digest,
 }
 
 /// What a batch did.
@@ -112,6 +116,12 @@ pub enum AnchorAlert {
         witness: String,
         reason: String,
     },
+    /// A witness has seen checkpoints this log no longer has (design
+    /// 4.7): the log was restored from an old backup or rolled back, and
+    /// signing on would fork it. Anchoring is held until an administrator
+    /// re-establishes the log (`pragmatic-server confirm-anchors`); webhook
+    /// `anchor_failed` with `fork: true`.
+    Fork { reason: String },
     /// A snapshot contradicts a signed leaf: fewer entries than the
     /// object's latest leaf, or the same entries and another head (design
     /// 4.7). It was not anchored. The run (`None`: the access log) was
@@ -150,9 +160,13 @@ pub struct CheckpointView {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LeafView {
     pub index: u64,
-    /// The run whose tip this is (`None` for the access log). Used only to
-    /// filter by scope; whether it is shown is the library's choice (with
-    /// `anchor_run_ids = "hmac"` it should not be).
+    /// True for an access-log leaf (a record count and a chain head, shown
+    /// to every auditor); false for a run's leaf.
+    pub access_log: bool,
+    /// The run whose tip this is, when it is known (never for the access
+    /// log). Used only to filter by scope: a run leaf whose run is unknown
+    /// is shown to administrators only. Whether the id itself is shown is
+    /// the library's choice (with `anchor_run_ids = "hmac"` it is not).
     pub run_id: Option<String>,
     pub body: JsonValue,
 }
@@ -250,10 +264,43 @@ pub trait Anchoring: Send + Sync + 'static {
     /// `host`, as after a batch.
     fn retry(&self, _host: &dyn AnchorHost) {}
 
+    /// The sequence number of the latest checkpoint, if any. An evidence
+    /// request notes it before reading the journal and builds the bundle's
+    /// anchors through it ([`Anchoring::run_anchors_through`]).
+    fn latest_seq(&self) -> Option<u64> {
+        None
+    }
+
     /// The run's anchors for an evidence bundle: its whole leaf chain with
-    /// proofs, checkpoints and witnesses. Empty for a run never anchored.
-    fn run_anchors(&self, _run_id: &str) -> Result<RunAnchors, AnchorError> {
+    /// proofs, checkpoints and witnesses, as of the latest checkpoint.
+    /// Empty for a run never anchored.
+    fn run_anchors(&self, run_id: &str) -> Result<RunAnchors, AnchorError> {
+        self.run_anchors_through(run_id, self.latest_seq())
+    }
+
+    /// The run's anchors as of checkpoint `through`: the leaves inside that
+    /// checkpoint's tree, each proven consistent with it, and it as the
+    /// latest checkpoint. `None` gives no anchors.
+    fn run_anchors_through(
+        &self,
+        _run_id: &str,
+        _through: Option<u64>,
+    ) -> Result<RunAnchors, AnchorError> {
         Ok(RunAnchors::default())
+    }
+
+    /// True when the log holds a leaf of this run. The server never starts
+    /// a fresh record under an id the log has anchored: that history was
+    /// lost, not never written (design 4.8).
+    fn has_leaf(&self, _run_id: &str) -> Result<bool, AnchorError> {
+        Ok(false)
+    }
+
+    /// Why anchoring is held (no checkpoint is signed), if it is: the log
+    /// was restored from a backup, or a witness has seen checkpoints the
+    /// log no longer has (design 4.7, 4.13).
+    fn held(&self) -> Option<String> {
+        None
     }
 }
 
@@ -324,12 +371,16 @@ impl Anchoring for NoAnchoring {
 
 /// Everything an evidence bundle is built from. Access control has already
 /// happened: the requester may see this run, and `redact` was checked
-/// against `view_raw` (a viewer without it never gets `none`).
+/// against `view_raw` (a viewer without it only gets `detectors` or `all`).
 pub struct EvidenceRequest<'a> {
     pub run_id: &'a str,
     /// The durable journal, read under the run's shared lock.
     pub journal: &'a Journal,
     pub journal_bytes: &'a [u8],
+    /// The latest checkpoint when the journal was read (noted before the
+    /// read). The bundle's anchors run through it, and it is the bundle's
+    /// `latest_checkpoint` (design 4.17).
+    pub anchors_through: Option<u64>,
     /// The token id of the requester (`requested_by`).
     pub requested_by: &'a str,
     /// `none`, `detectors`, `binary` or `all`.
@@ -337,6 +388,9 @@ pub struct EvidenceRequest<'a> {
     pub redactor: &'a Redactor,
     pub anchoring: &'a dyn Anchoring,
     pub key: &'a ServerKey,
+    /// At least one external witness is configured. The bundle claims
+    /// `independent` only when this holds and one of its anchors is
+    /// independently witnessed.
     pub independent: bool,
     /// `pragmatic-server <version>`.
     pub generator: &'a str,
@@ -505,7 +559,7 @@ pub struct InstantAnchoring {
 #[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Default)]
 struct InstantState {
-    leaves: Vec<(Option<String>, u64)>,
+    leaves: Vec<(Option<String>, u64, Digest)>,
     batches: Vec<(u64, usize, usize)>,
     anchored: HashMap<String, u64>,
 }
@@ -534,16 +588,19 @@ impl Anchoring for InstantAnchoring {
                 run_id: None,
                 entries: log.entries,
                 leaf_index: s.leaves.len() as u64,
+                head: log.head,
             });
-            s.leaves.push((None, log.entries));
+            s.leaves.push((None, log.entries, log.head));
         }
         for tip in &input.runs {
             placed.push(LeafPlaced {
                 run_id: Some(tip.run_id.clone()),
                 entries: tip.entries,
                 leaf_index: s.leaves.len() as u64,
+                head: tip.head,
             });
-            s.leaves.push((Some(tip.run_id.clone()), tip.entries));
+            s.leaves
+                .push((Some(tip.run_id.clone()), tip.entries, tip.head));
             s.anchored.insert(tip.run_id.clone(), tip.entries);
             anchored.push((tip.run_id.clone(), tip.entries));
         }
@@ -599,25 +656,39 @@ impl Anchoring for InstantAnchoring {
     fn last_leaves(&self) -> Result<Vec<LeafPlaced>, AnchorError> {
         let s = self.state.lock().expect("anchoring state");
         let mut last: HashMap<Option<String>, LeafPlaced> = HashMap::new();
-        for (i, (run_id, entries)) in s.leaves.iter().enumerate() {
+        for (i, (run_id, entries, head)) in s.leaves.iter().enumerate() {
             last.insert(
                 run_id.clone(),
                 LeafPlaced {
                     run_id: run_id.clone(),
                     entries: *entries,
                     leaf_index: i as u64,
+                    head: *head,
                 },
             );
         }
         Ok(last.into_values().collect())
     }
+
+    fn latest_seq(&self) -> Option<u64> {
+        let s = self.state.lock().expect("anchoring state");
+        s.batches.last().map(|(seq, _, _)| *seq)
+    }
+
+    fn has_leaf(&self, run_id: &str) -> Result<bool, AnchorError> {
+        let s = self.state.lock().expect("anchoring state");
+        Ok(s.leaves
+            .iter()
+            .any(|(id, _, _)| id.as_deref() == Some(run_id)))
+    }
 }
 
 #[cfg(any(test, feature = "testing"))]
 fn leaf_view(s: &InstantState, i: usize) -> LeafView {
-    let (run, entries) = &s.leaves[i];
+    let (run, entries, _) = &s.leaves[i];
     LeafView {
         index: i as u64,
+        access_log: run.is_none(),
         run_id: run.clone(),
         body: serde_json::json!({"index": i, "run_id": run, "entries": entries}),
     }

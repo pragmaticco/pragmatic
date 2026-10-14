@@ -43,9 +43,12 @@
 //!
 //! Binary attachments (images, documents, audio) are never scanned as
 //! text: [`binary`] finds them in JSON slots and describes each by media
-//! type, size and SHA-256 instead.
+//! type, size and SHA-256 instead. A streamed model reply holds its text in
+//! deltas of a few characters, where no detector sees a value split across
+//! them: [`stream`] puts that text back together.
 
 pub mod binary;
+pub mod stream;
 
 use std::collections::HashMap;
 

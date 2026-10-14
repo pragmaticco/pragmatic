@@ -1905,6 +1905,62 @@ fn erasure_by_match_covers_every_copy() {
     assert!(data.get("access_log_cursor").unwrap().is_null());
 }
 
+/// A value the model repeated back in a streamed reply arrives split
+/// across token deltas; erasure by match reaches it there and erases the
+/// whole reply slot (a data subject request must not leave it in the
+/// journal for anyone who joins the deltas).
+#[test]
+fn erasure_by_match_reaches_a_value_split_across_stream_deltas() {
+    let mut j = journal(None);
+    let mut stream = String::new();
+    for d in [
+        "A confirmation went to ",
+        "jane",
+        ".doe",
+        "@example",
+        ".com",
+        ".",
+    ] {
+        stream.push_str("event: content_block_delta\ndata: ");
+        stream.push_str(&format!(
+            r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{d}"}}}}"#
+        ));
+        stream.push_str("\n\n");
+    }
+    let intent = j
+        .append(
+            ROOT,
+            Event::DrawIntent {
+                provenance: "anthropic".into(),
+                parts: vec![Content::from("refund my order")],
+            },
+        )
+        .unwrap();
+    j.append(
+        ROOT,
+        Event::DrawResult {
+            intent,
+            meta: r#"{"outcome":"ok"}"#.into(),
+            head: Content::from(r#"{"status":200}"#),
+            body: Content::from(stream.as_str()),
+        },
+    )
+    .unwrap();
+    j.mark_persisted(j.len());
+    let file = j.to_bytes();
+    assert_eq!(occurrences(&file, b"jane.doe@example.com"), 0);
+    let e = j
+        .erase(
+            &EraseSelector::Match(b"jane.doe@example.com".to_vec()),
+            &ErasureNote::local("dsar", ""),
+            AT,
+        )
+        .unwrap();
+    assert_eq!(e.slots, vec![(1, 1)], "the stream body, nothing else");
+    assert_eq!(occurrences(&e.file, b".doe"), 0);
+    assert!(e.journal.audit().is_ok());
+}
+
 #[test]
 fn naming_a_ref_erases_its_target() {
     let (j, _) = personal_journal();

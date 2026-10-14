@@ -60,7 +60,13 @@
 //! checkpoint), and is not asked about any checkpoint until its backoff
 //! ends; each RFC 3161 retry uses a fresh nonce. A cosigner that reports
 //! it has already cosigned past a checkpoint (it can happen after a
-//! restart) no longer owes that one.
+//! restart) no longer owes that one. A cosigner that reports a larger tree
+//! than the log holds, or refuses a checkpoint as inconsistent with the
+//! tree it cosigned (422), has seen checkpoints this log no longer has:
+//! the log was restored from an old backup or rolled back, and each new
+//! checkpoint up to that size would fork its signed history. That is
+//! reported in [`BatchOutcome::forks`] for the caller to stop signing and
+//! alert, never retried away.
 //!
 //! A checkpoint becomes independently anchored once the stored results
 //! cover `min_independent_operators` distinct operators
@@ -294,6 +300,13 @@ pub struct BatchOutcome {
     /// witness result that could not be stored, a reopened log). Alert on
     /// them.
     pub errors: Vec<String>,
+    /// Cosigners that report having cosigned a larger tree for this
+    /// origin than the log holds. The log has forgotten checkpoints it
+    /// signed (restored from an old backup, or rolled back), so every
+    /// checkpoint it signs from here up to that size forks the history
+    /// the cosigner vouches for. Stop signing and alert: this is never
+    /// retried away.
+    pub forks: Vec<String>,
 }
 
 /// Counters for metrics and alerts.
@@ -372,6 +385,10 @@ enum AttemptError {
     /// A cosigner has cosigned a newer checkpoint and can never cosign this
     /// one.
     Superseded,
+    /// A cosigner has cosigned a larger tree for this origin than the log
+    /// holds: the log forgot checkpoints it signed (see
+    /// [`BatchOutcome::forks`]).
+    Fork(String),
 }
 
 /// What one witness did in one pass.
@@ -379,6 +396,7 @@ enum AttemptError {
 struct WitnessRun {
     attempts: Vec<WitnessAttempt>,
     errors: Vec<String>,
+    forks: Vec<String>,
 }
 
 /// The anchoring engine. See the module documentation.
@@ -509,6 +527,24 @@ impl Anchorer {
             &self.config.policy,
             leaf_type,
             id,
+        )
+    }
+
+    /// The evidence anchor section of `id` as of checkpoint `through`
+    /// ([`evidence::anchor_section_through`]).
+    pub fn anchor_section_through(
+        &self,
+        leaf_type: LeafType,
+        id: &str,
+        through: Option<u64>,
+    ) -> Result<AnchorSection, AnchorError> {
+        evidence::anchor_section_through(
+            &self.read_log(),
+            &self.config.id_mode,
+            &self.config.policy,
+            leaf_type,
+            id,
+            through,
         )
     }
 
@@ -779,6 +815,7 @@ impl Anchorer {
         for ((w, _), run) in plan.iter().zip(runs) {
             attempts.extend(run.attempts.into_iter().map(|a| (a.seq, *w, a)));
             outcome.errors.extend(run.errors);
+            outcome.forks.extend(run.forks);
         }
         attempts.sort_by_key(|(seq, w, _)| (*seq, *w));
         let mut touched: BTreeSet<u64> = attempts.iter().map(|(seq, _, _)| *seq).collect();
@@ -897,6 +934,17 @@ impl Anchorer {
                     self.set_cosigned_size(w, theirs);
                     old = theirs;
                 }
+                // tlog-witness answers 422 when a checkpoint is not
+                // consistent with the tree it cosigned for this origin.
+                // This log never signs a tree inconsistent with an earlier
+                // one, so it has forgotten one it signed.
+                Err(WitnessClientError::Status { status: 422, body }) => {
+                    return Err(AttemptError::Fork(format!(
+                        "the witness refuses checkpoint {} (size {size}) as inconsistent with \
+                         the tree it cosigned for this origin from size {old}: {body}",
+                        stored.seq
+                    )))
+                }
                 Err(e) => return Err(AttemptError::Failed(e.to_string())),
             }
         }
@@ -907,15 +955,17 @@ impl Anchorer {
 
     /// A cosigner reports a size beyond this checkpoint: superseded if the
     /// log holds that size, otherwise the witness has seen a tree this log
-    /// does not have (a fork, or a log restored from an old backup).
+    /// does not have (a log restored from an old backup, or a fork), which
+    /// is fatal rather than worth a retry.
     fn newer_than(&self, theirs: u64) -> AttemptError {
         let ours = self.read_log().size();
         if theirs <= ours {
             AttemptError::Superseded
         } else {
-            AttemptError::Failed(format!(
+            AttemptError::Fork(format!(
                 "the witness has cosigned {theirs} leaves for this origin but the log holds {ours}: \
-                 possible fork or rollback"
+                 the log forgot checkpoints it signed (restored from an old backup, or rolled \
+                 back), and signing on would fork it"
             ))
         }
     }
@@ -985,6 +1035,12 @@ impl Anchorer {
                 true
             }
             Err(AttemptError::Failed(why)) => {
+                attempt.result = Err(why);
+                self.back_off(w);
+                false
+            }
+            Err(AttemptError::Fork(why)) => {
+                run.forks.push(format!("{}: {why}", witness.label()));
                 attempt.result = Err(why);
                 self.back_off(w);
                 false

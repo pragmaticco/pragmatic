@@ -779,3 +779,72 @@ async fn the_ledger_record_is_written_before_the_erasure_commits() {
         SlotState::Erased
     );
 }
+
+/// A data subject request erases by `match`, and a streamed model reply
+/// holds the subject's email split across token deltas: the erasure
+/// reaches the reply too, so nobody can join the deltas back afterwards
+/// (design 1.1, 2.13).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_match_erasure_reaches_an_email_echoed_in_a_streamed_reply() {
+    const EMAIL: &str = "jane.doe@example.com";
+    let ts = TestServer::start(|_| {}).await;
+    let (agent, _) = ts.issue("agent", &["*"], false).await;
+    let mut w = Writer::create(&ts, &agent, "support:7").await;
+    w.add(note("attempt.start", json!({"attempt": 1}), vec![]));
+    let request = json!({"model": "claude", "stream": true, "messages": [
+        {"role": "user", "content": format!("I am Jane ({EMAIL}), refund my order")}]});
+    let d = w.add(pragmatic::Event::DrawIntent {
+        provenance: "anthropic".into(),
+        parts: vec![pragmatic::Content::from(request.to_string())],
+    });
+    let mut body = String::new();
+    for delta in [
+        "Done! A confirmation went to ",
+        "jane",
+        ".doe",
+        "@example",
+        ".com",
+        ".",
+    ] {
+        body.push_str("event: content_block_delta\ndata: ");
+        body.push_str(
+            &json!({"type": "content_block_delta", "index": 0,
+                    "delta": {"type": "text_delta", "text": delta}})
+            .to_string(),
+        );
+        body.push_str("\n\n");
+    }
+    w.add(pragmatic::Event::DrawResult {
+        intent: d,
+        meta: r#"{"outcome":"ok"}"#.into(),
+        head: pragmatic::Content::from(r#"{"status":200}"#),
+        body: pragmatic::Content::from(body.as_str()),
+    });
+    w.add(note(
+        "attempt.end",
+        json!({"attempt": 1, "outcome": "ok"}),
+        vec![],
+    ));
+    assert_eq!(w.push(&ts).await.status(), StatusCode::OK);
+    assert_eq!(w.release(&ts).await.status(), StatusCode::NO_CONTENT);
+
+    let (status, v) = erase(
+        &ts,
+        "support:7",
+        json!({"match": EMAIL, "reason_code": "gdpr_art17"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["erased"],
+        json!([[2, 0], [3, 1]]),
+        "the request and the reply"
+    );
+    let j = stored(&ts, "support:7");
+    for e in j.entries() {
+        if let pragmatic::Event::DrawResult { body, .. } = &e.event {
+            assert!(body.value().is_none(), "the streamed reply is erased");
+        }
+    }
+    assert!(j.audit().is_ok());
+}

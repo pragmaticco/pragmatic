@@ -52,6 +52,14 @@ Server (`pragmatic.Runtime("https://...", token=...)`, or
 `PRAGMATIC_URL` and `PRAGMATIC_TOKEN`), or a store of your own implementing
 `pragmatic.Store`.
 
+On a server, `run` and `resume` work with the agent token that records the
+run. `replay` and `verify` read the run's journal without holding its
+lease, which needs an admin token or an auditor token with `view_raw`: an
+agent token reads a journal only while it holds the lease, so `replay` with
+one raises `ServerError` saying so. `verify` with such a token returns the
+server's own report instead (its verdict kept), and an auditor without
+`view_raw` reads the run redacted through `rt.entries`.
+
 ## Journaled model clients
 
 ### `ctx.wrap` and `pragmatic.wrap`
@@ -483,6 +491,16 @@ rt.verify("research-42")       # VerifyReport, truthy when intact
 rt.runs()                      # RunSummary for each run
 rt.entries("research-42")      # every entry, in the Entry JSON shape
 ```
+
+A report is never truthy for a journal the server says is missing or
+damaged (`report.missing`, `report.damaged`), whether the journal was
+checked here or the server's own report was returned.
+
+`python -m pragmatic push DIR RUN` uploads a local run to a server. It
+refuses, before anything is created on the server, a journal the server
+would refuse from a client: format 1, keyed, and one erased locally with
+`pragmatic erase` (the server records erasures only through its own erase
+endpoint, which says who erased what). Push runs before erasing them.
 
 With `PRAGMATIC_OTEL=1` and `opentelemetry-api` installed, each attempt is a
 span and each model call a child span in the GenAI conventions, with token

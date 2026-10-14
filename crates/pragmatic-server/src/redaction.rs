@@ -21,14 +21,25 @@
 //!   keys redact alike (`[email]` twice), later ones get a suffix
 //!   (`[email] (2)`), so the view stays strict JSON with every member.
 //!
-//! A slot that is JSON but not *strict* JSON (a repeated key, nesting past
-//! 64) is parsed leniently (a repeated key keeps its last value) and the
-//! same rules apply, so its binary fields are still withheld. Slots that
-//! are not JSON at all are redacted as text, with any embedded
-//! `data:...;base64,...` URL replaced first and, since their structure is
-//! unknown, any run of 256 or more base64 characters withheld as binary.
-//! Slots that are not UTF-8 are binary and never served without
+//! Every slot goes through the core's `redact::binary::scan` first, which
+//! reads JSON in one pass with no nesting limit and every copy of a
+//! repeated key, and replaces each binary value with its placeholder in
+//! place. The view is built from that text, never from the slot's own
+//! bytes, so a slot that is JSON but not *strict* JSON (a repeated key,
+//! nesting past 64), which is then parsed leniently (a repeated key keeps
+//! its last value), can no longer hide an attachment behind a second copy
+//! of a key. Slots that are not JSON at all are redacted as text, with any
+//! embedded `data:...;base64,...` URL replaced first and, since their
+//! structure is unknown, any run of 256 or more base64 characters withheld
+//! as binary; so is a slot that starts like JSON but could not be read to
+//! its end. Slots that are not UTF-8 are binary and never served without
 //! `view_raw`.
+//!
+//! A streamed model reply (an event stream) holds its text in deltas of a
+//! few characters, where no detector sees a value split across them. When
+//! the reassembled text of such a slot (`redact::stream`) holds something
+//! a detector or pattern finds, the view shows that reassembled text,
+//! redacted, instead of the events.
 //!
 //! Redaction does not look inside images, PDFs or audio, and regex
 //! redaction is not de-identification: the documentation says so.
@@ -37,7 +48,7 @@ use std::collections::HashSet;
 
 use pragmatic::encoding::{base64_decode, hex_encode};
 use pragmatic::json::{self, Json};
-use pragmatic::redact::{self, binary, Kind};
+use pragmatic::redact::{self, binary, stream, Kind};
 use pragmatic::sha256::sha256;
 use regex::Regex;
 use serde::Serialize;
@@ -167,11 +178,16 @@ impl Redactor {
                     return true;
                 }
                 mode == "detectors"
-                    && (!redact::find(&text, &self.kinds).is_empty()
-                        || self.patterns.iter().any(|p| p.is_match(&text)))
+                    && (self.detects(&text) || stream::texts(bytes).iter().any(|t| self.detects(t)))
             }
             _ => true,
         }
+    }
+
+    /// Whether a configured detector or pattern finds something in `text`.
+    fn detects(&self, text: &str) -> bool {
+        !redact::find(text, &self.kinds).is_empty()
+            || self.patterns.iter().any(|p| p.is_match(text))
     }
 
     /// Redact free text: embedded `data:` URLs, then the detectors, then
@@ -198,20 +214,47 @@ impl Redactor {
 
     /// Redact one slot's bytes (see the module documentation).
     pub fn redact_slot(&self, bytes: &[u8]) -> Redacted {
-        let Ok(text) = std::str::from_utf8(bytes) else {
+        let scanned = binary::scan(bytes);
+        let Some(text) = scanned.text else {
             return Redacted::Binary(BinaryInfo::of("application/octet-stream", bytes));
         };
-        let doc = match json::parse(text) {
+        if scanned.incomplete {
+            // Not read to its end: what follows may hold attachments, so it
+            // is treated as text of unknown structure.
+            return Redacted::Text(self.redact_loose_text(&text));
+        }
+        let doc = match json::parse(&text) {
             Ok(doc) => Some(doc),
-            Err(_) => lenient(text),
+            Err(_) => lenient(&text),
         };
         match doc {
             Some(doc) if is_container(&doc) => {
                 Redacted::Text(self.redact_json(doc, None).to_string())
             }
-            Some(_) => Redacted::Text(self.redact_text(text)),
-            None => Redacted::Text(self.redact_loose_text(text)),
+            Some(_) => Redacted::Text(self.redact_text(&text)),
+            None => Redacted::Text(
+                self.redact_stream(bytes)
+                    .unwrap_or_else(|| self.redact_loose_text(&text)),
+            ),
         }
+    }
+
+    /// The reassembled, redacted text of a streamed reply in which a
+    /// detector or pattern finds something only once its deltas are joined
+    /// (see the module documentation); `None` otherwise.
+    fn redact_stream(&self, bytes: &[u8]) -> Option<String> {
+        let parts = stream::texts(bytes);
+        if !parts.iter().any(|t| self.detects(t)) {
+            return None;
+        }
+        let mut out = String::from("[event stream: its text reassembled and redacted]\n");
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                out.push_str("\n\n");
+            }
+            out.push_str(&self.redact_loose_text(part));
+        }
+        Some(out)
     }
 
     /// Redact text whose structure is unknown: long base64 runs are
@@ -234,6 +277,7 @@ impl Redactor {
     /// `key` is the member name the value sits under.
     fn redact_json(&self, value: Json, key: Option<&str>) -> Json {
         match value {
+            Json::String(s) if is_placeholder(&s) => Json::String(s),
             Json::String(s) => {
                 if let Some(b) = self.data_url_binary(&s) {
                     return Json::String(b.placeholder());
@@ -277,7 +321,9 @@ impl Redactor {
             .into_iter()
             .map(|(k, v)| {
                 let value = match (&binary_data, &v) {
-                    (Some((field, media)), Json::String(s)) if k == *field => {
+                    (Some((field, media)), Json::String(s))
+                        if k == *field && !is_placeholder(s) =>
+                    {
                         Json::String(binary_of_base64(media, s).placeholder())
                     }
                     _ => self.redact_json(v, Some(&k)),
@@ -306,6 +352,13 @@ impl Redactor {
     }
 }
 
+/// A binary value the core scan already replaced: kept as it is (its size
+/// and digest describe the original bytes, which a second pass would
+/// replace with the placeholder's own).
+fn is_placeholder(s: &str) -> bool {
+    s.starts_with("[binary media_type=") && s.ends_with(']') && !s.contains('\n')
+}
+
 fn is_container(doc: &Json) -> bool {
     matches!(doc, Json::Object(_) | Json::Array(_) | Json::String(_))
 }
@@ -323,8 +376,9 @@ fn unique_name(name: String, used: &mut HashSet<String>) -> String {
 }
 
 /// JSON that the strict parser refuses but a common one reads (a repeated
-/// key keeps its last value, nesting up to 128): what most consumers of
-/// the slot would see, so its binary fields can still be found.
+/// key keeps its last value, nesting up to 128). Only ever given the core
+/// scan's text, whose binary values (in every copy of a repeated key) are
+/// already placeholders, so dropping a copy here cannot uncover one.
 fn lenient(text: &str) -> Option<Json> {
     serde_json::from_str::<serde_json::Value>(text)
         .ok()
@@ -593,6 +647,56 @@ mod tests {
             );
         }
         assert_eq!(hex_encode(&r.patterns_digest()), r.patterns_sha256());
+    }
+
+    /// A second `type` member in an Anthropic source block: a lenient
+    /// parse keeps the last copy and no longer sees a base64 block, but the
+    /// core scan reads every copy, and the view is built from its text.
+    #[test]
+    fn a_repeated_key_never_uncovers_an_attachment() {
+        let b64 = base64_encode(&[0x89u8; 300]);
+        let slot = format!(
+            r#"{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{b64}","type":"base64-image"}}}}"#
+        );
+        let out = text(redactor().redact_slot(slot.as_bytes()));
+        assert!(!out.contains(&b64), "{out}");
+        assert!(
+            out.contains("[binary media_type=image/png bytes=300 sha256="),
+            "the placeholder describes the original bytes: {out}"
+        );
+        // A strict slot's placeholder is the same as before.
+        let strict = format!(
+            r#"{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{b64}"}}}}"#
+        );
+        let out = text(redactor().redact_slot(strict.as_bytes()));
+        assert!(
+            out.contains("[binary media_type=image/png bytes=300 sha256="),
+            "{out}"
+        );
+    }
+
+    /// A streamed reply that holds an email only across its deltas is shown
+    /// as its reassembled text, redacted; evidence `detectors` withholds it.
+    #[test]
+    fn a_value_split_across_stream_deltas_is_redacted() {
+        let mut stream = String::new();
+        for d in ["Done, mailed ", "jane", ".doe@", "example.com", "."] {
+            stream.push_str("event: content_block_delta\ndata: ");
+            stream.push_str(&format!(
+                r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{d}"}}}}"#
+            ));
+            stream.push_str("\n\n");
+        }
+        let r = redactor();
+        let out = text(r.redact_slot(stream.as_bytes()));
+        assert!(out.contains("[email]"), "{out}");
+        assert!(!out.contains("jane") && !out.contains(".doe"), "{out}");
+        assert!(r.withholds("detectors", stream.as_bytes()));
+        assert!(!r.withholds("binary", stream.as_bytes()));
+        // A stream with nothing to redact is shown as it was.
+        let calm = stream.replace("jane", "the").replace(".doe@", " team at ");
+        let out = text(r.redact_slot(calm.as_bytes()));
+        assert!(out.contains("content_block_delta"), "{out}");
     }
 
     #[test]

@@ -269,8 +269,9 @@ pub fn verify_dict<'py>(py: Python<'py>, r: &VerifyReport) -> PyResult<Bound<'py
 }
 
 /// What a journal file is, read without a key: `format`, `keyed`,
-/// `entries` and `head` (unkeyed journals only), `valid_len` and
-/// `tail_len`. Used by `python -m pragmatic push` to refuse what a server
+/// `entries` and `head` (unkeyed journals only), `valid_len`, `tail_len`
+/// and `unpushable` (why a server would refuse its frames from a client,
+/// or `None`). Used by `python -m pragmatic push` to refuse what a server
 /// cannot hold before anything is sent.
 #[pyfunction]
 pub fn journal_info<'py>(
@@ -299,6 +300,16 @@ pub fn journal_info<'py>(
         d.set_item("tail_len", parsed.tail_len)?;
         let run_id = parsed.journal.run_start_id();
         d.set_item("run_id", run_id)?;
+        // What a server would refuse from a client (spec 4.6): the same
+        // frame checks it runs, so push refuses before creating the run.
+        let frames = &bytes[pragmatic_rt::journal::HEADER_LEN..parsed.valid_len as usize];
+        let refused = py.detach(|| {
+            Journal::new(None)
+                .append_frames(frames)
+                .err()
+                .map(|e| e.to_string())
+        });
+        d.set_item("unpushable", refused)?;
     }
     Ok(d)
 }

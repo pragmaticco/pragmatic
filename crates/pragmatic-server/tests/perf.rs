@@ -11,7 +11,9 @@
 //! ```
 //!
 //! `PRAGMATIC_LOAD_STARTUP_RUNS` sets how many runs the startup part
-//! creates (default 1,000,000; 0 skips it).
+//! creates (default 1,000,000; 0 skips it). With 1,000,000 runs startup
+//! must take at most 30 s (design 4.16); `PRAGMATIC_LOAD_STARTUP_LIMIT_SECS`
+//! sets the bound for a smaller count, as CI does on its runners.
 
 mod common;
 
@@ -166,10 +168,13 @@ async fn startup_with(n: usize) {
     let took = started.elapsed();
     eprintln!("startup with {n} runs: {took:?}");
     assert_eq!(ts.app().store.len(), n);
-    if n >= 1_000_000 {
+    let limit: Option<u64> = std::env::var("PRAGMATIC_LOAD_STARTUP_LIMIT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    if let Some(secs) = limit.or((n >= 1_000_000).then_some(30)) {
         assert!(
-            took <= Duration::from_secs(30),
-            "startup at most 30 s with 1 million runs"
+            took <= Duration::from_secs(secs),
+            "startup at most {secs} s with {n} runs"
         );
     }
 }

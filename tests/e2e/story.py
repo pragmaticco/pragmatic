@@ -210,6 +210,37 @@ class Story:
             start = page["next"]
 
     @staticmethod
+    def streamed_texts(text: str) -> List[str]:
+        """The text a model streamed, joined per part: a streamed reply is
+        stored as the provider's event stream, where a value the model
+        repeated back is split across deltas (Anthropic ``content_block_delta``,
+        OpenAI ``choices[].delta`` and Responses ``*.delta`` events)."""
+        parts: Dict[str, str] = {}
+
+        def add(key: str, value: Any) -> None:
+            if isinstance(value, str):
+                parts[key] = parts.get(key, "") + value
+
+        for line in text.splitlines():
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if not data.startswith("{"):
+                continue
+            try:
+                event = json.loads(data)
+            except ValueError:
+                continue
+            if event.get("type") == "content_block_delta":
+                for k in ("text", "partial_json", "thinking"):
+                    add(f"a{event.get('index')}{k}", (event.get("delta") or {}).get(k))
+            for choice in event.get("choices") or []:
+                add(f"c{choice.get('index')}", (choice.get("delta") or {}).get("content"))
+            if str(event.get("type", "")).endswith(".delta"):
+                add(f"r{event.get('type')}{event.get('output_index')}", event.get("delta"))
+        return list(parts.values())
+
+    @staticmethod
     def notes(entries: List[Dict[str, Any]], kind: str) -> List[Dict[str, Any]]:
         return [e for e in entries if (e.get("fields") or {}).get("kind") == kind]
 
@@ -467,7 +498,14 @@ class Story:
         assert rt.verify(RUN), "the chain still verifies after the erasure"
         raw = self.api.request("GET", Api.run_path(RUN, "/journal"), self.admin)
         assert raw.status == 200 and ticket.email.encode() not in raw.body
-        self.n.check("the hash chain still verifies end to end, and the email is nowhere in the stored journal")
+        for entry in self.entries(RUN):
+            for slot in entry.get("slots") or []:
+                for part in self.streamed_texts(slot.get("text") or ""):
+                    assert ticket.email not in part, "an email split across a streamed reply"
+        self.n.check(
+            "the hash chain still verifies end to end, and the email is nowhere in the stored "
+            "journal, nor in the text of any streamed reply"
+        )
         world = support_agent.World(self.agent_work, RUN)
         try:
             rt.replay(RUN, support_agent.make_agent(world))

@@ -21,10 +21,18 @@ const ROLES: &[Role] = &[Role::Auditor, Role::Admin];
 /// The most leaves one request returns.
 const MAX_LEAVES: u64 = 10_000;
 
+/// Whether `p` may see `leaf`. Decided by the leaf's type, never by
+/// whether its run is known: an access-log leaf is shown to every auditor,
+/// a run leaf only in scope, and a run leaf whose run cannot be told (its
+/// batch index is gone, under HMAC run ids) only to administrators, so the
+/// filter never fails open.
 fn visible(p: &Principal, leaf: &LeafView) -> bool {
+    if leaf.access_log {
+        return true;
+    }
     match &leaf.run_id {
         Some(id) => p.in_scope(id),
-        None => true,
+        None => p.role == Role::Admin,
     }
 }
 

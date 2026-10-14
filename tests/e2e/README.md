@@ -10,6 +10,7 @@ processes, using only local resources:
 | `support_agent.py` | the agent (Anthropic and OpenAI SDKs over scripted `httpx2.MockTransport` APIs, journaled with `ctx.wrap`, a refund tool through `ctx.run_tools`), run as separate processes |
 | `local_tsa.py` | two throwaway OpenSSL TSAs (a root plus a TSA certificate with critical `extendedKeyUsage = timeStamping`) served over HTTP by a responder that calls `openssl ts -reply` |
 | `harness.py` | builds and starts `pragmatic-server`, issues tokens, calls the API, runs `pragmatic` and `tools/verify_evidence.py` |
+| `test_sdk_against_server.py` | the SDK's server store against the real binary rather than the SDK suite's mock: calls longer than the lease with a competing resume, a lost response resent through a dropping proxy, `run_deleted`, `payload_too_large`, and how `verify`, `replay` and `push` report missing, damaged and erased runs |
 
 The steps:
 

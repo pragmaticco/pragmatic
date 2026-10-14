@@ -50,6 +50,10 @@ pub struct Durable {
     pub entries: u64,
     pub head: String,
     pub bytes: Vec<u8>,
+    /// Why the stored journal is damaged, if it is: `bytes` is then what
+    /// the file still holds of the indexed prefix (its valid prefix is all
+    /// a reader can use), and `entries` and `head` are the index's.
+    pub damaged: Option<String>,
     budget: BudgetGuard,
 }
 
@@ -132,7 +136,7 @@ struct Snapshot {
     entries: u64,
     byte_len: u64,
     head: String,
-    broken: bool,
+    broken: Option<String>,
     generation: u64,
 }
 
@@ -151,17 +155,24 @@ impl Store {
             entries: st.meta.entries,
             byte_len: st.meta.byte_len,
             head: st.meta.head.clone(),
-            broken: st.broken.is_some(),
+            broken: st.broken.clone(),
             generation: run.generation(),
         })
     }
 
     /// Open the run's journal and note its durable prefix, under the file
-    /// lock held shared.
+    /// lock held shared. A damaged journal is refused with `chain_broken`
+    /// before anything is streamed: its index may name bytes the file no
+    /// longer holds, and raw journal bytes stand for the run's whole
+    /// history, which the server knows this file is not. (Entries and the
+    /// console serve its valid prefix.)
     pub fn open_durable(&self, run_id: &str) -> Result<DurableFile, ApiError> {
         let run = self.find(run_id)?;
         let _file = run.file.read().unwrap_or_else(|p| p.into_inner());
         let s = self.read_state(&run)?;
+        if let Some(why) = &s.broken {
+            return Err(ApiError::chain_broken(why));
+        }
         let file = File::open(self.layout.journal(&run.stem))?;
         Ok(DurableFile {
             file,
@@ -183,18 +194,23 @@ impl Store {
     /// bundle holds the journal again as base64 and as records). One take,
     /// never two: a reader holding part of the budget while waiting for
     /// more could wait for itself.
+    ///
+    /// A damaged journal yields what the file still holds of its indexed
+    /// prefix, with [`Durable::damaged`] set: never an error for a file
+    /// shorter than its index (that damage is permanent, so answering
+    /// `storage_unavailable`, which clients resend, would be wrong).
     pub fn durable_scaled(&self, run_id: &str, factor: u64) -> Result<Durable, ApiError> {
         let run = self.find(run_id)?;
         let size = run.lock().meta.byte_len;
         let budget = self.budget.take(size.saturating_mul(factor.max(1)));
         let _file = run.file.read().unwrap_or_else(|p| p.into_inner());
         let s = self.read_state(&run)?;
-        let file = File::open(self.layout.journal(&run.stem))?;
-        let bytes = fsutil::read_prefix(&file, s.byte_len)?;
+        let bytes = self.read_prefix(&run, s.byte_len, s.broken.is_some())?;
         Ok(Durable {
             entries: s.entries,
             head: s.head,
             bytes,
+            damaged: s.broken,
             budget,
         })
     }
@@ -206,7 +222,7 @@ impl Store {
         let run = self.find(run_id)?;
         let _file = run.file.read().unwrap_or_else(|p| p.into_inner());
         let s = self.read_state(&run)?;
-        if s.broken {
+        if s.broken.is_some() {
             drop(_file);
             return self.damaged_page(&run, from, limit);
         }
@@ -292,8 +308,8 @@ impl Store {
         let _budget = self.budget.take(size);
         let _file = run.file.read().unwrap_or_else(|p| p.into_inner());
         let s = self.read_state(run)?;
-        let bytes = self.read_prefix(run, s.byte_len, s.broken)?;
-        if s.broken {
+        let bytes = self.read_prefix(run, s.byte_len, s.broken.is_some())?;
+        if s.broken.is_some() {
             Journal::audit_bytes(&bytes, None)
                 .map(|(j, _)| j)
                 .map_err(|e| ApiError::chain_broken(&e.to_string()))
@@ -472,15 +488,20 @@ impl Store {
     /// accounting) under the byte budget, cache the report, and mark the
     /// run damaged unless the report is ok (design 2.13: content erased
     /// without a note is tampering, as a broken chain is).
+    ///
+    /// A damaged journal never gets an ok report, even when the prefix the
+    /// file still holds verifies on its own: a journal that lost
+    /// acknowledged entries is not intact. Its report fails at the first
+    /// entry it no longer holds (`first_bad`), counts only the entries it
+    /// holds (`verified_entries`), and names the damage.
     pub fn verify_run(&self, run: &Run) -> Result<VerifyCache, ApiError> {
         let size = run.lock().meta.byte_len;
         let _budget = self.budget.take(size);
         let _file = run.file.read().unwrap_or_else(|p| p.into_inner());
         let s = self.read_state(run)?;
-        let entries = s.entries;
-        let bytes = self.read_prefix(run, s.byte_len, s.broken)?;
-        let report = match Journal::audit_bytes(&bytes, None) {
-            Ok((_, report)) => report,
+        let bytes = self.read_prefix(run, s.byte_len, s.broken.is_some())?;
+        let (held, mut report) = match Journal::audit_bytes(&bytes, None) {
+            Ok((journal, report)) => (journal.len(), report),
             Err(e) => {
                 let mut st = run.lock();
                 self.mark_broken(&run.id, &mut st, e.to_string());
@@ -488,10 +509,19 @@ impl Store {
             }
         };
         drop(bytes);
+        let entries = if s.broken.is_some() {
+            if report.is_ok() || held < s.entries {
+                report.first_bad = Some(report.first_bad.map_or(held, |c| c.min(held)));
+            }
+            held.min(s.entries)
+        } else {
+            s.entries
+        };
         let cache = VerifyCache {
             report,
             entries,
             checked_at: timefmt::now_rfc3339(),
+            damaged: s.broken.clone(),
         };
         let mut st = run.lock();
         self.judge(&run.id, &mut st, &cache.report);
@@ -500,18 +530,26 @@ impl Store {
     }
 
     /// Verify every run (background, after startup and every
-    /// `verify_interval_hours`). Returns `(runs checked, runs failing)`.
-    pub fn verify_all(&self) -> (u64, u64) {
-        let (mut checked, mut failing) = (0, 0);
+    /// `verify_interval_hours`). Returns the runs checked and the ids of
+    /// those failing, in order: a report that is not ok, a damaged or
+    /// missing journal, or one that could not be read. The count and the
+    /// list are the same set, so verify-data never names a run as failing
+    /// without counting it.
+    pub fn verify_all(&self) -> (u64, Vec<String>) {
+        let mut checked = 0;
+        let mut failing = Vec::new();
         for run in self.all() {
-            match self.verify_run(&run) {
-                Ok(v) if v.report.is_ok() => checked += 1,
-                Ok(_) | Err(_) => {
-                    checked += 1;
-                    failing += 1;
-                }
+            if run.lock().deleted {
+                continue;
+            }
+            checked += 1;
+            let ok = matches!(self.verify_run(&run), Ok(v) if v.report.is_ok());
+            let st = run.lock();
+            if !ok || st.broken.is_some() || st.missing {
+                failing.push(run.id.clone());
             }
         }
+        failing.sort();
         (checked, failing)
     }
 
@@ -528,11 +566,13 @@ impl Store {
     }
 }
 
-/// The VerifyReport JSON.
+/// The VerifyReport JSON. `damaged` names why the stored journal is
+/// damaged (`null` when it is not); a damaged journal's report is never ok.
 pub fn verify_json(v: &VerifyCache) -> JsonValue {
     let r = &v.report;
     json!({
-        "ok": r.is_ok(),
+        "ok": r.is_ok() && v.damaged.is_none(),
+        "damaged": v.damaged,
         "first_bad": r.first_bad,
         "unaccounted_erasures": r.unaccounted_erasures,
         "erasure_incomplete": r.erasure_incomplete,

@@ -177,7 +177,8 @@ fn delete(app: &App, run_id: &str, policy_json: JsonValue) -> Result<(), ApiErro
 /// rest).
 pub fn verify_data(app: &App) -> JsonValue {
     let (checked, failing) = app.store.verify_all();
-    let (failing_runs, dropped) = crate::ops::capped(app.store.failing_run_ids());
+    let runs_failing = failing.len();
+    let (failing_runs, dropped) = crate::ops::capped(failing);
     let mut access_log = verify_access_log(app);
     access_log["anchored"] = match app.access_log_matches_leaf() {
         None => JsonValue::Null,
@@ -194,7 +195,7 @@ pub fn verify_data(app: &App) -> JsonValue {
         .unwrap_or_else(|e| json!({"error": e.0}));
     let result = json!({
         "runs_checked": checked,
-        "runs_failing": failing,
+        "runs_failing": runs_failing,
         "failing_run_ids": failing_runs,
         "failing_run_ids_dropped": dropped,
         "access_log": access_log,

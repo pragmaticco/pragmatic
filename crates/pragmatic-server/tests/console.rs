@@ -198,15 +198,24 @@ async fn the_console_signs_in_shows_runs_redacted_and_guards_its_forms() {
     // A later page of the timeline.
     let html = a.page("/console/runs/case-1?from=3").await;
     assert!(html.contains("Entries from #3 of"));
-    // The evidence download, as the API serves it.
-    let resp = a.get("/console/runs/case-1/evidence?redact=binary").await;
+    // The evidence download, as the API serves it: a bundle that carries
+    // text unredacted needs view_raw, so this auditor gets detectors.
+    assert_eq!(
+        a.get("/console/runs/case-1/evidence?redact=binary")
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let resp = a
+        .get("/console/runs/case-1/evidence?redact=detectors")
+        .await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(resp.headers()["content-disposition"]
         .to_str()
         .unwrap()
         .contains("case-1.evidence.json"));
     let bundle: Value = resp.json().await.unwrap();
-    assert_eq!(bundle["redaction"]["mode"], "binary");
+    assert_eq!(bundle["redaction"]["mode"], "detectors");
     ts.app().access.flush().await.unwrap();
     let html = a.page("/console/access").await;
     assert!(

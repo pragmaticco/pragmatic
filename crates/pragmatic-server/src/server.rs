@@ -12,15 +12,16 @@
 //!    and the access log (verified; a damaged access log stops startup);
 //! 5. listening. `/healthz` answers at once; `/readyz` and every run
 //!    endpoint answer 503 `starting` until the index is built;
-//! 6. the `config.loaded` access-log record, and a check that the access
-//!    log still holds what its last anchor leaf recorded;
-//! 7. the index, in the background, then each run's last anchor leaf from
-//!    the anchor log, then full verification, also in the background.
+//! 6. the `config.loaded` access-log record;
+//! 7. the index, in the background, then from the anchor log each run's
+//!    last leaf (missing and rolled-back runs found), and a check that the
+//!    access log still holds what its last leaf in the anchor log covers,
+//!    then full verification, also in the background.
 //!
 //! Background tasks: the `meta.json` flusher (every second), the sweeper
-//! (dangling effects, idle writers, the anchoring lag), anchoring batches,
-//! retention (hourly), verify-data (every `verify_interval_hours`) and
-//! console session expiry.
+//! (dangling effects, idle writers, the anchoring lag and its alert),
+//! anchoring batches, retention (hourly), verify-data (every
+//! `verify_interval_hours`) and console session expiry.
 //!
 //! # Serving
 //!
@@ -196,8 +197,12 @@ pub struct App {
     /// One anchoring batch at a time.
     pub anchor_lock: std::sync::Mutex<()>,
     pub anchor_soon: Arc<AnchorSoon>,
-    /// The access log's last anchor leaf (design 4.7).
+    /// The access log's last anchor leaf (design 4.7): a cache of the
+    /// anchor log's leaf (`audit/anchor.json`), reconciled with the anchor
+    /// log at startup.
     pub access_leaf: std::sync::Mutex<Option<AccessLeaf>>,
+    /// The anchoring-lag alert has fired and not yet cleared.
+    pub lag_alerted: AtomicBool,
     pub limits: Limits,
     /// Request body bytes being received, in [`BODY_UNIT`]s.
     pub body_budget: Arc<tokio::sync::Semaphore>,
@@ -277,6 +282,36 @@ impl App {
 }
 
 impl App {
+    /// Raise `anchor_failed` once the anchoring lag passes three anchoring
+    /// intervals (design 4.7: "an alert fires if fewer than the minimum
+    /// succeed for 3 intervals"), and re-arm once it falls back. Driven by
+    /// time from the sweeper, not by batches: a batch runs only when new
+    /// leaves exist, so on a quiet server whose witnesses are down the
+    /// last finished run would otherwise stay unanchored with no alert.
+    /// Only with an external witness configured: a self-anchored
+    /// deployment's lag grows by design, and says so in its metric.
+    pub fn check_anchoring_lag(&self) {
+        if !(self.hooks.anchoring.integrated() && self.hooks.anchoring.independent()) {
+            return;
+        }
+        let lag = self.metrics.anchor_lag_seconds();
+        let limit = 3 * self.config.anchoring.interval_secs;
+        if lag > limit as f64 {
+            if !self.lag_alerted.swap(true, Ordering::SeqCst) {
+                Host { app: self }.alert(AnchorAlert::Failed {
+                    reason: format!(
+                        "the oldest append not independently anchored is {lag:.0} s old, more \
+                         than three anchoring intervals ({limit} s): fewer than \
+                         min_independent_operators = {} witnesses are succeeding",
+                        self.config.anchoring.min_independent_operators
+                    ),
+                });
+            }
+        } else {
+            self.lag_alerted.store(false, Ordering::SeqCst);
+        }
+    }
+
     /// Remember where a batch put the access log's leaf, on disk first.
     fn record_access_leaf(&self, leaf_index: u64, entries: u64, head: pragmatic::sha256::Digest) {
         let leaf = AccessLeaf {
@@ -291,13 +326,49 @@ impl App {
     }
 
     /// Whether the access log still holds what its last leaf anchored: as
-    /// many records, ending in the same hash. `None` before its first leaf.
+    /// many records, ending in the same hash. The leaf is the anchor log's
+    /// own (signed, witnessed) when anchoring can say, and the cached
+    /// `audit/anchor.json` otherwise; a cache that disagrees with the
+    /// anchor log is itself a finding. `None` before the first leaf.
     pub fn access_log_matches_leaf(&self) -> Option<Result<(), String>> {
-        let leaf = self
+        let cached = self
             .access_leaf
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .clone()?;
+            .clone();
+        let anchored = self.hooks.anchoring.last_leaves().ok().and_then(|leaves| {
+            leaves
+                .into_iter()
+                .find(|l| l.run_id.is_none())
+                .map(|l| AccessLeaf {
+                    leaf_index: l.leaf_index,
+                    entries: l.entries,
+                    head: hex_encode(&l.head),
+                })
+        });
+        let leaf = match (anchored, cached) {
+            (Some(a), Some(c)) if c.leaf_index > a.leaf_index => {
+                return Some(Err(format!(
+                    "audit/anchor.json names access-log leaf {}, which the anchor log does not \
+                     hold (its last is {})",
+                    c.leaf_index, a.leaf_index
+                )))
+            }
+            (Some(a), Some(c)) if c.leaf_index == a.leaf_index && c != a => {
+                return Some(Err(format!(
+                    "audit/anchor.json disagrees with the anchor log's access-log leaf {}",
+                    a.leaf_index
+                )))
+            }
+            (Some(a), _) => a,
+            (None, Some(c)) => c,
+            (None, None) => return None,
+        };
+        self.access_log_holds(&leaf)
+    }
+
+    /// Whether the access log holds `leaf`'s records, ending in its head.
+    fn access_log_holds(&self, leaf: &AccessLeaf) -> Option<Result<(), String>> {
         let (entries, _) = self.access.tip();
         if entries < leaf.entries {
             return Some(Err(format!(
@@ -339,6 +410,15 @@ impl AnchorHost for Host<'_> {
                 ));
             }
             AnchorAlert::WitnessFailed { .. } => self.app.metrics.anchor_failed(),
+            AnchorAlert::Fork { reason } => {
+                eprintln!("pragmatic-server: anchoring is held: {reason}");
+                self.app.metrics.anchor_failed();
+                self.app.webhooks.send(WebhookEvent::new(
+                    "anchor_failed",
+                    None,
+                    json!({"reason": reason, "fork": true, "held": true}),
+                ));
+            }
             AnchorAlert::Contradicted {
                 run_id: Some(run_id),
                 anchored_entries,
@@ -581,6 +661,7 @@ pub async fn start_with(
         anchor_lock: std::sync::Mutex::new(()),
         anchor_soon,
         access_leaf: std::sync::Mutex::new(access_leaf),
+        lag_alerted: AtomicBool::new(false),
         body_budget,
         limits,
     });
@@ -595,7 +676,6 @@ pub async fn start_with(
     ));
 
     record_config_loaded(&app).await?;
-    check_access_log_leaf(&app);
     spawn_index(app.clone());
     spawn_background(app.clone(), shutdown_rx);
     Ok(ServerHandle {
@@ -718,89 +798,123 @@ fn connection_service(
     })
 }
 
-/// Check, at startup, that the access log still holds what its last anchor
-/// leaf recorded. A log that lost or rewrote anchored records was cut or
-/// tampered with: raise `chain_broken` for `pragmatic:access-log` and
-/// record the finding in the log itself. The server goes on (refusing to
-/// start would stop the record of everything that follows).
-fn check_access_log_leaf(app: &App) {
-    if let Some(Err(why)) = app.access_log_matches_leaf() {
-        eprintln!("pragmatic-server: {why}");
-        app.metrics.chain_broken();
-        app.webhooks.send(WebhookEvent::new(
-            "chain_broken",
-            Some(access_log::ACCESS_LOG_RUN_ID),
-            json!({"reason": why}),
-        ));
-        app.access.submit(AccessRecord::new(
-            "access_log.damaged",
-            json!({"reason": why}),
-        ));
-    }
-}
-
 /// Build the index in the background, then mark the server ready and
 /// verify everything.
+///
+/// Before the server is ready, the index is completed from the anchor
+/// log, which a crash cannot lose: every run the log holds a leaf for but
+/// the data directory has no trace of (neither journal nor tombstone) is
+/// `missing`, whether or not it was independently anchored (a record that
+/// was only self-anchored, or whose witnesses were down, was still written
+/// and signed); every run's last leaf is raised to the log's, and a run
+/// that holds less than its last leaf is `regressed` at once rather than
+/// at the next batch, so nothing is appended to a rolled-back history in
+/// between; and the access log is checked against its leaf. A pass over
+/// the anchor log that fails is alerted on, never ignored.
 fn spawn_index(app: Arc<App>) {
     tokio::task::spawn_blocking(move || {
         let report = app.store.index();
         for e in &report.errors {
             eprintln!("pragmatic-server: index: {e}");
         }
-        if let Ok(lengths) = app.hooks.anchoring.anchored_lengths() {
-            for (run_id, entries) in &lengths {
-                if !app.store.is_tombstoned(run_id) {
-                    app.store.register_missing(run_id, *entries);
-                }
+        let host = Host { app: &app };
+        let lengths = match app.hooks.anchoring.anchored_lengths() {
+            Ok(l) => l,
+            Err(e) => {
+                host.alert(AnchorAlert::Failed {
+                    reason: format!("reading anchored lengths from the anchor log at startup: {e}"),
+                });
+                Default::default()
             }
-            app.store.apply_anchored_lengths(&lengths);
+        };
+        let leaves = match app.hooks.anchoring.last_leaves() {
+            Ok(l) => l,
+            Err(e) => {
+                host.alert(AnchorAlert::Failed {
+                    reason: format!("reading last leaves from the anchor log at startup: {e}"),
+                });
+                Vec::new()
+            }
+        };
+        for leaf in &leaves {
+            let Some(run_id) = &leaf.run_id else { continue };
+            if !app.store.is_tombstoned(run_id) {
+                let anchored = lengths.get(run_id).copied().unwrap_or(0);
+                app.store.register_missing(run_id, anchored);
+            }
         }
-        if let Ok(leaves) = app.hooks.anchoring.last_leaves() {
-            app.store.apply_last_leaves(&leaves);
-            recover_access_leaf(&app, &leaves);
-        }
+        app.store.apply_anchored_lengths(&lengths);
+        app.store.apply_last_leaves(&leaves);
+        recover_access_leaf(&app, &leaves);
         app.store.sweep();
         app.ready.store(true, Ordering::SeqCst);
         app.store.verify_all();
     });
 }
 
-/// Take the access log's last leaf from the anchor log when it is newer
-/// than `audit/anchor.json` (a crash between the two writes).
+/// Check, at startup, that the access log still holds what its last leaf
+/// covers: the records the leaf counts, ending in the leaf's head (design
+/// 4.7). A log that lost or rewrote anchored records was cut or tampered
+/// with: `chain_broken` fires for `pragmatic:access-log` and the finding
+/// is recorded in the log itself. The server goes on (refusing to start
+/// would stop the record of everything that follows).
+///
+/// The leaf is the anchor log's, which is the record that was signed and
+/// witnessed; `audit/anchor.json` is only its cache (it lags the anchor log
+/// after a crash between the two writes), is brought to it, and is a
+/// finding of its own when it names a leaf the anchor log does not hold.
+/// The current log's hash is never taken for the anchored head: a
+/// rewritten prefix would then be adopted as anchored. Without a leaf in
+/// the anchor log (anchoring not integrated), the cache is checked.
 fn recover_access_leaf(app: &App, leaves: &[crate::hooks::LeafPlaced]) {
-    let Some(leaf) = leaves.iter().find(|l| l.run_id.is_none()) else {
-        return;
-    };
-    let known = app
+    let cached = app
         .access_leaf
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .as_ref()
-        .map(|l| l.leaf_index);
-    if known.is_some_and(|k| k >= leaf.leaf_index) {
+        .clone();
+    let Some(leaf) = leaves.iter().find(|l| l.run_id.is_none()) else {
+        if let Some(Err(why)) = cached.and_then(|leaf| app.access_log_holds(&leaf)) {
+            access_log_broken(app, why);
+        }
         return;
+    };
+    let anchored = AccessLeaf {
+        leaf_index: leaf.leaf_index,
+        entries: leaf.entries,
+        head: hex_encode(&leaf.head),
+    };
+    if let Some(c) = &cached {
+        if c.leaf_index >= anchored.leaf_index && *c != anchored {
+            access_log_broken(
+                app,
+                format!(
+                    "audit/anchor.json (leaf {}, {} records) disagrees with the anchor log's \
+                     access-log leaf {} ({} records)",
+                    c.leaf_index, c.entries, anchored.leaf_index, anchored.entries
+                ),
+            );
+        }
     }
-    let head = leaf
-        .entries
-        .checked_sub(1)
-        .and_then(|c| app.access.hash_at(c).ok().flatten());
-    match head {
-        Some(head) => app.record_access_leaf(leaf.leaf_index, leaf.entries, head),
-        None => check_access_log_leaf_missing(app, leaf),
+    if cached.as_ref() != Some(&anchored) {
+        app.record_access_leaf(leaf.leaf_index, leaf.entries, leaf.head);
+    }
+    if let Some(Err(why)) = app.access_log_holds(&anchored) {
+        access_log_broken(app, why);
     }
 }
 
-/// The anchor log names more access-log records than the log holds.
-fn check_access_log_leaf_missing(app: &App, leaf: &crate::hooks::LeafPlaced) {
-    let why = format!(
-        "the anchor log's leaf {} covers {} access-log records, which the log does not hold",
-        leaf.leaf_index, leaf.entries
-    );
+/// The access log contradicts its anchor: `chain_broken` for
+/// `pragmatic:access-log`, and a record of the finding in the log itself.
+fn access_log_broken(app: &App, why: String) {
     eprintln!("pragmatic-server: {why}");
     app.metrics.chain_broken();
     app.webhooks.send(WebhookEvent::new(
         "chain_broken",
         Some(access_log::ACCESS_LOG_RUN_ID),
+        json!({"reason": why}),
+    ));
+    app.access.submit(AccessRecord::new(
+        "access_log.damaged",
         json!({"reason": why}),
     ));
 }
@@ -821,6 +935,7 @@ fn spawn_background(app: Arc<App>, shutdown: watch::Receiver<bool>) {
         |app| {
             if app.is_ready() {
                 app.store.sweep();
+                app.check_anchoring_lag();
             }
             app.sessions.expire();
         },

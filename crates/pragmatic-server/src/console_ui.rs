@@ -347,13 +347,15 @@ fn run_actions(
         summary["entries"].as_u64().unwrap_or(0),
     ));
     if viewer.role == "auditor" || viewer.role == "admin" {
+        // `none` and `binary` carry text unredacted, so only a viewer
+        // with view_raw is offered them (the API refuses them otherwise).
         let mut modes = vec![
             ("detectors", "redacted by detectors"),
-            ("binary", "attachments withheld"),
             ("all", "all content withheld"),
         ];
         if viewer.view_raw {
             modes.insert(0, ("none", "unredacted"));
+            modes.insert(1, ("binary", "attachments withheld, text unredacted"));
         }
         let links: Vec<String> = modes
             .iter()
@@ -669,6 +671,10 @@ mod tests {
         let auditor = run_actions(&viewer("auditor"), "/console/runs/r", &summary, None);
         assert!(auditor.contains("evidence?redact=detectors"));
         assert!(!auditor.contains("redact=none"), "no view_raw");
+        assert!(
+            !auditor.contains("redact=binary"),
+            "binary bundles carry text unredacted: view_raw only"
+        );
         assert!(!auditor.contains("/erase"));
         let admin = run_actions(&viewer("admin"), "/console/runs/r", &summary, None);
         assert!(admin.contains("/console/runs/r/erase"));

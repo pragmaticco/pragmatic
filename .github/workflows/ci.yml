@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # release.yml runs this whole workflow before it publishes anything.
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
@@ -49,7 +51,7 @@ jobs:
           sleep 2
           curl -sf http://127.0.0.1:7171/healthz
           curl -sf http://127.0.0.1:7171/ | grep -q research-42
-          curl -sf http://127.0.0.1:7171/run/research-42 | grep -q "draw.result"
+          curl -sf http://127.0.0.1:7171/run/research-42 | grep -q "draw.ok"
           kill %1
 
   python:
@@ -199,6 +201,36 @@ jobs:
           else
             cargo test -p pragmatic-anthropic -- --ignored
           fi
+
+  msrv:
+    name: every crate builds on the minimum supported Rust (1.89)
+    # rust-version in Cargo.toml is a promise; stable alone would let a
+    # dependency or a language feature that needs a newer rustc slip in.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-targets
+
+  load:
+    name: performance targets (design 4.16), release mode
+    # The load test against the design's numbers: 1,000 appends/s across
+    # 200 runs, p50 at most 5 ms and p99 at most 25 ms server-side, and
+    # startup with many runs, sized for a hosted runner. Not on pull
+    # requests, where a noisy neighbour would make it flaky to iterate on;
+    # on main and before every release.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Load test and startup at 200,000 runs
+        env:
+          PRAGMATIC_LOAD_STARTUP_RUNS: "200000"
+          PRAGMATIC_LOAD_STARTUP_LIMIT_SECS: "15"
+        run: cargo test -p pragmatic-server --release --test perf -- --ignored --nocapture
 
   msrv-and-min:
     name: core builds without default features

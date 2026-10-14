@@ -138,7 +138,8 @@ impl AnchorSection {
     }
 }
 
-/// Build the anchor section of `id` from `log`.
+/// Build the anchor section of `id` from `log`, as of its latest
+/// checkpoint.
 pub fn anchor_section(
     log: &AnchorLog,
     id_mode: &RunIdMode,
@@ -146,7 +147,37 @@ pub fn anchor_section(
     leaf_type: LeafType,
     id: &str,
 ) -> Result<AnchorSection, AnchorError> {
-    let latest = log.latest_checkpoint();
+    let latest = log.latest_checkpoint().map(|c| c.seq);
+    anchor_section_through(log, id_mode, policy, leaf_type, id, latest)
+}
+
+/// Build the anchor section of `id` as of checkpoint `through`: the leaves
+/// of the chain inside that checkpoint's tree, each with its consistency
+/// proof to that tree, and that checkpoint as `latest_checkpoint`. `None`
+/// (a log that had no checkpoint yet) gives an empty section.
+///
+/// A bundle builder reads the journal after noting the latest checkpoint,
+/// and builds the section through that one: every leaf in it was placed
+/// before the journal was read, so it covers entries the journal must
+/// still hold (a leaf the journal contradicts stays in, and verification
+/// fails, as it should for a run rolled back after it was anchored), and
+/// no leaf of a later batch, which may cover appends made after the read,
+/// sits inside the bundle's latest tree.
+pub fn anchor_section_through(
+    log: &AnchorLog,
+    id_mode: &RunIdMode,
+    policy: &IndependencePolicy,
+    leaf_type: LeafType,
+    id: &str,
+    through: Option<u64>,
+) -> Result<AnchorSection, AnchorError> {
+    let latest = match through {
+        Some(seq) => Some(
+            log.checkpoint_meta(seq)
+                .ok_or_else(|| AnchorError::OutOfRange(format!("no checkpoint {seq}")))?,
+        ),
+        None => None,
+    };
     let latest_tree_size = latest.map_or(0, |c| c.tree_size);
     let latest_checkpoint = match latest {
         Some(c) => Some(log.checkpoint(c.seq)?.signed.note),
@@ -155,6 +186,9 @@ pub fn anchor_section(
     let leaf_id = id_mode.leaf_id(leaf_type, id);
     let mut anchors = Vec::new();
     for (leaf_index, leaf) in log.leaf_chain(leaf_type, &leaf_id)? {
+        if leaf_index >= latest_tree_size {
+            break;
+        }
         let meta = log.checkpoint_for_leaf(leaf_index).ok_or_else(|| {
             AnchorError::Corrupt(format!("leaf {leaf_index} is in no checkpoint"))
         })?;

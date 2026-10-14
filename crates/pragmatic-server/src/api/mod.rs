@@ -325,6 +325,7 @@ pub fn router(app: AppState) -> Router {
         .route("/v1/witness", post(witness::add_checkpoint))
         .route("/add-checkpoint", post(witness::add_checkpoint))
         .route("/v1/witness/log/{origin}", get(witness::log))
+        .route("/v1/witness/resume/{origin}", post(witness::resume))
         .route("/console", get(console::runs))
         .route(
             "/console/sign-in",

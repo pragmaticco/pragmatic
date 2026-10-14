@@ -186,18 +186,27 @@ async fn without_anchoring_nothing_claims_to_be_anchored() {
 async fn an_access_log_shorter_than_its_anchored_leaf_is_reported() {
     let ts = TestServer::start_anchored(|_| {}).await;
     ts.app().access.flush().await.unwrap();
-    ts.app()
+    let receipt = ts
+        .app()
         .anchor_batch(BatchReason::Interval)
         .unwrap()
         .unwrap();
+    let leaf = receipt.leaves.iter().find(|l| l.run_id.is_none()).unwrap();
+    assert!(leaf.entries >= 2);
     let mut ts = ts;
     ts.stop().await;
-    let mut leaf = pragmatic_server::access_log::read_leaf(&ts.data_dir())
-        .unwrap()
-        .unwrap();
-    leaf.entries += 1000;
-    pragmatic_server::access_log::write_leaf(&ts.data_dir(), &leaf).unwrap();
+    // Cut the log back to one record short of what was anchored.
+    let path = ts.data_dir().join("audit").join("access.journal");
+    let bytes = std::fs::read(&path).unwrap();
+    let j = pragmatic::Journal::parse(&bytes, None).unwrap().journal;
+    let mut cut = bytes[..pragmatic::journal::HEADER_LEN].to_vec();
+    for c in 0..leaf.entries - 1 {
+        cut.extend(j.frame_bytes(c).unwrap());
+    }
+    std::fs::write(&path, cut).unwrap();
+    let _ = std::fs::remove_file(ts.data_dir().join("audit").join("access.index"));
     let ts = ts.restart().await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let page = metrics(&ts).await;
     assert_eq!(
         metric(&page, "pragmatic_chain_broken_total"),
@@ -209,10 +218,14 @@ async fn an_access_log_shorter_than_its_anchored_leaf_is_reported() {
         .iter()
         .find(|r| r["kind"] == "access_log.damaged")
         .expect("the finding is in the log itself");
-    assert!(damaged["reason"]
-        .as_str()
-        .unwrap()
-        .contains("were anchored"));
+    // The restart appends records before the check runs, so the log is
+    // found either short of the leaf or with another record where the
+    // leaf's head was.
+    let reason = damaged["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("were anchored") || reason.contains("no longer has the hash anchored"),
+        "{reason}"
+    );
     let v: Value = ts
         .post_json("/v1/verify-data", &ts.admin, serde_json::json!({}))
         .await

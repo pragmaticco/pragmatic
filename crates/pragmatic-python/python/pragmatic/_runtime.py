@@ -1359,13 +1359,26 @@ class Runtime:
         commitment and ref, and erasure accounting. Truthy when intact.
 
         On a server, the journal is downloaded and checked here when the
-        token may read it; otherwise the server's own report is returned."""
+        token may read it. When the token may not (an agent without the
+        run's lease, an auditor without ``view_raw``), the server's own
+        report is returned, with the server's verdict kept. A journal the
+        server knows is damaged or missing (``chain_broken``) gives a
+        failing report; any other refusal is raised."""
         if isinstance(self._store, ServerStore):
             try:
                 return VerifyReport.from_dict(self._native.verify(run_id))
-            except (ServerError, FileNotFoundError):
-                doc = self._store.summary(run_id).get("verify") or {}
-                return VerifyReport.from_dict(doc)
+            except ServerError as e:
+                if e.code == "chain_broken":
+                    doc = dict(self._store.summary(run_id).get("verify") or {})
+                    doc["ok"] = False
+                    doc["damaged"] = doc.get("damaged") or str(e)
+                    return VerifyReport.from_dict(doc)
+                if e.status not in (401, 403, 404):
+                    raise
+            except FileNotFoundError:
+                pass
+            doc = self._store.summary(run_id).get("verify") or {}
+            return VerifyReport.from_dict(doc)
         return VerifyReport.from_dict(self._native.verify(run_id))
 
     def runs(self) -> List[RunSummary]:

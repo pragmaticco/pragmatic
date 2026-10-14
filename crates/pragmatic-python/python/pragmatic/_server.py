@@ -770,8 +770,24 @@ class ServerStore:
 
     def snapshot(self, run_id: str) -> Tuple[bytes, int, str]:
         """The run's durable journal, without a lease (auditors with
-        ``view_raw`` and admins)."""
-        return self._download(run_id, None)
+        ``view_raw`` and admins). ``replay`` and ``verify`` read it this
+        way: an agent token reads a journal only while it holds the run's
+        lease (spec 4.3), so it is refused here with a ``ServerError`` that
+        says which tokens may."""
+        try:
+            return self._download(run_id, None)
+        except ServerError as e:
+            if e.status != 403:
+                raise
+            raise ServerError(
+                f"reading run {run_id!r} without a lease (replay, verify) needs an admin token "
+                f"or an auditor token with view_raw; agent tokens read a journal only while "
+                f"they hold its lease, and auditors without view_raw see it redacted, through "
+                f"rt.entries() ({e})",
+                status=e.status,
+                code=e.code,
+                url=e.url,
+            ) from None
 
     def list(self) -> List[str]:
         return [s["run_id"] for s in self.summaries()]
@@ -852,6 +868,11 @@ class ServerStore:
             raise ValueError("only unkeyed format 2 journals can be pushed")
         if info.get("run_id") not in (None, run_id):
             raise ValueError(f"the journal belongs to run {info.get('run_id')!r}, not {run_id!r}")
+        refused = info.get("unpushable")
+        if refused:
+            # Checked before the run is created: a push the server would
+            # refuse must not leave an empty run behind.
+            raise ValueError(f"the server refuses this journal from clients: {refused}")
         frames = bytes(data[16 : info["valid_len"]])
         total = int(info["entries"])
         held, _, held_head = self.checkout(run_id, True)

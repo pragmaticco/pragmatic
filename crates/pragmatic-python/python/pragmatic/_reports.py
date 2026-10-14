@@ -15,8 +15,14 @@ class VerifyReport:
     """The full integrity check of a run's journal (spec 2.5, 2.13).
 
     Truthy when ``ok``: the chain, every commitment and every erasure check
-    out. A torn tail (``torn_bytes``) is what a crash during an append
-    leaves behind and does not make a report fail."""
+    out, and the server (when the report came from one) did not say
+    otherwise. A torn tail (``torn_bytes``) is what a crash during an
+    append leaves behind and does not make a report fail.
+
+    A server's report can fail for reasons the failure lists do not carry:
+    the run's journal is ``missing``, or ``damaged`` (it lost entries the
+    server acknowledged, so what is left may verify on its own). Those
+    reports are never truthy."""
 
     first_bad: Optional[int] = None
     """The first cursor whose chain link, commitment or ref fails."""
@@ -28,6 +34,12 @@ class VerifyReport:
     """``erasure`` notes that list slots that do not exist."""
     torn_bytes: int = 0
     """Bytes past the valid prefix (a torn tail)."""
+    missing: bool = False
+    """The server holds no journal for a run it knows was anchored."""
+    damaged: Optional[str] = None
+    """Why the stored journal is damaged, when the server says it is."""
+    server_ok: Optional[bool] = None
+    """The ``ok`` the server stated, when the report came from one."""
 
     @property
     def ok(self) -> bool:
@@ -36,6 +48,9 @@ class VerifyReport:
             and not self.unaccounted_erasures
             and not self.erasure_incomplete
             and not self.invalid_erasure_notes
+            and not self.missing
+            and self.damaged is None
+            and self.server_ok is not False
         )
 
     def __bool__(self) -> bool:
@@ -43,12 +58,19 @@ class VerifyReport:
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "VerifyReport":
+        """A report from its JSON (the server's ``verify`` or the native
+        layer's). The server's own ``ok`` is kept and honoured: a report the
+        server calls failed is never rebuilt into a passing one."""
+        stated = d.get("ok")
         return cls(
             first_bad=d.get("first_bad"),
             unaccounted_erasures=_pairs(d.get("unaccounted_erasures")),
             erasure_incomplete=_pairs(d.get("erasure_incomplete")),
             invalid_erasure_notes=tuple(int(c) for c in d.get("invalid_erasure_notes") or ()),
             torn_bytes=int(d.get("torn_bytes") or 0),
+            missing=bool(d.get("missing")),
+            damaged=str(d["damaged"]) if d.get("damaged") else None,
+            server_ok=bool(stated) if stated is not None else None,
         )
 
 

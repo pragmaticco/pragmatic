@@ -67,15 +67,31 @@ RFC 3161 token, each `tlog-witness` cosigner for a cosignature.
   `pragmatic_anchor_lag_seconds` grows.
 - Witnesses that fail are retried every 30 seconds with exponential
   backoff (to an hour) per witness, oldest checkpoint first, until each
-  succeeds. A witness failure counts in `pragmatic_anchor_failures_total`;
-  three batches in a row that end short of the policy fire the
-  `anchor_failed` webhook.
+  succeeds. A witness failure counts in `pragmatic_anchor_failures_total`.
+  The `anchor_failed` webhook fires once the oldest append not
+  independently anchored is three anchoring intervals old (checked every
+  15 seconds, so a quiet server whose witnesses are down alerts too, once
+  until anchoring catches up), and when three batches in a row end short
+  of the policy.
 - A run whose journal holds fewer entries than its latest leaf, or the
   same entries under another head, was rolled back or rewritten after it
   was anchored. The anchor log refuses it, the server marks the run
-  `regressed` (appends answer `409 regressed`) and fires `regressed`. An
-  administrator who accepts the journal runs
-  `pragmatic-server accept-regression RUN`.
+  `regressed` (at startup, or at the next batch; appends answer
+  `409 regressed`) and fires `regressed`. An administrator who accepts the
+  journal runs `pragmatic-server accept-regression RUN`. Acceptance claims
+  nothing about anchoring: the run keeps as anchored only what it still
+  holds of its independently anchored leaves (often nothing), and its
+  anchoring lag keeps counting until a new leaf is witnessed.
+- A run the anchor log holds a leaf for, whose files are gone and that has
+  no tombstone, is `missing` (webhook `record_missing`).
+- If a witness reports having cosigned more of this log than the log
+  holds, or refuses a checkpoint as inconsistent with what it cosigned,
+  the log has forgotten checkpoints it signed (it was restored from an old
+  backup, or rolled back), and signing on would fork it. Anchoring is
+  then *held*: no checkpoint is signed until an administrator lifts the
+  hold with `confirm-anchors` (see [Restoring the anchor
+  log](#restoring-the-anchor-log)), and `anchor_failed` fires with
+  `fork: true`.
 - TSA tokens are verified with OpenSSL (`openssl ts -verify -partial_chain`
   against the operator's pinned anchors) before they are stored, so
   `openssl` (OpenSSL, not LibreSSL) must be on `PATH` when TSAs are
@@ -90,11 +106,16 @@ RFC 3161 token, each `tlog-witness` cosigner for a cosignature.
 (auditors and administrators) answers a bundle (design section 5): the
 durable journal, its decoded records, its whole leaf chain with inclusion
 proofs, checkpoints, consistency proofs to the latest checkpoint and every
-stored witness result, signed with the log key. `redact` is `none` (needs
-`view_raw`, and is logged as a raw read), `detectors` (the default without
-`view_raw`), `binary` or `all`; a redacted slot is withheld whole, so the
-chain still verifies. `anchor=now` runs a batch, and its first witness
-pass, before the bundle is built. An auditor verifies the bundle offline:
+stored witness result, signed with the log key. `redact` is `none`,
+`binary` (attachments withheld, text in clear), `detectors` (the default
+without `view_raw`) or `all`; `none` and `binary` carry text unredacted, so
+they need `view_raw` and are logged as raw reads. A redacted slot is
+withheld whole, so the chain still verifies. The anchors run through the
+checkpoint that was the latest when the journal was read, which is the
+bundle's latest checkpoint; `independent` is true only when one of them is
+independently witnessed. A damaged journal answers `409 chain_broken`.
+`anchor=now` runs a batch, and its first witness pass, before the bundle
+is built. An auditor verifies the bundle offline:
 
 ```sh
 pragmatic verify-evidence case-1.evidence.json \
@@ -450,16 +471,24 @@ logged, and erasing the subjects slot removes the run from the index.
 A token without `view_raw` sees content through redaction:
 
 - Images, PDFs, audio and other binary data inside JSON (base64 image
-  blocks, `data:` URLs, `file_data`, `input_audio`, encoded bytes) are
-  replaced by `[binary media_type=... bytes=... sha256=...]` and never
-  served. JSON that is not strict (a repeated key, deep nesting) is read
-  leniently for this, so its binary fields are found too.
+  blocks, `data:` URLs, `file_data`, `b64_json`, `input_audio`, encoded
+  bytes) are replaced by `[binary media_type=... bytes=... sha256=...]`
+  and never served. JSON that is not strict (a repeated key, deep nesting)
+  is read in every copy of a repeated key for this, so its binary fields
+  are found too.
 - Text is redacted with the built-in detectors and your patterns, and so
   are JSON object keys (a map keyed by email address is common). Keys that
   redact alike get a suffix: `[email]`, `[email] (2)`.
 - Content that is not JSON is redacted as text, and any run of 256 or more
   base64 characters in it is withheld as binary.
+- A streamed model reply holds its text in deltas of a few characters,
+  where no detector sees an email or a number split across them. When its
+  reassembled text holds something a detector or pattern finds, the view
+  shows that text, redacted, instead of the events, and a `detectors`
+  bundle withholds the slot.
 - Content that is not UTF-8 is described, never served.
+- Evidence bundles for a token without `view_raw` are `detectors` or
+  `all`: `binary` withholds attachments only and leaves text in clear.
 
 Redaction is a view: the journal keeps its bytes, and an auditor with
 `view_raw` sees them. Redaction does not look inside images, PDFs or
@@ -538,8 +567,12 @@ commitment fails, when it holds fewer entries than were acknowledged or a
 different history, and when its erasure accounting does not add up
 (content erased without an `erasure` note, which is tampering). A damaged
 run refuses writes; one whose only finding is slots an erasure note lists
-that hold content again can be repaired by erasing them again.
-`verify-data` lists every damaged run in `failing_run_ids`.
+that hold content again can be repaired by erasing them again. Its verify
+report is never ok (`damaged` names why); entries, slots and the console
+show the part of it that still verifies, while a journal download and an
+evidence bundle answer `409 chain_broken`. `verify-data` lists every
+damaged and missing run in `failing_run_ids` and counts them in
+`runs_failing`.
 
 ## Witness mode
 
@@ -561,6 +594,28 @@ witness, cosigned, next}`, where each `cosigned[].checkpoint` is the signed
 note with this witness's cosignature line. An auditor's `--witness-log`
 file is `{"witness": witness, "origin": origin_line, "checkpoints": [every
 cosigned[].checkpoint, page by page, in order]}`.
+
+The witness never cosigns from a record that may have forgotten what it
+cosigned, since it could then cosign a fork of a tree it already vouched
+for: a damaged record, one that holds less than its last leaf in this
+server's anchor log, one restored from a backup, and one whose files are
+gone while the anchor log holds a leaf for it. For such an origin
+`add-checkpoint` answers `503`, and the record is never begun afresh. To
+resume, take the latest checkpoint this witness cosigned for the origin
+from outside the host (the witnessed log keeps its cosignatures; a
+Pragmatic Server keeps them under `anchors/witness/`), as the signed note
+with this witness's cosignature line, and run:
+
+```sh
+pragmatic-server witness-resume example-log --checkpoint latest-cosigned.note \
+    --reason "restored from the 2026-10-13 backup"
+```
+
+The checkpoint must carry the log's signature and this witness's valid
+cosignature, and must not be older than, or conflict with, a cosignature
+the record still holds. It is recorded as a `witness.resume` note
+(`resumed: true` in the log endpoint), and cosigning continues from it.
+`accept-regression` does not apply to witness records.
 
 ## Sizing and limits
 
@@ -641,6 +696,43 @@ run. Runs that now have fewer entries than were anchored are marked
 the restored history with `pragmatic-server accept-regression RUN`, which
 is logged. The restore itself is recorded in the access log.
 
+### Restoring the anchor log
+
+The backup's anchor log is as old as the backup, and the server went on
+signing checkpoints after it. A restored server that signed on from it
+would sign other trees under sequence numbers and sizes it already signed,
+under the same key and origin: a fork of its own log, which every
+checkpoint it handed out since (in bundles, to TSAs and witnesses)
+contradicts, and which a witness records as a fork attempt. So:
+
+- **If the anchors directory survived** (keep `<data_dir>/anchors` on its
+  own volume, or copy it off the host as it grows), restore it in place of
+  the backup's: `restore --from DIR --anchors /surviving/anchors`. It must
+  continue the backup's log (every checkpoint of the backup's is in it,
+  naming the same tree). Anchoring continues where it was, and runs the
+  log knows but the backup lacks show as `missing`.
+- **Otherwise anchoring is held** after the restore: no checkpoint is
+  signed, `anchor=now` answers `503`, and the server says so at startup.
+  With the server stopped, lift the hold one of two ways:
+  - `pragmatic-server confirm-anchors --checkpoint newest.note`, with the
+    newest checkpoint the log published (a witness's log, or the newest
+    evidence bundle's `latest_checkpoint`). It must be the restored log's
+    latest: then nothing was signed after the backup, and anchoring
+    resumes.
+  - `pragmatic-server confirm-anchors --new-log` begins a new log under a
+    new key, which is a new origin: generate it first with
+    `pragmatic-server keygen` into a new key file and point
+    `keys.signing_key_file` at it. The held log moves to
+    `anchors.retired-<ms>/` (keep it: earlier bundles verify against it),
+    the old keys' validity ends, every run is anchored in the new log
+    afresh, and an `anchors.new_log` access record names the old origin
+    and its latest checkpoint, which the new log's first batch anchors.
+    Onboard the new origin at every witness that cosigned the old one.
+
+In witness mode every restored witness record is held as well: it has
+forgotten every cosignature made after the backup. Resume each with
+`witness-resume` (see [Witness mode](#witness-mode)).
+
 **Verification.** `pragmatic-server verify-data` (on a running server, or
 `--offline` when it is stopped) re-verifies every chain, commitment and
 anchor proof and records the result in the access log. The server also runs
@@ -675,11 +767,13 @@ validity window, so earlier signatures stay checkable.
 | `token new\|revoke\|list` | manage tokens on a running server |
 | `token bootstrap` | print a fresh token and its SHA-256 for `[bootstrap]` |
 | `backup --to DIR` | copy the data directory while the server runs |
-| `restore --from DIR [--erasure-ledger FILE] [--trust-key HEX]` | restore into an empty data directory |
+| `restore --from DIR [--erasure-ledger FILE] [--trust-key HEX] [--anchors DIR]` | restore into an empty data directory; without `--anchors` anchoring is held |
+| `confirm-anchors (--checkpoint FILE \| --new-log)` | lift the hold on a restored or forked anchor log (server stopped) |
 | `verify-data [--offline]` | verify everything now |
 | `verify-evidence FILE` | points to `pragmatic verify-evidence`, the CLI an auditor verifies bundles with |
 | `migrate` | bring the data directory to this build's format |
 | `accept-regression RUN` | accept a regressed run's history (logged) |
+| `witness-resume ORIGIN --checkpoint FILE [--reason TEXT]` | resume a held witness record from the latest checkpoint it cosigned (logged) |
 
 Every command takes `--config FILE` (or `PRAGMATIC_CONFIG`). Commands that
 talk to a running server take `--url` (default: `public_url`, or

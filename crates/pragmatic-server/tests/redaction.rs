@@ -228,7 +228,7 @@ async fn bundles_and_the_console_never_show_seeded_personal_data_without_view_ra
     let (agent, _) = ts.issue("agent", &["*"], false).await;
     seeded_run(&ts, &agent, "support:1").await;
     let (auditor, _) = ts.issue("auditor", &["support:"], false).await;
-    for mode in ["", "?redact=detectors", "?redact=binary", "?redact=all"] {
+    for mode in ["", "?redact=detectors", "?redact=all"] {
         let resp = ts
             .get(
                 &run_path("support:1", &format!("/evidence{mode}")),
@@ -239,22 +239,25 @@ async fn bundles_and_the_console_never_show_seeded_personal_data_without_view_ra
         let text = resp.text().await.unwrap();
         let bundle = pragmatic::evidence::Bundle::from_json(text.as_bytes()).unwrap();
         let journal = String::from_utf8_lossy(&bundle.journal.bytes).into_owned();
-        if mode != "?redact=binary" {
-            assert!(leaks(&text).is_empty(), "{mode}: {:?}", leaks(&text));
-            assert!(
-                leaks(&journal).is_empty(),
-                "{mode} journal: {:?}",
-                leaks(&journal)
-            );
-        } else {
-            // Binary mode withholds attachments only, which it does.
-            assert!(!text.contains(&image()) && !journal.contains(&image()));
-        }
+        assert!(leaks(&text).is_empty(), "{mode}: {:?}", leaks(&text));
+        assert!(
+            leaks(&journal).is_empty(),
+            "{mode} journal: {:?}",
+            leaks(&journal)
+        );
     }
-    let resp = ts
-        .get(&run_path("support:1", "/evidence?redact=none"), &auditor)
-        .await;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // `none` and `binary` (which withholds attachments only) carry text
+    // slots in clear: refused without view_raw, never served.
+    for mode in ["none", "binary"] {
+        let resp = ts
+            .get(
+                &run_path("support:1", &format!("/evidence?redact={mode}")),
+                &auditor,
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{mode}");
+        assert!(leaks(&resp.text().await.unwrap()).is_empty());
+    }
     let cookie = console_session(&ts, &auditor).await;
     for path in [
         "/console",
@@ -304,4 +307,109 @@ async fn salts_are_never_served_in_any_view() {
         }
     }
     assert!(!body.contains("salt"));
+}
+
+/// A slot that is JSON but not strict JSON keeps its attachments withheld
+/// in every view (design 4.10): a second `type` member in an Anthropic
+/// source block does not uncover the image's base64 to an auditor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeated_key_never_uncovers_an_image_in_the_entries_view() {
+    let ts = TestServer::start(|_| {}).await;
+    let (agent, _) = ts.issue("agent", &["*"], false).await;
+    let mut png = vec![0x89u8, b'P', b'N', b'G', 13, 10, 26, 10];
+    png.extend((0..292u32).map(|i| (i * 7 % 251) as u8));
+    let b64 = base64_encode(&png);
+    let request = format!(
+        r#"{{"model":"claude","messages":[{{"role":"user","content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{b64}","type":"base64-image"}}}}]}}]}}"#
+    );
+    let mut w = Writer::create(&ts, &agent, "support:2").await;
+    w.add(note("attempt.start", json!({"attempt": 1}), vec![]));
+    w.add(Event::ChannelRecv {
+        channel: "in".into(),
+        value: Content::from(request.as_str()),
+    });
+    w.add(note(
+        "attempt.end",
+        json!({"attempt": 1, "outcome": "ok"}),
+        vec![],
+    ));
+    assert_eq!(w.push(&ts).await.status(), StatusCode::OK);
+    let (auditor, _) = ts.issue("auditor", &["support:"], false).await;
+    for path in ["/entries", "/entries/2/slots/0"] {
+        let body = ts
+            .get(&run_path("support:2", path), &auditor)
+            .await
+            .text()
+            .await
+            .unwrap();
+        assert!(!body.contains(&b64), "{path} served the image");
+        assert!(
+            body.contains("[binary media_type=image/png bytes=300"),
+            "{path}: {body}"
+        );
+    }
+}
+
+/// A model's streamed reply that repeats personal data across its token
+/// deltas: an auditor without `view_raw` sees the reassembled text with
+/// the value redacted, never the deltas, and a `detectors` bundle
+/// withholds the slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_value_split_across_stream_deltas_is_redacted_in_views_and_bundles() {
+    let ts =
+        TestServer::start_integrated(|_| {}, pragmatic_server::anchoring::Options::default()).await;
+    let (agent, _) = ts.issue("agent", &["*"], false).await;
+    let mut w = Writer::create(&ts, &agent, "support:3").await;
+    w.add(note("attempt.start", json!({"attempt": 1}), vec![]));
+    let d = w.add(Event::DrawIntent {
+        provenance: "anthropic".into(),
+        parts: vec![Content::from(r#"{"model":"claude","stream":true}"#)],
+    });
+    let mut body = String::new();
+    for delta in [
+        "A confirmation went to ",
+        "jane",
+        ".doe",
+        "@example",
+        ".com",
+        ".",
+    ] {
+        body.push_str("event: content_block_delta\ndata: ");
+        body.push_str(
+            &json!({"type": "content_block_delta", "index": 0,
+                    "delta": {"type": "text_delta", "text": delta}})
+            .to_string(),
+        );
+        body.push_str("\n\n");
+    }
+    w.add(Event::DrawResult {
+        intent: d,
+        meta: r#"{"outcome":"ok"}"#.into(),
+        head: Content::from(r#"{"status":200}"#),
+        body: Content::from(body.as_str()),
+    });
+    w.add(note(
+        "attempt.end",
+        json!({"attempt": 1, "outcome": "ok"}),
+        vec![],
+    ));
+    assert_eq!(w.push(&ts).await.status(), StatusCode::OK);
+    let (auditor, _) = ts.issue("auditor", &["support:"], false).await;
+    let view = ts
+        .get(&run_path("support:3", "/entries/3/slots/1"), &auditor)
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(view.contains("[email]"), "{view}");
+    assert!(!view.contains(".doe"), "{view}");
+    let resp = ts
+        .get(
+            &run_path("support:3", "/evidence?redact=detectors"),
+            &auditor,
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let b = pragmatic::evidence::Bundle::from_json(&resp.bytes().await.unwrap()).unwrap();
+    assert!(b.redacted_slots.contains(&(3, 1)), "{:?}", b.redacted_slots);
 }

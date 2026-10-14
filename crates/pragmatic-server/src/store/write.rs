@@ -189,6 +189,36 @@ impl Store {
         Ok(())
     }
 
+    /// Begin again the files of a missing server-written record that an
+    /// administrator resumes: meta, then the journal header. A journal or a
+    /// tombstone on disk is never replaced; a meta left without its
+    /// journal is (it describes the history that was lost, which the
+    /// record no longer claims). Call with `st.missing` cleared.
+    pub(super) fn recreate_files(&self, run: &Run, st: &mut RunState) -> Result<(), ApiError> {
+        let dir = self.layout.run_dir(&run.stem);
+        fsutil::create_dir_durable(&dir)?;
+        if self.layout.tombstone(&run.stem).exists() {
+            return Err(ApiError::run_deleted());
+        }
+        let path = self.layout.journal(&run.stem);
+        if std::fs::symlink_metadata(&path).is_ok() {
+            return Err(ApiError::storage_unavailable(
+                "the record's journal exists on disk; it is never replaced",
+            ));
+        }
+        st.meta.entries = 0;
+        st.meta.byte_len = pragmatic::journal::HEADER_LEN as u64;
+        st.meta.head = hex_encode(&Journal::new(None).head());
+        self.write_meta(run, st)?;
+        fsutil::write_atomic(&path, &pragmatic::journal::header(0))?;
+        let file = OpenOptions::new().read(true).write(true).open(&path)?;
+        st.writer = Some(Writer {
+            journal: Journal::new(None),
+            file,
+        });
+        Ok(())
+    }
+
     /// Refuse to create a run whose files exist: a tombstone is a deleted
     /// run (410); a journal or meta is a run the index could not read,
     /// which becomes unavailable (503) until it loads.
@@ -688,7 +718,7 @@ fn check_run_start(
 }
 
 /// Refuse writes to runs an admin must look at first.
-fn refuse_if_unwritable(st: &RunState) -> Result<(), ApiError> {
+pub(super) fn refuse_if_unwritable(st: &RunState) -> Result<(), ApiError> {
     if st.meta.regressed {
         return Err(ApiError::regressed());
     }

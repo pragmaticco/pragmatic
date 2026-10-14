@@ -498,3 +498,80 @@ async fn startup_never_truncates_acknowledged_entries_as_a_torn_tail() {
         .any(|e| e.file_name().to_string_lossy().contains(".torn-"));
     assert!(!moved);
 }
+
+/// A journal that lost acknowledged entries is never reported intact, and
+/// every read of it answers definitively (design 4.17): its verify report
+/// fails at the first entry it no longer holds and counts only what it
+/// holds; verify-data counts it and names it; entries and the console
+/// serve its valid prefix; a raw download and an evidence bundle (which
+/// stand for the whole history) answer `409 chain_broken`, never a dropped
+/// connection or a `503` a client would resend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_read_of_a_journal_that_lost_entries_answers_definitively() {
+    let mut ts = TestServer::start_integrated(
+        |c| c.lease_ttl_secs = 60,
+        pragmatic_server::anchoring::Options::default(),
+    )
+    .await;
+    let (agent, _) = ts.issue("agent", &["*"], false).await;
+    let mut w = Writer::create(&ts, &agent, "lost").await;
+    w.attempt(&ts, 2).await;
+    assert_eq!(w.release(&ts).await.status(), StatusCode::NO_CONTENT);
+    let before = summary(&ts, "lost").await;
+    let entries = before["entries"].as_u64().unwrap();
+    ts.stop().await;
+    let path = run_file(&ts, "lost", ".journal");
+    let bytes = std::fs::read(&path).unwrap();
+    let frames =
+        pragmatic::journal::split_frames(&bytes[pragmatic::journal::HEADER_LEN..]).unwrap();
+    let keep: usize = pragmatic::journal::HEADER_LEN
+        + frames[..frames.len() - 1]
+            .iter()
+            .map(|f| f.len())
+            .sum::<usize>();
+    std::fs::write(&path, &bytes[..keep]).unwrap();
+    let ts = ts.restart().await;
+
+    let s = summary(&ts, "lost").await;
+    let v = &s["verify"];
+    assert_eq!(v["ok"], false, "{s}");
+    assert_eq!(v["verified_entries"], entries - 1, "{s}");
+    assert_eq!(v["first_bad"], entries - 1, "{s}");
+    assert!(v["damaged"].is_string(), "{s}");
+
+    let report: Value = ts
+        .post_json("/v1/verify-data", &ts.admin, json!({}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(report["failing_run_ids"], json!(["lost"]), "{report}");
+    assert_eq!(report["runs_failing"], 1, "{report}");
+
+    let resp = ts.get(&run_path("lost", "/journal"), &ts.admin).await;
+    assert_eq!(
+        code(resp).await,
+        (StatusCode::CONFLICT, "chain_broken".to_string())
+    );
+    let resp = ts.get(&run_path("lost", "/evidence"), &ts.admin).await;
+    assert_eq!(
+        code(resp).await,
+        (StatusCode::CONFLICT, "chain_broken".to_string())
+    );
+    let page: Value = ts
+        .get(&run_path("lost", "/entries"), &ts.admin)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(page["total"], entries - 1);
+    let cookie = console_session(&ts, &ts.admin).await;
+    let resp = ts
+        .client
+        .get(format!("{}/console/runs/lost", ts.url))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

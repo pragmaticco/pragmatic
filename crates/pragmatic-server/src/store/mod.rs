@@ -187,6 +187,9 @@ pub struct VerifyCache {
     /// frame on the way in, so the report stays true for them.
     pub entries: u64,
     pub checked_at: String,
+    /// Why the stored journal is damaged, when it is (the report is then
+    /// never ok).
+    pub damaged: Option<String>,
 }
 
 /// Everything mutable about a run.
@@ -504,6 +507,13 @@ impl Store {
     }
 
     fn write_meta(&self, run: &Run, st: &mut RunState) -> Result<(), ApiError> {
+        if st.missing {
+            // A missing run has no files, and must not get a meta.json
+            // either: meta without a journal and nothing anchored is taken
+            // at startup for a run whose PUT crashed, and begun again
+            // empty, which would turn a lost history into a fresh one.
+            return Ok(());
+        }
         st.meta.leases = st.lease.iter().map(|l| l.record.clone()).collect();
         st.meta.status = self.status(st).to_string();
         crate::fsutil::write_json_atomic(&self.layout.meta(&run.stem), &st.meta)?;

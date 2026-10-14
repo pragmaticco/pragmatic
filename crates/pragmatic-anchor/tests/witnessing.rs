@@ -219,6 +219,107 @@ fn a_cosigner_always_sees_checkpoints_in_order() {
     assert!(anchorer.status().pending.is_empty());
 }
 
+/// A log that forgot checkpoints it signed (a second log under the same
+/// key and origin stands for one restored from an old backup) is told by
+/// a cosigner that it has cosigned a larger tree for the origin, and then
+/// that its next checkpoint of a size it cosigned is not the tree it
+/// cosigned. Both are fork alarms in `forks`, for the caller to stop
+/// signing: neither is a failure to retry.
+#[test]
+fn a_cosigner_that_saw_more_of_the_log_raises_a_fork_alarm() {
+    let w = InProcCosigner::new(1, 0);
+    let first = tempfile::tempdir().unwrap();
+    let (before, _) = Anchorer::open(
+        first.path(),
+        signer(),
+        vec![w.witness("w1")],
+        config(1, no_backoff()),
+    )
+    .unwrap();
+    for n in 1..=3 {
+        let out = before.run_batch(&provider(vec![snap("a", n)])).unwrap();
+        assert!(out.forks.is_empty());
+    }
+    assert_eq!(cosigned_sizes(&w), [1, 2, 3]);
+
+    // The same log, as old as a backup taken after its first batch.
+    let restored = tempfile::tempdir().unwrap();
+    let (after, _) = Anchorer::open(
+        restored.path(),
+        signer(),
+        vec![w.witness("w1")],
+        config(1, no_backoff()),
+    )
+    .unwrap();
+    let out = after.run_batch(&provider(vec![snap("b", 1)])).unwrap();
+    assert_eq!(out.committed.unwrap().tree_size(), 1);
+    assert_eq!(out.forks.len(), 1, "{:?}", out.attempts);
+    assert!(
+        out.forks[0].contains("cosigned 3 leaves"),
+        "{:?}",
+        out.forks
+    );
+    assert!(out.newly_independent.is_empty());
+
+    // A tree of the size the witness cosigned, with another root.
+    let restored = tempfile::tempdir().unwrap();
+    let (other, _) = Anchorer::open(
+        restored.path(),
+        signer(),
+        vec![w.witness("w1")],
+        config(1, no_backoff()),
+    )
+    .unwrap();
+    let out = other
+        .run_batch(&provider(vec![snap("x", 1), snap("y", 1), snap("z", 1)]))
+        .unwrap();
+    assert_eq!(out.committed.unwrap().tree_size(), 3);
+    assert_eq!(out.forks.len(), 1, "{:?}", out.attempts);
+    assert!(out.forks[0].contains("inconsistent"), "{:?}", out.forks);
+}
+
+/// An evidence section through an earlier checkpoint leaves out the
+/// leaves of later batches and proves every kept leaf against that
+/// checkpoint, which is its `latest_checkpoint`.
+#[test]
+fn an_anchor_section_through_a_checkpoint_stops_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let (anchorer, _) =
+        Anchorer::open(dir.path(), signer(), vec![], config(1, no_backoff())).unwrap();
+    anchorer.run_batch(&provider(vec![snap("a", 1)])).unwrap();
+    anchorer.run_batch(&provider(vec![snap("a", 2)])).unwrap();
+    anchorer.run_batch(&provider(vec![snap("a", 3)])).unwrap();
+    let all = anchorer.anchor_section(LeafType::Run, "a").unwrap();
+    assert_eq!(all.anchors.len(), 3);
+    let through = anchorer
+        .anchor_section_through(LeafType::Run, "a", Some(1))
+        .unwrap();
+    assert_eq!(through.anchors.len(), 2);
+    assert_eq!(through.latest_tree_size, 2);
+    let latest = through.latest_checkpoint.unwrap();
+    assert!(latest.contains("\n2\n"), "{latest}");
+    for a in &through.anchors {
+        let root = anchorer.log().root(2).unwrap();
+        assert!(
+            pragmatic::merkle::verify_consistency(
+                a.tree_size,
+                2,
+                &a.root,
+                &root,
+                &a.consistency_to_latest
+            ) || a.tree_size == 2
+        );
+    }
+    assert!(anchorer
+        .anchor_section_through(LeafType::Run, "a", None)
+        .unwrap()
+        .anchors
+        .is_empty());
+    assert!(anchorer
+        .anchor_section_through(LeafType::Run, "a", Some(9))
+        .is_err());
+}
+
 fn w2_label(w: &InProcCosigner) -> String {
     format!(
         "witness-{}",

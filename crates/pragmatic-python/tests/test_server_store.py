@@ -424,6 +424,37 @@ def test_definitive_errors_fail_the_session_and_are_never_resent(server, status,
     assert appends[-1] == status and appends.count(status) == 1
 
 
+def test_verify_keeps_the_servers_verdict_and_raises_what_it_cannot_judge(server):
+    rt = runtime(server)
+    rt.run("v", lambda ctx: ctx.tool("t", lambda: 1))
+    assert rt.verify("v"), "downloaded and checked here"
+    # A token that may not download the journal gets the server's report.
+    server.inject("GET", "/journal$", "error:403:forbidden")
+    assert rt.verify("v")
+    # A journal the server knows is damaged is a failing report, not a
+    # fallback to a cached one.
+    server.inject("GET", "/journal$", "error:409:chain_broken")
+    report = rt.verify("v")
+    assert not report and report.damaged
+    # Anything else is raised.
+    server.inject("GET", "/journal$", "error:400:bad_request")
+    with pytest.raises(pragmatic.ServerError):
+        rt.verify("v")
+
+
+def test_a_server_report_that_says_failed_is_never_rebuilt_into_a_pass():
+    from pragmatic._reports import VerifyReport
+
+    assert not VerifyReport.from_dict({"ok": False, "missing": True})
+    assert not VerifyReport.from_dict({"ok": False})
+    assert not VerifyReport.from_dict({"missing": True})
+    damaged = VerifyReport.from_dict({"ok": False, "damaged": "lost 1 entry", "first_bad": 5})
+    assert not damaged and damaged.damaged == "lost 1 entry" and damaged.first_bad == 5
+    assert VerifyReport.from_dict({"ok": True, "first_bad": None})
+    assert VerifyReport.from_dict({"first_bad": None}), "a local report carries no verdict"
+    assert not VerifyReport.from_dict({"ok": True, "first_bad": 3})
+
+
 def test_resuming_a_run_the_server_does_not_have(server):
     rt = runtime(server)
     with pytest.raises(FileNotFoundError, match="does not exist"):

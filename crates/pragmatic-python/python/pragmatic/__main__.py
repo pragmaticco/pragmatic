@@ -44,6 +44,13 @@ def _refusal(info: dict) -> Optional[str]:
             "is keyed (HMAC): only the key holder can check its chain, and server-stored runs are "
             "unkeyed so that anyone can verify them; record it again without a key to push it"
         )
+    if info.get("unpushable"):
+        return (
+            f"holds what a server accepts only from its own writers ({info['unpushable']}): a "
+            "journal erased locally (pragmatic erase), or one with server-written notes, keeps "
+            "that history only where it is. Push runs before erasing them, and erase on the "
+            "server, which records who erased what"
+        )
     return None
 
 

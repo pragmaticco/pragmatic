@@ -5,17 +5,20 @@
 //! pragmatic-server keygen [--rotate]
 //! pragmatic-server token new|revoke|list|bootstrap
 //! pragmatic-server backup --to DIR
-//! pragmatic-server restore --from DIR [--erasure-ledger FILE] [--trust-key HEX]
+//! pragmatic-server restore --from DIR [--erasure-ledger FILE] [--trust-key HEX] [--anchors DIR]
+//! pragmatic-server confirm-anchors (--checkpoint FILE | --new-log)
 //! pragmatic-server verify-data [--offline]
 //! pragmatic-server verify-evidence FILE
 //! pragmatic-server migrate
 //! pragmatic-server accept-regression RUN
+//! pragmatic-server witness-resume ORIGIN --checkpoint FILE [--reason TEXT]
 //! ```
 //!
 //! The configuration comes from `--config` or `PRAGMATIC_CONFIG`. The
-//! `token`, `accept-regression` and (online) `verify-data` subcommands talk
-//! to a running server with an admin token from `PRAGMATIC_TOKEN` or
-//! `--token-file`; nothing secret is ever taken from the command line.
+//! `token`, `accept-regression`, `witness-resume` and (online)
+//! `verify-data` subcommands talk to a running server with an admin token
+//! from `PRAGMATIC_TOKEN` or `--token-file`; nothing secret is ever taken
+//! from the command line.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -88,6 +91,22 @@ enum Command {
         /// (repeatable).
         #[arg(long = "trust-key")]
         trust_keys: Vec<String>,
+        /// The anchors directory that survived the disaster, restored in
+        /// place of the backup's (it must continue the backup's log).
+        /// Without it anchoring is held until `confirm-anchors`.
+        #[arg(long)]
+        anchors: Option<PathBuf>,
+    },
+    /// Lift the hold on a restored (or forked) anchor log (server stopped).
+    ConfirmAnchors {
+        /// The newest checkpoint the log published (a signed note): it
+        /// must be the restored log's latest.
+        #[arg(long, conflicts_with = "new_log", required_unless_present = "new_log")]
+        checkpoint: Option<PathBuf>,
+        /// Retire the held log and begin a new one under the configured
+        /// key, which must be a new log key (a new origin).
+        #[arg(long)]
+        new_log: bool,
     },
     /// Verify every chain, commitment and anchor proof now.
     VerifyData {
@@ -104,6 +123,21 @@ enum Command {
     /// Accept a regressed run's journal as its history (logged).
     AcceptRegression {
         run: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// Resume a held witness record from the latest checkpoint the witness
+    /// cosigned for the origin, taken from outside this host (logged).
+    WitnessResume {
+        /// The origin entry's configuration name.
+        origin: String,
+        /// The cosigned checkpoint: the signed note with this witness's
+        /// cosignature line.
+        #[arg(long)]
+        checkpoint: PathBuf,
+        /// Why (recorded in the access log).
+        #[arg(long, default_value = "")]
+        reason: String,
         #[command(flatten)]
         conn: Conn,
     },
@@ -212,19 +246,31 @@ fn run(cli: Cli) -> Result<String, String> {
             from,
             erasure_ledger,
             trust_keys,
+            anchors,
         } => {
             let config = load(&cli.config)?.0;
             let anchoring = OfflineAnchoring {
                 config: config.clone(),
             };
-            let report = ops::restore_trusting(
-                &config,
-                &from,
-                erasure_ledger.as_deref(),
-                &anchoring,
-                &trust_keys,
-            )?;
+            let options = ops::RestoreOptions {
+                ledger_file: erasure_ledger.as_deref(),
+                trust_keys: &trust_keys,
+                anchors_from: anchors.as_deref(),
+            };
+            let report = ops::restore_with(&config, &from, &options, &anchoring)?;
             Ok(pretty(&report))
+        }
+        Command::ConfirmAnchors {
+            checkpoint,
+            new_log,
+        } => {
+            let config = load(&cli.config)?.0;
+            let how = match (checkpoint, new_log) {
+                (Some(path), false) => ops::ConfirmAnchors::Checkpoint(path),
+                (None, true) => ops::ConfirmAnchors::NewLog,
+                _ => return Err("give exactly one of --checkpoint FILE and --new-log".into()),
+            };
+            ops::confirm_anchors(&config, &how)
         }
         Command::VerifyData { offline: true, .. } => {
             let config = load(&cli.config)?.0;
@@ -248,6 +294,19 @@ fn run(cli: Cli) -> Result<String, String> {
             let config = load(&cli.config)?.0;
             let path = format!("/v1/runs/{}/accept-regression", encode_segment(&run));
             call(&config, &conn, "POST", &path, None)
+        }
+        Command::WitnessResume {
+            origin,
+            checkpoint,
+            reason,
+            conn,
+        } => {
+            let config = load(&cli.config)?.0;
+            let text = std::fs::read_to_string(&checkpoint)
+                .map_err(|e| format!("{}: {e}", checkpoint.display()))?;
+            let path = format!("/v1/witness/resume/{}", encode_segment(&origin));
+            let body = json!({"checkpoint": text, "reason": reason});
+            call(&config, &conn, "POST", &path, Some(body))
         }
         Command::Token { conn, action } => token(&load(&cli.config)?.0, &conn, action),
     }

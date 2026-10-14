@@ -1,5 +1,6 @@
 //! Witness mode endpoints (design 4.8): `POST /add-checkpoint` (also at
-//! `POST /v1/witness`) and `GET /v1/witness/log/{origin}`.
+//! `POST /v1/witness`), `GET /v1/witness/log/{origin}` and
+//! `POST /v1/witness/resume/{origin}`.
 
 use axum::body::Body;
 use axum::extract::rejection::PathRejection;
@@ -7,7 +8,13 @@ use axum::extract::{Extension, Path, RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-use super::{blocking, need, ok, query_pairs, query_u64, read_body, AppState, Caller};
+use serde::Deserialize;
+use serde_json::json;
+
+use super::middleware::{durable_intent, intent};
+use super::{
+    blocking, need, ok, parse_json, query_pairs, query_u64, read_body, AppState, Caller, JSON_LIMIT,
+};
 use crate::error::ApiError;
 use crate::tokens::Role;
 use crate::witness::record_run_id;
@@ -34,7 +41,10 @@ pub async fn add_checkpoint(
         .cloned()
         .ok_or_else(|| ApiError::forbidden("this token is not bound to an origin"))?;
     let body = read_body(&app, &headers, body, BODY_LIMIT).await?;
-    let result = blocking(move || Ok(witness.add_checkpoint(&app.store, &origin, &body))).await?;
+    let result = blocking(move || {
+        Ok(witness.add_checkpoint(&app.store, app.hooks.anchoring.as_ref(), &origin, &body))
+    })
+    .await?;
     let (status, content_type, text) = match result {
         Ok(line) => (StatusCode::OK, "text/plain; charset=utf-8", line),
         Err(e) => (
@@ -87,4 +97,56 @@ pub async fn log(
     };
     let page = blocking(move || witness.log(&app.store, &origin, after)).await?;
     Ok(ok(page))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResumeBody {
+    /// The latest checkpoint this witness cosigned for the origin: the
+    /// signed note with this witness's cosignature line.
+    checkpoint: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// `POST /v1/witness/resume/{origin}` (admin): resume a held witness record
+/// from the latest checkpoint the witness cosigned for the origin, taken
+/// from outside this host (design 4.8, 4.13). Logged durably before it
+/// acts.
+pub async fn resume(
+    State(app): State<AppState>,
+    Extension(c): Extension<Caller>,
+    origin: Result<Path<String>, PathRejection>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, ApiError> {
+    let origin = origin
+        .map(|Path(o)| o)
+        .map_err(|e| ApiError::bad_request(format!("path: {e}")))?;
+    let p = c.principal.clone();
+    need(&p, &[Role::Admin])?;
+    let Some(witness) = app.witness.clone() else {
+        return Err(ApiError::not_found());
+    };
+    let req: ResumeBody = parse_json(&read_body(&app, &headers, body, JSON_LIMIT).await?)?;
+    if req.reason.len() > 4096 {
+        return Err(ApiError::bad_request("reason: at most 4096 bytes"));
+    }
+    let record = record_run_id(&origin);
+    durable_intent(
+        &app,
+        intent(
+            "witness_resume",
+            &p,
+            Some(&record),
+            json!({"reason": req.reason}),
+        ),
+    )
+    .await?;
+    let out = blocking(move || {
+        let anchored = super::runs::independent_leaves(&app, &record);
+        witness.resume(&app.store, &anchored, &origin, &req.checkpoint)
+    })
+    .await?;
+    Ok(ok(out))
 }

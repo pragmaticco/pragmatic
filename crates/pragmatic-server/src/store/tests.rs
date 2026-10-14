@@ -181,11 +181,13 @@ fn tips_cover_changed_runs_only() {
             run_id: Some("a".into()),
             entries: 0,
             leaf_index: 0,
+            head: pragmatic::Journal::new(None).head(),
         },
         crate::hooks::LeafPlaced {
             run_id: Some("b".into()),
             entries: 0,
             leaf_index: 1,
+            head: pragmatic::Journal::new(None).head(),
         },
     ]);
     assert!(s.anchor_tips().is_empty());
