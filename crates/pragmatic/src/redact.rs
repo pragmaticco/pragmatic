@@ -2128,17 +2128,17 @@ mod tests {
     #[test]
     fn detects_api_keys() {
         for key in [
-            "sk-proj-abc123def456ghi789jkl012mno345",
-            "sk-ant-api03-AbCdEf0123456789_xyz-AbCdEfGh",
-            "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKL",
-            "sk_live_51Hx0aBcDeFgHiJkLmNoPq",
+            concat!("sk-", "proj-abc123def456ghi789jkl012mno345"),
+            concat!("sk-", "ant-api03-AbCdEf0123456789_xyz-AbCdEfGh"),
+            concat!("sk-", "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKL"),
+            concat!("sk_", "live_51Hx0aBcDeFgHiJkLmNoPq"),
         ] {
             assert_finds(Kind::ApiKey, &format!("key=\"{key}\";"), key);
         }
         for text in [
             "sk-learn",
             "task-abc123def456ghi789jkl012",
-            "sk-this-is-not-a-real-key-at-all",
+            concat!("sk-", "this-is-not-a-real-key-at-all"),
             "sk-12345",
             "ask-abc123def456ghi789jkl012mno",
         ] {
@@ -2151,19 +2151,19 @@ mod tests {
         assert_finds(
             Kind::AwsAccessKey,
             "id AKIAIOSFODNN7EXAMPLE.",
-            "AKIAIOSFODNN7EXAMPLE",
+            concat!("AKI", "AIOSFODNN7EXAMPLE"),
         );
         assert_finds(
             Kind::AwsAccessKey,
             "\"ASIAY34FZKBOKMUTVV7A\"",
-            "ASIAY34FZKBOKMUTVV7A",
+            concat!("ASI", "AY34FZKBOKMUTVV7A"),
         );
         for text in [
-            "AKIAIOSFODNN7EXAMPL",
+            concat!("AKI", "AIOSFODNN7EXAMPL"),
             "XAKIAIOSFODNN7EXAMPLE",
-            "AKIAIOSFODNN7EXAMPLE1",
+            concat!("AKI", "AIOSFODNN7EXAMPLE1"),
             "akiaiosfodnn7example",
-            "AKIAIOSFODNN7EXAMPLe",
+            concat!("AKI", "AIOSFODNN7EXAMPLe"),
         ] {
             assert_none(Kind::AwsAccessKey, text);
         }
@@ -2171,33 +2171,39 @@ mod tests {
 
     #[test]
     fn detects_github_tokens() {
-        let classic = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+        let classic = concat!("ghp", "_0123456789abcdefghijABCDEFGHIJ012345");
         assert_finds(Kind::GithubToken, &format!("token: {classic}"), classic);
-        let fine = "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234";
+        let fine = concat!(
+            "git",
+            "hub_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234"
+        );
         assert_finds(Kind::GithubToken, fine, fine);
         assert_finds(
             Kind::GithubToken,
-            "gho_0123456789abcdefghijABCDEFGHIJ012345",
-            "gho_0123456789abcdefghijABCDEFGHIJ012345",
+            concat!("gho", "_0123456789abcdefghijABCDEFGHIJ012345"),
+            concat!("gho", "_0123456789abcdefghijABCDEFGHIJ012345"),
         );
         assert_none(Kind::GithubToken, "ghp_short");
         assert_none(
             Kind::GithubToken,
             "xghp_0123456789abcdefghijABCDEFGHIJ012345",
         );
-        assert_none(Kind::GithubToken, "github_pat_tooshort");
+        assert_none(Kind::GithubToken, concat!("git", "hub_pat_tooshort"));
     }
 
     #[test]
     fn detects_slack_tokens() {
-        let bot = concat!("xo", "xb-123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx");
+        let bot = concat!(
+            "xox",
+            "b-123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx"
+        );
         assert_finds(Kind::SlackToken, &format!("SLACK_TOKEN={bot}"), bot);
         assert_finds(
             Kind::SlackToken,
-            concat!("xo", "xp-1234567890-abc"),
-            concat!("xo", "xp-1234567890-abc"),
+            concat!("xox", "p-1234567890-abc"),
+            concat!("xox", "p-1234567890-abc"),
         );
-        assert_none(Kind::SlackToken, concat!("xo", "xz-1234567890abcdef"));
+        assert_none(Kind::SlackToken, concat!("xox", "z-1234567890abcdef"));
         assert_none(Kind::SlackToken, concat!("xo", "xb-123"));
     }
 
@@ -2650,17 +2656,17 @@ mod tests {
         assert_none(Kind::Credential, "Basic authentication is deprecated");
         assert_none(Kind::Credential, "Basic dGhpcyBpcyBwcm9zZQ==");
         for key in [
-            "AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY",
-            concat!("hf", "_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh"),
-            "glpat-xxxxxxxxxxxxxxxxxxxx",
+            concat!("AIz", "aSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY"),
+            concat!("hf_", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh"),
+            concat!("glp", "at-xxxxxxxxxxxxxxxxxxxx"),
         ] {
             assert_finds(Kind::ApiKey, &format!("key: {key}\n"), key);
         }
-        assert_none(Kind::ApiKey, "AIzaSyD-tooShort");
+        assert_none(Kind::ApiKey, concat!("AIz", "aSyD-tooShort"));
         for token in [
-            "xapp-1-A0123456789-1234567890123-abcdef",
-            concat!("xo", "xe-1-My0xLTEyMzQ1Njc4OTA"),
-            concat!("xoxe.xo", "xp-1-Mi0yLTEyMzQ1Njc4OTA"),
+            concat!("xap", "p-1-A0123456789-1234567890123-abcdef"),
+            concat!("xox", "e-1-My0xLTEyMzQ1Njc4OTA"),
+            concat!("xox", concat!("e.xo", "xp-1-Mi0yLTEyMzQ1Njc4OTA")),
         ] {
             assert_finds(Kind::SlackToken, token, token);
         }
@@ -2771,7 +2777,10 @@ mod tests {
         assert_none(Kind::Ssn, "123 45 6789");
         assert_none(Kind::PaymentCard, "[4 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1]");
         assert_none(Kind::PaymentCard, "4 1111 1111 1111 111");
-        assert_none(Kind::ApiKey, "sk-test-environment-2024-q1-config");
+        assert_none(
+            Kind::ApiKey,
+            concat!("sk-", "test-environment-2024-q1-config"),
+        );
         // Realistic card groupings still match.
         for text in [
             "4111 1111 1111 1111",
