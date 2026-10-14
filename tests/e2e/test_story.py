@@ -10,8 +10,9 @@ time-stamping authorities on loopback. Nothing leaves the machine.
     python -m pytest tests/e2e -v        # add -s to read the story as it runs
 
 It needs OpenSSL 3 on PATH (or from Homebrew on a Mac), Rust to build the
-binaries, and a Python with the SDK built (``maturin develop``) and
-``pytest``, ``anthropic``, ``openai`` and ``httpx2`` installed.
+binaries, and a Python with the SDK built (``pip install
+./crates/pragmatic-python``) and ``pytest``, ``anthropic``, ``openai`` and
+``httpx2`` installed.
 """
 
 from __future__ import annotations

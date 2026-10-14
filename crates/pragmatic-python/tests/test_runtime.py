@@ -117,6 +117,88 @@ def test_sync_wrappers_use_a_private_loop_and_refuse_a_running_one():
     asyncio.run(inside())
 
 
+def test_sync_calls_on_one_thread_share_a_private_loop_between_calls():
+    """An async client built once pools its connections on the first loop
+    that used it, so the private loop outlives a call: three calls run on
+    one loop. Each still ends as asyncio.run ends it: the caller's context
+    as it is now reaches the agent, nothing leaks from one call to the
+    next, and tasks the agent left running are cancelled."""
+    rt = pragmatic.Runtime(pragmatic.MemoryStore())
+    tag = contextvars.ContextVar("tag", default="unset")
+    loops, seen, stragglers = [], [], []
+
+    async def straggle():
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            stragglers.append("cancelled")
+            raise
+
+    async def agent(ctx):
+        loops.append(asyncio.get_running_loop())
+        seen.append(tag.get())
+        tag.set("set inside the run")
+        asyncio.get_running_loop().create_task(straggle())
+        return await ctx.atool("t", lambda: "ok")
+
+    for i in range(3):
+        tag.set(f"call {i}")
+        assert rt.run(f"r{i}", agent).output == "ok"
+        assert not loops[-1].is_closed()
+        assert stragglers == ["cancelled"] * (i + 1)
+    assert loops[0] is loops[1] is loops[2]
+    assert seen == ["call 0", "call 1", "call 2"]
+    assert tag.get() == "call 2"
+    # The private loop is never the thread's current loop.
+    with pytest.raises(RuntimeError):
+        asyncio.get_running_loop()
+
+
+def test_a_crash_closes_the_private_loop_and_the_next_call_starts_a_fresh_one():
+    rt = pragmatic.Runtime(pragmatic.MemoryStore())
+    loops = []
+
+    async def crashes(ctx):
+        loops.append(asyncio.get_running_loop())
+        await ctx.atool("t", lambda: 1)
+        raise Die()
+
+    async def fine(ctx):
+        loops.append(asyncio.get_running_loop())
+        return await ctx.atool("t", lambda: 2)
+
+    assert rt.run("before", fine).output == "2"
+    with pytest.raises(Die):
+        rt.run("crash", crashes)
+    assert loops[0] is loops[1] and loops[1].is_closed()
+    # The crashed run was checked in: it resumes on a fresh loop, and the
+    # tool's recorded result is read back.
+    assert rt.resume("crash", fine).output == "1"
+    assert loops[2] is not loops[1] and not loops[2].is_closed()
+
+
+def test_each_thread_has_its_own_private_loop():
+    rt = pragmatic.Runtime(pragmatic.MemoryStore())
+    loops = {}
+
+    async def agent(ctx):
+        loops.setdefault(threading.get_ident(), []).append(asyncio.get_running_loop())
+        return await ctx.atool("t", lambda: "ok")
+
+    def twice(n):
+        rt.run(f"a{n}", agent)
+        rt.run(f"b{n}", agent)
+
+    threads = [threading.Thread(target=twice, args=(n,)) for n in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    first, second = loops.values()
+    assert first[0] is first[1] and second[0] is second[1]
+    assert first[0] is not second[0]
+
+
 def test_cancelling_an_async_run_is_a_crash():
     rt = pragmatic.Runtime(pragmatic.MemoryStore())
 

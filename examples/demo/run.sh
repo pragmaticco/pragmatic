@@ -103,9 +103,19 @@ fi
 step "installing the Anthropic and OpenAI SDKs" \
   "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check \
   maturin anthropic openai httpx2
+# Build a wheel and install it, rather than `maturin develop`: an editable
+# install is a .pth file, which Python 3.13 and later skip when it is marked
+# hidden, and iCloud Drive marks every file of a virtual environment hidden
+# when the checkout is in Desktop or Documents.
+WHEELS="$(mktemp -d -t pragmatic-demo-wheels.XXXXXX)"
 step "building the Pragmatic Python SDK" \
-  env VIRTUAL_ENV="$VENV" PATH="$VENV/bin:$PATH" \
-  "$VENV/bin/maturin" develop --quiet --manifest-path "$ROOT/crates/pragmatic-python/Cargo.toml"
+  "$VENV/bin/maturin" build --quiet --manifest-path "$ROOT/crates/pragmatic-python/Cargo.toml" \
+  --interpreter "$VENV/bin/python" --out "$WHEELS"
+wheel=("$WHEELS"/*.whl)
+step "installing the Pragmatic Python SDK" \
+  "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check \
+  --force-reinstall --no-deps "${wheel[0]}"
+rm -rf "$WHEELS"
 step "building Pragmatic Server and the pragmatic CLI" \
   cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p pragmatic-server -p pragmatic-cli
 rm -f "$LOG"

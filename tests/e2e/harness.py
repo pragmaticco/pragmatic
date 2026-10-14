@@ -23,6 +23,7 @@ import os
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -81,6 +82,90 @@ def find_openssl() -> str:
         "cannot). On a Mac: brew install openssl@3. On Linux: install your distribution's "
         "openssl package."
     )
+
+
+#: What the agent processes import (support_agent.py).
+AGENT_MODULES = ("pragmatic", "anthropic", "openai", "httpx2")
+
+
+def hidden_pth_files(python: str = sys.executable) -> List[str]:
+    """The ``.pth`` files in ``python``'s site-packages that carry the
+    hidden flag. Python 3.13 and later skip them, so a package installed
+    as an editable ``.pth`` (``maturin develop``) cannot be imported. On a
+    Mac, iCloud Drive marks every file in a virtual environment hidden when
+    the environment sits in a folder it syncs (Desktop or Documents)."""
+    hidden_flag = getattr(stat, "UF_HIDDEN", 0)
+    if not hidden_flag:
+        return []
+    try:
+        out = subprocess.run(
+            [python, "-c", "import site, sys; print('\\n'.join(site.getsitepackages()))"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    found = []
+    for directory in out.stdout.splitlines():
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(directory, name)
+            if name.endswith(".pth") and getattr(os.lstat(path), "st_flags", 0) & hidden_flag:
+                found.append(path)
+    return found
+
+
+def import_problem(error: BaseException, python: str = sys.executable) -> str:
+    """What to tell someone whose Python cannot import what the suite needs,
+    and how to fix it."""
+    lines = [f"{python} cannot import what the agent needs: {error}"]
+    hidden = hidden_pth_files(python)
+    if hidden:
+        lines.append(
+            "Python 3.13 and later skip hidden .pth files, and these are hidden (iCloud Drive "
+            "marks the files of a virtual environment in a synced folder hidden): "
+            + ", ".join(hidden)
+        )
+        lines.append(
+            "Install the SDK without an editable .pth (pip install ./crates/pragmatic-python, "
+            "or maturin build and pip install the wheel), or keep the virtual environment "
+            "outside Desktop and Documents."
+        )
+    else:
+        lines.append(
+            "Build the SDK into this Python (pip install ./crates/pragmatic-python) and install "
+            "anthropic, openai and httpx2; examples/demo/run.sh does both."
+        )
+    return "\n  ".join(lines)
+
+
+def check_python(
+    env: Mapping[str, str],
+    modules: Sequence[str] = AGENT_MODULES,
+    python: str = sys.executable,
+) -> None:
+    """Check that ``python`` imports ``modules`` in the environment the agent
+    processes get. An SDK they cannot import is something this machine
+    lacks, so it is a ``SetupError``, never a failed check."""
+    code = "import importlib, sys\nfor m in sys.argv[1:]: importlib.import_module(m)"
+    try:
+        out = subprocess.run(
+            [python, "-c", code, *modules],
+            env=dict(env),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise SetupError(import_problem(e, python)) from None
+    if out.returncode != 0:
+        lines = [line for line in out.stderr.strip().splitlines() if line.strip()]
+        why = lines[-1] if lines else f"exit {out.returncode}"
+        raise SetupError(import_problem(RuntimeError(why), python))
 
 
 def target_dir() -> Path:

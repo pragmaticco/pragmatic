@@ -101,7 +101,11 @@ crates.io.
     Pydantic AI, LangChain (`pragmatic.integrations.langchain.journal`)
     and LangGraph.
   - `arun`, `aresume` and `areplay` run in your event loop; a `Runtime`
-    can be shared across threads.
+    can be shared across threads. `run`, `resume` and `replay` drive an
+    async agent on a private event loop that each thread keeps from one
+    call to the next, so an async client built once (`pragmatic.wrap` at
+    module level, or a framework's default client) keeps its pooled
+    connections from run to run.
   - Pragmatic Server as a store: `Runtime("https://...", token=...)` or
     `PRAGMATIC_URL` and `PRAGMATIC_TOKEN`, with leases renewed in the
     background. `python -m pragmatic push` uploads local format 2
@@ -127,7 +131,10 @@ crates.io.
   offline with pinned roots in both verifiers, is `UNANCHORED` with
   unrelated roots and fails with one byte changed. `tests/e2e` asserts the
   same steps against the real binaries, in CI and with outbound network
-  blocked.
+  blocked. The demo installs the SDK from a wheel rather than as an
+  editable `.pth` file, which Python 3.13 and later skip when iCloud Drive
+  marks it hidden, and both report a Python that cannot import the SDK as
+  a setup problem with its fix.
 - **Documentation:** `docs/threat-model.md`, `docs/compliance.md` (a
   mapping of record-keeping rules to what Pragmatic provides and what the
   customer is responsible for), `docs/privacy.md`, `docs/server.md`,
@@ -150,8 +157,9 @@ crates.io.
   - `Runtime` methods take `&self`, and `Runtime` is `Send + Sync` when its
     oracle is. `begin` and `Attempt::finish` expose attempts directly.
   - `Runtime::verify` returns a `VerifyReport` instead of
-    `Result<(), Cursor>`; `Journal::verify` stays as the chain-only check
-    and `Journal::audit` is the full check.
+    `Result<(), Cursor>`; `Journal::verify` checks every commitment, ref
+    and chain link, and `Journal::audit` adds erasure accounting and
+    returns a `VerifyReport`.
   - `Event` gains the format 2 kinds (`DrawIntent` and `DrawResult` replace
     `OracleDraw`; `EffectResult` replaces `EffectCommit` and
     `EffectCompensated`; new `Random`, `Fork`, `Marker`, `Note` and

@@ -27,7 +27,12 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "tests" / "e2e"))
 
 import harness  # noqa: E402
-from story import Narrator, Story  # noqa: E402
+
+try:
+    from story import Narrator, Story  # noqa: E402
+except ImportError as e:
+    print(f"This computer is missing something the demo needs:\n  {harness.import_problem(e)}")
+    sys.exit(2)
 
 INTRO = """\
 Pragmatic: the system of record for AI agents
@@ -47,6 +52,11 @@ def main() -> int:
     p.add_argument("--open", action="store_true", help="open the auditor's report at the end")
     p.add_argument("--keep-running", action="store_true", help="leave the server running until Ctrl-C")
     args = p.parse_args()
+    # Show each line as it is told, also when the output goes to a pipe or a
+    # log (tee, CI) rather than a terminal.
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(line_buffering=True)
 
     work = Path(tempfile.mkdtemp(prefix="pragmatic-demo-"))
     narrator = Narrator()
@@ -77,7 +87,8 @@ All 8 steps passed in {elapsed:.0f} seconds.
 What the demo left behind, in {work}:
   the auditor's report     {story.report_html}
   the evidence bundle      {story.bundle}
-  the server's data        {story.server.data_dir if story.server else ''}"""
+  the server's data        {story.server.data_dir if story.server else ''}""",
+        flush=True,
     )
     if args.open and story.report_html is not None and sys.platform == "darwin":
         subprocess.run(["open", str(story.report_html)], check=False)
@@ -87,7 +98,8 @@ What the demo left behind, in {work}:
             f.write(story.admin + "\n")
         print(
             f"\nThe server is still running: sign in to {story.api.url}/console with the "
-            f"administrator token in {token_file}. Ctrl-C stops it."
+            f"administrator token in {token_file}. Ctrl-C stops it.",
+            flush=True,
         )
         try:
             while story.server.proc is not None and story.server.proc.poll() is None:

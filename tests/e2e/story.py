@@ -280,6 +280,9 @@ class Story:
         )
         self.openssl_dir = harness.find_openssl()
         self.env = harness.child_env(self.openssl_dir)
+        # The agent runs as separate processes: check they can import the
+        # SDKs before anything starts, so a broken install reads as one.
+        harness.check_python(self.env)
         openssl = os.path.join(self.openssl_dir, "openssl")
         self.tsas = local_tsa.start_tsas(self.work, OPERATORS, openssl)
         for op, t in self.tsas.items():
