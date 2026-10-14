@@ -174,6 +174,27 @@ fn fail<T>(what: &str, e: impl fmt::Display) -> Result<T, StartError> {
     Err(StartError(format!("{what}: {e}")))
 }
 
+/// How the console names one configured TSA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TsaLabel {
+    /// The operator, canonical, as its witnesses carry it.
+    pub operator: String,
+    /// `[anchoring] tsa` `name`, or empty.
+    pub name: String,
+    /// The root its pinned anchors chain to, when it can be read.
+    pub root: Option<String>,
+}
+
+fn tsa_labels(tsa: &[crate::config::TsaConfig]) -> Vec<TsaLabel> {
+    tsa.iter()
+        .map(|t| TsaLabel {
+            operator: pragmatic_anchor::operator::canonical_operator(&t.operator),
+            name: t.name.trim().to_string(),
+            root: pragmatic_anchor::tsa::anchor_root_name(&t.roots_pem),
+        })
+        .collect()
+}
+
 /// Everything a request handler can reach.
 pub struct App {
     pub config: Config,
@@ -203,6 +224,10 @@ pub struct App {
     pub access_leaf: std::sync::Mutex<Option<AccessLeaf>>,
     /// The anchoring-lag alert has fired and not yet cleared.
     pub lag_alerted: AtomicBool,
+    /// How the console names each configured TSA: its operator as
+    /// witnesses carry it, the configured display name (or empty), and the
+    /// root its pinned anchors chain to, read once at startup.
+    pub tsa_labels: Vec<TsaLabel>,
     pub limits: Limits,
     /// Request body bytes being received, in [`BODY_UNIT`]s.
     pub body_budget: Arc<tokio::sync::Semaphore>,
@@ -639,6 +664,7 @@ pub async fn start_with(
         .or_else(|e| fail(&format!("listen {addr}"), e))?;
     let addr = listener.local_addr().or_else(|e| fail("listen", e))?;
 
+    let tsa_labels = tsa_labels(&config.anchoring.tsa);
     let app = Arc::new(App {
         config,
         config_sha256,
@@ -662,6 +688,7 @@ pub async fn start_with(
         anchor_soon,
         access_leaf: std::sync::Mutex::new(access_leaf),
         lag_alerted: AtomicBool::new(false),
+        tsa_labels,
         body_budget,
         limits,
     });

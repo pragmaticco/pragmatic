@@ -131,10 +131,14 @@ crates.io.
   intent and its results together, with the recorded content as a quoted
   excerpt or a gist of data, and opens to the entries. Record keeping
   written after a run has its own group, and the Run card lists the
-  attempts and failures to jump to. The runs list speaks the same
-  language. Pragmatic Server's console asks for confirmation before
-  erasing, removing a hold, revoking a token or running retention, and
-  answers failed requests with pages instead of JSON.
+  attempts (with the token that recorded each, never the user and machine
+  the SDK ran as) and failures to jump to. The Anchoring card names each
+  timestamp service as configured (`[anchoring] tsa` `name`) with the root
+  its pinned anchors chain to, and the time they vouch for to the second.
+  The runs list speaks the same language. Pragmatic Server's console asks
+  for confirmation before erasing, removing a hold, revoking a token or
+  running retention, and answers failed requests with pages instead of
+  JSON.
 - **A one-command demo and an end-to-end suite.** `examples/demo/run.sh`
   tells the whole story on one machine against a real Pragmatic Server and
   two local timestamp authorities: a support agent crashes mid-refund and

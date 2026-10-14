@@ -624,11 +624,17 @@ fn anchor_status(app: &AppState, run_id: &str) -> Option<pragmatic_console::Anch
             } else {
                 WitnessTrust::Operator
             };
+            // A configured TSA's name and the root its pinned anchors
+            // chain to: shown, never counted.
+            let label = matches!(wit, Witness::Rfc3161 { .. })
+                .then(|| app.tsa_labels.iter().find(|l| l.operator == operator))
+                .flatten();
             AnchorWitness {
+                name: label.map(|l| l.name.clone()).filter(|n| !n.is_empty()),
+                root: label.and_then(|l| l.root.clone()),
                 operator,
                 kind: kind.to_string(),
                 trust,
-                root: None,
             }
         })
         .collect();
@@ -681,6 +687,18 @@ pub async fn run(
             .map_err(|e| ApiError::chain_broken(&e.to_string()))?;
         drop(durable);
         let anchor = anchor_status(&a, &run);
+        // The principal of each token, to name the one that recorded each
+        // attempt: personal data, so only for a viewer who sees content
+        // raw (as the access log does).
+        let principals: Vec<(String, String)> = if v.view_raw {
+            a.tokens
+                .list()
+                .into_iter()
+                .map(|t| (t.id, t.principal))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let from = from.min(journal.len());
         let shown = (from, from.saturating_add(PAGE_ENTRIES).min(journal.len()));
         let data = ConsolePage::Run {
@@ -692,6 +710,7 @@ pub async fn run(
             anchor: anchor.as_ref(),
             from,
             redactor: (!v.view_raw).then_some(a.redactor.as_ref()),
+            principals: &principals,
             notice: notice.as_ref(),
         };
         Ok((render(&a, &data, StatusCode::OK), shown))

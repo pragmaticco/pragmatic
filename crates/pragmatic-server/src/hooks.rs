@@ -538,6 +538,10 @@ pub enum ConsolePage<'a> {
         from: u64,
         /// Set when the viewer may not see content raw.
         redactor: Option<&'a Redactor>,
+        /// Who each token is, as `(token id, principal)`, so the page can
+        /// name the token that recorded each attempt. Empty for a viewer
+        /// who may not see content raw.
+        principals: &'a [(String, String)],
         notice: Option<&'a ConsoleNotice>,
     },
     AccessLog {

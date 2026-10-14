@@ -20,7 +20,7 @@ use pragmatic::redact::binary;
 
 use crate::html::{diamond, document, empty, esc, masthead, mono, notice, Crumb, Frame, Page};
 use crate::rows::{Facts, Liveness};
-use crate::run::{time_words, timeline, RunView};
+use crate::run::{time_words, timeline, when, RunView};
 use crate::text;
 
 /// The verification report and timeline of a bundle as a page.
@@ -71,19 +71,6 @@ pub fn render_evidence(bundle: &Bundle, report: &EvidenceReport) -> String {
             ..Page::default()
         },
     )
-}
-
-/// An RFC 3339 UTC time as the console sets it in a sentence: `14 Oct
-/// 2026, 04:01:30 UTC`, the time in mono and kept on one line.
-fn when(rfc: &str) -> String {
-    match (rfc.get(11..19), rfc.len() >= 20) {
-        (Some(hms), true) if rfc.as_bytes().get(10) == Some(&b'T') => format!(
-            "{}, <span class=\"m nw\">{}</span> UTC",
-            esc(&text::day_of(rfc)),
-            esc(hms)
-        ),
-        _ => format!("<span class=\"m nw\">{}</span>", esc(&text::clip(rfc, 40))),
-    }
 }
 
 /// `1 operator`, `2 operators`.
@@ -276,8 +263,9 @@ fn checks(r: &EvidenceReport) -> String {
     }
     format!(
         "<section class=\"sect\"><h2 class=\"rhead\">Checks</h2><p class=\"lede\">Numbered by \
-         the steps of the verification procedure, which <span class=\"m\">pragmatic \
-         verify-evidence --explain</span> prints. A step with more than one check shows its \
+         the steps of the verification procedure, which <span class=\"m\"><span class=\"nw\">pragmatic</span> \
+         <span class=\"nw\">verify-evidence</span> <span class=\"nw\">--explain</span></span> \
+         prints. A step with more than one check shows its \
          number once, and a step this bundle gives nothing to check is left out.</p>\
          <div class=\"tsheet\"><div class=\"tscroll\">\
          <table class=\"stack\"><caption class=\"sr-only\">Checks</caption><thead><tr>\
@@ -536,7 +524,7 @@ mod tests {
     fn times_and_flags_are_set_as_data() {
         assert_eq!(
             when("2026-10-14T04:01:30Z"),
-            "14 Oct 2026, <span class=\"m nw\">04:01:30</span> UTC"
+            "14\u{a0}Oct\u{a0}2026, <span class=\"m nw\">04:01:30</span>\u{a0}UTC"
         );
         assert_eq!(when("<x>"), "<span class=\"m nw\">&lt;x&gt;</span>");
         assert_eq!(

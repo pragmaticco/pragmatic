@@ -94,7 +94,7 @@ const STYLE: &str = r###"
   --gut: clamp(16px, 4vw, 40px);
   --link-rule: var(--ink-30);
   --step: 18px;
-  --side: 372px;
+  --side: 380px;
   /* Paper, always, as on the website: the console has no dark scheme. */
   color-scheme: light;
 }
@@ -239,25 +239,27 @@ h1.title { font-size: 32px; line-height: 1.12; letter-spacing: -.012em; text-wra
 .run-grid { display: grid; gap: 24px; align-items: start; }
 .side { display: grid; gap: 16px; align-content: start; align-items: start; min-width: 0; }
 .side > .stick { display: grid; gap: 16px; min-width: 0; }
-@container main (min-width: 940px) {
-  .run-grid { grid-template-columns: minmax(0, 1fr) clamp(320px, 30cqi, var(--side)); }
+/* Beside the sheet only where a card is wide enough for its labels and
+   values on one line each; below that the cards go under the sheet. */
+@container main (min-width: 1180px) {
+  .run-grid { grid-template-columns: minmax(0, 1fr) var(--side); }
   /* The side column runs the sheet's length; its last part (the attempts
      and failures to jump to) stays in view while a long timeline scrolls. */
   .side { align-self: stretch; grid-template-rows: auto; }
 }
 @media (min-height: 640px) {
-  @container main (min-width: 940px) {
+  @container main (min-width: 1180px) {
     .side > .stick { position: sticky; top: 16px; max-height: calc(100vh - 32px); overflow-y: auto;
                      scrollbar-width: thin; margin: -10px -10px 0; padding: 10px 10px 40px; }
     .side > .stick:has(details[open]) { position: static; max-height: none; overflow: visible; }
   }
 }
-/* Under the sheet, between 640px and 940px: the cards in two columns that
-   fill from the top, so no card is stretched or left alone. */
-@container main (min-width: 640px) and (max-width: 939px) {
-  .side { display: block; column-count: 2; column-gap: 16px; }
-  .side > .stick { display: block; }
-  .side .card, .side .erase { break-inside: avoid; margin-bottom: 16px; }
+/* Under the sheet, between 640px and 1180px: the cards in two columns,
+   none stretched. The Evidence check card, the tallest, takes the second
+   column; Anchoring and the Run card share the first. */
+@container main (min-width: 640px) and (max-width: 1179px) {
+  .side { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .side > .check { grid-row: span 2; }
 }
 @container main (max-width: 639px) {
   .side .erase { margin-top: 0; }
@@ -365,7 +367,7 @@ details[open] > summary.sum .t { display: block; overflow: visible; }
 .dl { display: grid; grid-template-columns: minmax(0, 156px) minmax(0, 1fr); column-gap: 12px; margin-top: 10px;
       font-family: var(--mono); font-size: 12.5px; line-height: 21px; }
 .dl dt { color: var(--ink-64); }
-.dl dd { min-width: 0; overflow-wrap: anywhere; }
+.dl dd { min-width: 0; overflow-wrap: anywhere; text-wrap: pretty; }
 .dl dd .q, .dl dd.q { font-family: var(--serif); font-style: italic; font-size: 14.5px; color: var(--ink-64); }
 .dl .hr { grid-column: 1 / -1; height: 1px; background: var(--ink-12); margin: 6px 0 7px; }
 .dl .res { display: flex; align-items: center; }
@@ -400,10 +402,14 @@ pre .js { color: var(--ink-70); }
   .sum .tm, .cols .c-time { display: none; }
   .cols .c-hash { display: inline; }
 }
+/* On a phone a row is its title and its entries: the kinds line wraps
+   between entries rather than cutting their numbers off, and the entry
+   hash, in the expanded row, leaves the summary. */
 @container sheet (max-width: 480px) {
-  .sum { grid-template-areas: "t t" "k h"; column-gap: 10px; }
+  .sum { grid-template-columns: minmax(0, 1fr); grid-template-areas: "t" "k"; }
   .sum .t { -webkit-line-clamp: 3; line-clamp: 3; }
-  .sum .k, .sum .h { font-size: 12px; }
+  .sum .k { font-size: 12px; white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: normal; }
+  .sum .h, .cols .c-hash { display: none; }
   .row { --step: 12px; }
 }
 @container sheet (max-width: 340px) {
@@ -411,11 +417,10 @@ pre .js { color: var(--ink-70); }
   .cols, .grp-label, .pager { padding-left: 42px; padding-right: 16px; }
   .tl::before, .grp.after::before { left: 21px; }
   .row { --rails: repeating-linear-gradient(to right, var(--ink-12) 0 1px, transparent 1px var(--step)) 21px 0 / calc((var(--d) + 1) * var(--step)) 100% no-repeat; }
-  .sum { grid-template-columns: minmax(0, 1fr); grid-template-areas: "t" "k" "h"; padding: 8px 16px 9px calc(42px + var(--d) * var(--step)); }
+  .sum { padding: 8px 16px 9px calc(42px + var(--d) * var(--step)); }
   .sum::before { left: calc(18px + var(--d) * var(--step)); }
   .mk-big .sum::before, .mk-alarm-big .sum::before { left: calc(17px + var(--d) * var(--step)); }
   .mk-aside .sum::before { left: calc(19px + var(--d) * var(--step)); }
-  .sum .h { justify-self: start; }
   .detail { margin: 0 12px 8px 30px; padding: 12px 12px 14px; }
   .dl { grid-template-columns: minmax(0, 1fr); }
   .chain { padding: 13px 16px 14px; }
@@ -423,9 +428,12 @@ pre .js { color: var(--ink-70); }
 
 /* ── Leaves: the side cards ── */
 .card { position: relative; min-width: 0; background: var(--leaf); box-shadow: var(--lift-1); container: card / inline-size; }
-@container card (max-width: 360px) {
-  .card .dl { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 8px; }
-  .card .dl.n { grid-template-columns: minmax(0, 92px) minmax(0, 1fr); }
+/* In a card narrower than the side column the check's labels sit above
+   their values, so neither is broken across lines. */
+@container card (max-width: 379px) {
+  .card .dl:not(.n) { grid-template-columns: minmax(0, 1fr); }
+  .card .dl:not(.n) dt { line-height: 18px; }
+  .card .dl:not(.n) dd { margin-bottom: 6px; }
 }
 .card-h { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 15px 18px 12px;
           border-bottom: 1px solid var(--ink-12); }
@@ -442,10 +450,14 @@ pre .js { color: var(--ink-70); }
 .card-b .note, .card-f .note { font-style: italic; font-size: 14.5px; color: var(--ink-64); }
 .card-b p .m, .card-f p .m { font-size: 12.5px; }
 .card .dl { margin-top: 0; grid-template-columns: minmax(0, 160px) minmax(0, 1fr); column-gap: 10px; font-size: 12.5px; line-height: 21px; }
-.card .dl.n { grid-template-columns: minmax(0, 92px) minmax(0, 1fr); }
+.card .dl.n { grid-template-columns: minmax(0, 80px) minmax(0, 1fr); column-gap: 8px; }
 .card .dl dd.full { grid-column: 1 / -1; margin: 0 0 3px; color: var(--ink-70); overflow-wrap: anywhere;
                     -webkit-user-select: all; user-select: all; }
 .card .dl dd .s { font-family: var(--serif); font-style: italic; font-size: 14.5px; color: var(--ink-64); }
+/* Hashes and ids never break: each is one unit, cut with an ellipsis only
+   if it is wider than the whole column. */
+.dl dd .id { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+             vertical-align: top; }
 /* A command: one line, or broken before its options with an indent. */
 .cmd { display: block; margin-top: 4px; font-family: var(--mono); font-size: 12.5px; line-height: 1.6; color: var(--ink);
        white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -456,14 +468,17 @@ pre .js { color: var(--ink-70); }
 .card-f .dls { list-style: none; margin-top: 6px; display: grid; gap: 2px; font-size: 15.5px; line-height: 1.5; }
 .anchor .card-h { border-bottom: 0; align-items: flex-start; padding-bottom: 13px; }
 .anchor .card-t::before { align-self: flex-start; margin-top: .5em; }
-.rule { position: relative; height: 1px; background: var(--ink-12); }
-.rule > span { position: absolute; left: 0; top: 0; bottom: 0; background: var(--ink); }
+.rule { height: 1px; background: var(--ink-12); }
+/* A partial anchor's share: a short bar on a track, inside the card. */
+.meter { position: relative; height: 2px; margin: 4px 0 12px; background: var(--ink-12); }
+.meter > span { position: absolute; left: 0; top: 0; bottom: 0; background: var(--ink-70); }
 .ops { list-style: none; padding: 8px 0 4px; }
 .op { display: grid; grid-template-columns: 14px minmax(0, 1fr) auto; column-gap: 8px; align-items: baseline; padding: 6px 18px; }
 .op > i { width: 6px; height: 6px; align-self: center; justify-self: center; background: var(--ink); transform: rotate(45deg); }
 .op > i.o { background: transparent; box-shadow: inset 0 0 0 1.2px var(--ink); }
 .op > i.a { background: var(--alarm); }
 .op .nm { font-size: 16px; line-height: 1.35; overflow-wrap: anywhere; }
+.op .nm.m { font-size: 13.5px; overflow-wrap: normal; }
 .op .st { font-family: var(--mono); font-size: 12.5px; color: var(--ink-64); white-space: nowrap; }
 .op .root { grid-column: 2 / -1; font-style: italic; font-size: 14px; line-height: 1.4; color: var(--ink-64); }
 .anchor .card-b { padding-top: 10px; }
@@ -475,7 +490,7 @@ pre .js { color: var(--ink-70); }
 .jl { list-style: none; }
 .jl li { border-top: 1px solid var(--ink-12); }
 .jl li:first-child { border-top: 0; }
-.jl a, .jl .ja { display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: 12px; align-items: baseline;
+.jl a, .jl .ja { display: flex; flex-wrap: wrap; justify-content: space-between; column-gap: 12px; align-items: baseline;
                  padding: 6px 0 7px; font-style: normal; background: none; }
 .jl .w { justify-self: start; font-size: 15.5px; line-height: 1.45; }
 .jl .w .m { font-size: 12.5px; }
@@ -484,10 +499,14 @@ pre .js { color: var(--ink-70); }
            transition: background-size .45s var(--ease); }
 @media (hover: hover) and (pointer: fine) { .jl a:hover .w { background-size: 100% 1px, 100% 1px; } }
 .jl a:focus-visible .w { background-size: 100% 1px, 100% 1px; }
-.jl .out { justify-self: end; font-style: italic; font-size: 15px; line-height: 1.45; color: var(--ink-70); text-align: right; }
+/* The outcome sits at the right of its attempt, or under it, left, where
+   the two do not fit on one line. */
+.jl .out { font-style: italic; font-size: 15px; line-height: 1.45; color: var(--ink-70); }
 .jl .out .m { font-size: 12.5px; color: var(--ink-64); }
-.jl .who { grid-column: 1 / -1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-           font-family: var(--mono); font-size: 12.5px; line-height: 1.6; color: var(--ink-64); }
+/* When it began, who recorded it and its process: the line breaks only
+   between them, never inside one. */
+.jl .who { flex-basis: 100%; min-width: 0; font-family: var(--mono); font-size: 12.5px; line-height: 1.6; color: var(--ink-64); }
+.jl .who .nw { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; vertical-align: top; }
 .jl .more { padding: 6px 0 2px; font-style: italic; font-size: 14.5px; color: var(--ink-64); }
 
 /* Erasure, for administrators: a quiet disclosure at the end of the side
@@ -516,7 +535,10 @@ input[type=text], input[type=password], input:not([type]), select {
   background: var(--leaf); color: var(--ink); font-family: var(--serif); font-size: 16px; line-height: 1.4;
   -webkit-appearance: none; appearance: none; }
 input.m, select.m { font-family: var(--mono); font-size: 13.5px; }
-input:focus, select:focus { outline: none; border-color: var(--ink); box-shadow: inset 0 0 0 .5px var(--ink); }
+/* A text field shows focus with its edge in ink, doubled; a checkbox
+   keeps a ring of its own, since its native paint hides any edge. */
+input[type=text]:focus, input[type=password]:focus, input:not([type]):focus, select:focus {
+  outline: none; border-color: var(--ink); box-shadow: inset 0 0 0 1px var(--ink); }
 input[aria-invalid=true] { border-color: var(--alarm); }
 select { padding-right: 28px; cursor: pointer; }
 .sel { position: relative; }
@@ -524,6 +546,7 @@ select { padding-right: 28px; cursor: pointer; }
               -webkit-mask: CHEVRON center / contain no-repeat; mask: CHEVRON center / contain no-repeat; pointer-events: none; }
 .cbox { display: flex; align-items: baseline; gap: 9px; font-size: 16px; line-height: 1.4; cursor: pointer; }
 .cbox input { flex: none; width: 16px; height: 16px; accent-color: var(--ink); transform: translateY(2px); }
+.cbox input:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
 .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px; margin-top: 18px; }
 .btn { display: inline-flex; align-items: center; justify-content: center; min-height: 38px; padding: 8px 18px 9px;
        border: 0; border-radius: 0; background: transparent; color: var(--ink); box-shadow: inset 0 0 0 1px var(--ink);
@@ -725,7 +748,7 @@ tr.revoked td { color: var(--ink-64); }
   .dm.o, .mk-hollow .sum::before, .mk-alarm-hollow .sum::before, .mk-breathe .sum::before, .card-t.o::before, .op > i.o,
   .rr.mk-hollow::before, .rr.mk-alarm-hollow::before, .rr.mk-breathe::before, .erase > summary::before {
     background: Canvas; }
-  .rule > span { background: none; border-top: 1px solid CanvasText; }
+  .meter > span { forced-color-adjust: none; background: CanvasText; }
   .tag { border: 1px solid CanvasText; box-shadow: none; }
   .btn { border: 1px solid ButtonText; }
   input, select { border: 1px solid FieldText; }
@@ -1221,6 +1244,38 @@ mod tests {
         // Fields have an edge of at least 3:1, and keep it in forced colours.
         assert!(p.contains("--field: rgba(26,23,18,.55);"));
         assert!(p.contains("input, select { border: 1px solid FieldText; }"));
+        // No rule that removes the focus outline reaches a checkbox, whose
+        // native paint hides the edge a text field shows focus with: every
+        // selector of such a rule names a text field, a select, or main.
+        let css = stylesheet(Fonts::Inline);
+        let mut rest = css.as_str();
+        let mut checked = 0;
+        while let Some(i) = rest.find("outline: none") {
+            let open = rest[..i].rfind('{').unwrap();
+            let start = rest[..open].rfind('}').map_or(0, |k| k + 1);
+            for sel in rest[start..open].split(',').map(str::trim) {
+                let sel = sel.rsplit('\n').next().unwrap().trim();
+                let text_field = [
+                    "input[type=text]",
+                    "input[type=password]",
+                    "input:not([type])",
+                ]
+                .iter()
+                .any(|f| sel.starts_with(f));
+                assert!(
+                    !sel.contains("input") || text_field,
+                    "{sel} removes the focus outline of a checkbox"
+                );
+                assert!(!sel.starts_with('*') && !sel.starts_with(":focus"), "{sel}");
+                checked += 1;
+            }
+            rest = &rest[i + 1..];
+        }
+        assert!(checked >= 4, "{checked}");
+        // A checkbox has a ring of its own.
+        assert!(css.contains(
+            ".cbox input:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }"
+        ));
     }
 
     #[test]

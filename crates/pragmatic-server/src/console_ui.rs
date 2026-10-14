@@ -68,6 +68,7 @@ impl ConsoleRenderer for ConsoleUi {
                 anchor,
                 from,
                 redactor,
+                principals,
                 notice,
             } => {
                 let path = format!("/console/runs/{}", encode(run_id));
@@ -93,6 +94,7 @@ impl ConsoleRenderer for ConsoleUi {
                     notices: &notices,
                     evidence: evidence.as_deref(),
                     erase: erase.as_deref(),
+                    principals,
                 };
                 let view = RunView {
                     anchor: *anchor,
@@ -220,18 +222,23 @@ fn chrome(viewer: &ConsoleViewer, current: &str) -> (String, String) {
     } else {
         "content redacted"
     };
-    let footer = format!(
-        "Signed in as {} ({}, {raw}) \u{b7} {}",
+    let mut footer = format!(
+        "Signed in as {} ({}, {raw})",
         mono(&text::clip(&viewer.name, 64)),
         esc(&role_words(&viewer.role)),
-        licensee_text(&viewer.licensee)
     );
+    let licensee = licensee_text(&viewer.licensee);
+    if !licensee.is_empty() {
+        footer.push_str(&format!(" \u{b7} {licensee}"));
+    }
     (nav, footer)
 }
 
+/// "Licensed to Example Corp", or nothing when no licensee is configured:
+/// the console's own chrome does not carry a configuration note.
 fn licensee_text(licensee: &str) -> String {
     if licensee.is_empty() {
-        "No licensee configured".to_string()
+        String::new()
     } else {
         format!("Licensed to {}", esc(&text::clip(licensee, 120)))
     }
@@ -349,9 +356,12 @@ fn sign_in(error: Option<&str>, note: Option<&str>, licensee: &str, csrf: &str) 
          <input class=\"m\" id=\"token\" type=\"password\" name=\"token\" autocomplete=\"off\" \
          required{invalid}></div>\
          <div class=\"actions\"><button class=\"btn\" type=\"submit\">Sign in</button></div>\
-         </form></section><p class=\"under\">{}</p>",
+         </form></section>{}",
         csrf_field(csrf),
-        licensee_text(licensee)
+        Some(licensee_text(licensee))
+            .filter(|l| !l.is_empty())
+            .map(|l| format!("<p class=\"under\">{l}</p>"))
+            .unwrap_or_default()
     ));
     document(
         &frame,
@@ -1450,7 +1460,8 @@ mod tests {
         every_form_has_csrf(&html, "s1gn");
         assert!(html.contains("&lt;no&gt;"));
         assert!(html.contains("You are signed out."));
-        assert!(html.contains("No licensee configured"));
+        assert!(!html.contains("No licensee") && !html.contains("Licensed to"));
+        assert!(!html.contains("class=\"under\""));
         assert!(html.contains("aria-invalid=\"true\""));
     }
 

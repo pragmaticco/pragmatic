@@ -208,6 +208,8 @@ async fn the_console_signs_in_shows_runs_redacted_and_guards_its_forms() {
     );
     let html = a.page("/console/runs/case-1").await;
     assert!(html.contains("Content is redacted for you"));
+    // Who recorded each attempt is personal data: withheld here.
+    assert!(!html.contains("agent@example.test"));
     assert!(!html.contains("jane.doe@example.com"));
     assert!(html.contains("[email]"));
     assert!(!html.contains("<script>alert"));
@@ -277,6 +279,12 @@ async fn the_console_signs_in_shows_runs_redacted_and_guards_its_forms() {
     let html = r.page("/console/runs/case-1").await;
     assert!(html.contains("jane.doe@example.com"));
     assert!(!html.contains("Content is redacted for you"));
+    // The Run card names the token that recorded the attempt, from the
+    // server's custody note.
+    assert!(
+        html.contains("<span class=\"nw\">agent@example.test</span>"),
+        "{html}"
+    );
 
     // An administrator's forms.
     b.sign_in(&ts.admin).await;

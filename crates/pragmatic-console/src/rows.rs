@@ -12,7 +12,9 @@
 //!   make one row, "Run started";
 //! - each `attempt.start` opens a group, and its `attempt.end` closes it;
 //! - an attempt that stopped without an end gets a derived row: "No end:
-//!   crashed" where a later attempt shows it crashed, or, at the end of
+//!   crashed" where a later attempt shows it crashed, right after the last
+//!   entry it wrote itself (a note the server wrote when the next attempt
+//!   took the run, such as its custody note, follows it), or, at the end of
 //!   the run's own entries, what is known (running, crashed, or for a
 //!   local journal, which cannot say, that the attempt is open);
 //! - record keeping written after the run's last attempt (erasure and
@@ -79,12 +81,19 @@ pub struct Attempt {
     pub at: u64,
     pub mode: String,
     pub pid: String,
-    pub host: String,
-    pub principal: String,
+    /// The Pragmatic Server token that held the run's lease when the
+    /// attempt began, from the server's custody notes (empty for a local
+    /// journal, or while the lease is still held). The SDK's own identity
+    /// (principal and host) stays in the attempt's note.
+    pub token: String,
     pub torn: u64,
     pub end: Option<AttemptEnd>,
     /// The next attempt's start: this attempt's entries end before it.
     pub until: Option<Cursor>,
+    /// The last entry the attempt wrote itself: its start, or a later
+    /// entry before `until`, never a note the server wrote (custody,
+    /// erasure, torn tail).
+    pub last_own: Cursor,
     /// Recovery notes that wrote off or retried an effect, and written-off
     /// results, in this attempt.
     pub repeated: usize,
@@ -135,6 +144,9 @@ pub struct Facts {
     /// a page finds an attempt in O(1) however many the run has.
     by_start: HashMap<Cursor, usize>,
     by_end: HashMap<Cursor, usize>,
+    /// Attempts with no end that a later attempt followed, by the cursor
+    /// their crash row goes before.
+    crash_at: HashMap<Cursor, usize>,
     /// Where the record keeping written after the run's last attempt
     /// begins (erasure and custody notes): the run's own entries end there.
     pub after: Option<Cursor>,
@@ -149,6 +161,12 @@ pub struct Facts {
     /// The run's entries cross a UTC day.
     pub multi_day: bool,
     pub live: Liveness,
+}
+
+/// A note the server wrote into the run (custody, erasure, torn tail),
+/// not one of the run's own entries.
+fn is_server_note(e: &Entry) -> bool {
+    e.branch == META && matches!(e.event.note_kind(), Some(k) if note::SERVER_ONLY.contains(&k))
 }
 
 fn json_str(d: &Json, k: &str, width: usize) -> String {
@@ -180,6 +198,9 @@ impl Facts {
         let mut legacy_open: Vec<(Cursor, String)> = Vec::new();
         let mut legacy_result = HashMap::new();
         let mut legacy_intent = HashMap::new();
+        // Each lease the server recorded: the entries it covered and the
+        // token that held it, in cursor order.
+        let mut leases: Vec<(u64, u64, String)> = Vec::new();
         let (mut first_at, mut last_at) = (u64::MAX, 0u64);
         for e in j.entries() {
             if e.at > 0 {
@@ -202,11 +223,11 @@ impl Facts {
                         at: e.at,
                         mode: json_str(&d, "mode", 24),
                         pid: json_str(&d, "pid", 24),
-                        host: json_str(&d, "host", 128),
-                        principal: json_str(&d, "principal", 128),
+                        token: String::new(),
                         torn: d.get("torn_bytes").and_then(Json::as_u64).unwrap_or(0),
                         end: None,
                         until: None,
+                        last_own: e.cursor,
                         repeated: 0,
                         first_repeated: None,
                     });
@@ -227,6 +248,20 @@ impl Facts {
                                 .and_then(Json::as_u64)
                                 .unwrap_or(0),
                         });
+                    }
+                }
+                Event::Note { kind, data, .. } if kind == note::CUSTODY && e.branch == META => {
+                    let d = Json::parse(data).unwrap_or(Json::Null);
+                    let range = (
+                        d.get("from_entries").and_then(Json::as_u64),
+                        d.get("to_entries").and_then(Json::as_u64),
+                    );
+                    let token = match d.get("token").and_then(Json::as_str) {
+                        Some(t) => t,
+                        None => d.get("principal").and_then(Json::as_str).unwrap_or(""),
+                    };
+                    if let ((Some(from), Some(to)), false) = (range, token.is_empty()) {
+                        leases.push((from, to, text::clip(token, 64)));
                     }
                 }
                 Event::Note { kind, data, .. } if kind == "recovery" => {
@@ -269,6 +304,23 @@ impl Facts {
                 }
                 _ => {}
             }
+            // The current attempt's own last entry (after the match, so an
+            // attempt's start counts for it, not for the one before).
+            if !is_server_note(e) {
+                if let Some(a) = attempts.last_mut() {
+                    a.last_own = e.cursor;
+                }
+            }
+        }
+        // The token that held the lease each attempt began under.
+        leases.sort_by_key(|l| l.0);
+        for a in &mut attempts {
+            let i = leases.partition_point(|l| l.0 <= a.start);
+            if let Some((_, to, token)) = i.checked_sub(1).map(|i| &leases[i]) {
+                if a.start < *to {
+                    a.token = token.clone();
+                }
+            }
         }
         let mut read_back = Vec::new();
         for a in &attempts {
@@ -293,6 +345,15 @@ impl Facts {
             .iter()
             .enumerate()
             .filter_map(|(i, a)| Some((a.end.as_ref()?.cursor, i)))
+            .collect();
+        // An attempt with no end that a later one followed: its crash row
+        // goes right after the last entry it wrote, before any note the
+        // server wrote when the next attempt took the run.
+        let crash_at = attempts
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.end.is_none() && a.until.is_some())
+            .map(|(i, a)| (a.last_own + 1, i))
             .collect();
         // The trailing record keeping: erasure and custody notes after the
         // last attempt began (and after its end, when it has one).
@@ -320,6 +381,7 @@ impl Facts {
             read_back,
             by_start,
             by_end,
+            crash_at,
             after,
             last_on_lane,
             effects_by_name,
@@ -360,6 +422,11 @@ impl Facts {
     /// The attempt whose end note is at `cursor`.
     pub fn attempt_ending(&self, cursor: Cursor) -> Option<&Attempt> {
         self.by_end.get(&cursor).map(|&i| &self.attempts[i])
+    }
+
+    /// The attempt with no end whose crash row goes just before `cursor`.
+    pub fn crash_before(&self, cursor: Cursor) -> Option<&Attempt> {
+        self.crash_at.get(&cursor).map(|&i| &self.attempts[i])
     }
 
     /// Where the run's own entries end: at the record keeping written
@@ -1182,11 +1249,11 @@ fn note_title(
                         at: e.at,
                         mode: String::new(),
                         pid: String::new(),
-                        host: String::new(),
-                        principal: String::new(),
+                        token: String::new(),
                         torn: 0,
                         end: None,
                         until: None,
+                        last_own: e.cursor,
                         repeated: 0,
                         first_repeated: None,
                     };
@@ -1436,11 +1503,14 @@ pub fn group_label(a: &Attempt) -> String {
     out
 }
 
-/// The crash row of an attempt with no end that a later attempt followed.
-fn crash_row(ctx: &Ctx<'_>, a: &Attempt, next_start: Cursor) -> Row {
-    let last = next_start.saturating_sub(1);
+/// The crash row of an attempt with no end that a later attempt followed:
+/// it stopped after the last entry it wrote itself, and a call that entry
+/// opened and no result closed before the next attempt is named.
+fn crash_row(ctx: &Ctx<'_>, a: &Attempt) -> Row {
+    let last = a.last_own;
+    let next_start = a.until.unwrap_or(Cursor::MAX);
     let mut t = Title::default().words("No end: crashed").accent(&format!(
-        "{} stopped after {}",
+        "{} stopped after\u{a0}{}",
         esc(&a.name()),
         ctx.cursor(last)
     ));
@@ -1469,7 +1539,10 @@ fn crash_row(ctx: &Ctx<'_>, a: &Attempt, next_start: Cursor) -> Row {
     }
     Row::derived(
         t.html(),
-        format!("no note.attempt.end for {}", esc(&a.name())),
+        format!(
+            "no note.attempt.end for {}",
+            esc(&a.name()).replace(' ', "\u{a0}")
+        ),
         Mark::AlarmHollow,
         true,
     )
@@ -1478,7 +1551,7 @@ fn crash_row(ctx: &Ctx<'_>, a: &Attempt, next_start: Cursor) -> Row {
 /// The row after the run's own entries when its last attempt has not
 /// ended.
 fn open_end_row(ctx: &Ctx<'_>, a: &Attempt) -> Row {
-    let last = ctx.facts.run_end(ctx.j).saturating_sub(1);
+    let last = a.last_own;
     let (title, mark, crash) = match ctx.facts.live {
         Liveness::Running => (
             Title::default()
@@ -1490,7 +1563,7 @@ fn open_end_row(ctx: &Ctx<'_>, a: &Attempt) -> Row {
         ),
         Liveness::Stopped | Liveness::Dangling => {
             let mut t = Title::default().words("No end: crashed").accent(&format!(
-                "{} stopped after {}",
+                "{} stopped after\u{a0}{}",
                 esc(&a.name()),
                 ctx.cursor(last)
             ));
@@ -1504,7 +1577,7 @@ fn open_end_row(ctx: &Ctx<'_>, a: &Attempt) -> Row {
         Liveness::Unknown => (
             Title::default()
                 .words(&format!("{} is open", a.title()))
-                .accent(&format!("last entry {}", ctx.cursor(last)))
+                .accent(&format!("last entry\u{a0}{}", ctx.cursor(last)))
                 .html(),
             Mark::Hollow,
             false,
@@ -1512,7 +1585,10 @@ fn open_end_row(ctx: &Ctx<'_>, a: &Attempt) -> Row {
     };
     Row::derived(
         title,
-        format!("no note.attempt.end for {} yet", esc(&a.name())),
+        format!(
+            "no note.attempt.end for {} yet",
+            esc(&a.name()).replace(' ', "\u{a0}")
+        ),
         mark,
         crash,
     )
@@ -1541,7 +1617,13 @@ pub fn build(ctx: &Ctx<'_>, page: &[Entry]) -> Vec<Group> {
             rows: Vec::new(),
         }
     } else {
-        match ctx.facts.attempt_at(ctx.from) {
+        // A page that starts with an earlier attempt's crash row continues
+        // that attempt's group.
+        let at = ctx
+            .facts
+            .crash_before(ctx.from)
+            .or_else(|| ctx.facts.attempt_at(ctx.from));
+        match at {
             Some(a) if a.start < ctx.from => Group {
                 label: continued(&group_label(a)),
                 id: format!("a{}", a.start),
@@ -1581,8 +1663,16 @@ pub fn build(ctx: &Ctx<'_>, page: &[Entry]) -> Vec<Group> {
                 rows: Vec::new(),
             });
         }
-        // A new attempt opens a group, after the crash row of the one
-        // before it when that one has no end.
+        // An attempt with no end that a later one followed: its crash row
+        // comes right after its own last entry, before the notes the server
+        // wrote when the next attempt took the run.
+        if let Some(p) = ctx.facts.crash_before(e.cursor) {
+            let row = crash_row(ctx, p);
+            if let Some(g) = groups.last_mut() {
+                g.rows.push(row);
+            }
+        }
+        // A new attempt opens a group.
         let starts = match &e.event {
             Event::Note { kind, .. } if kind == "attempt.start" => Some(e.cursor),
             Event::Note { kind, .. } if kind == "run.start" => page
@@ -1595,12 +1685,6 @@ pub fn build(ctx: &Ctx<'_>, page: &[Entry]) -> Vec<Group> {
         };
         if let Some(start) = starts {
             let found = ctx.facts.attempt_starting(start);
-            if let Some(p) = found.and_then(|(_, p)| p).filter(|p| p.end.is_none()) {
-                let row = crash_row(ctx, p, start);
-                if let Some(g) = groups.last_mut() {
-                    g.rows.push(row);
-                }
-            }
             groups.push(Group {
                 label: found.map(|(a, _)| group_label(a)),
                 id: format!("a{start}"),
@@ -2052,6 +2136,14 @@ fn numbers(shown: &[u64], total: usize) -> String {
     }
 }
 
+/// A kinds line that wraps only between its entries: each `kind #N` and
+/// each separator stays with the entry before it.
+fn kinds_html(kinds: &str) -> String {
+    kinds
+        .replace(" \u{b7} ", "\u{a0}\u{b7} ")
+        .replace(" #", "\u{a0}#")
+}
+
 fn row_html(ctx: &Ctx<'_>, row: &Row, section: &dyn Fn(Cursor) -> String) -> String {
     let d = row.depth.min(6);
     let mut class = format!("row {}", row.mark.class());
@@ -2068,7 +2160,8 @@ fn row_html(ctx: &Ctx<'_>, row: &Row, section: &dyn Fn(Cursor) -> String) -> Str
         return format!(
             "<li class=\"{class}\"><div class=\"sum\"><span class=\"t\">{}</span>\
              <span class=\"k\">{}</span></div></li>\n",
-            row.title, row.kinds
+            row.title,
+            kinds_html(&row.kinds)
         );
     }
     let anchors: String = row
@@ -2133,6 +2226,6 @@ fn row_html(ctx: &Ctx<'_>, row: &Row, section: &dyn Fn(Cursor) -> String) -> Str
          <span class=\"sr-only\">, {read_words}{tm_words}entry hash {h10}. Show the recorded entries.</span>\
          </summary><div class=\"detail\">{notes}{sections}</div></details></li>\n",
         title = row.title,
-        kinds = row.kinds,
+        kinds = kinds_html(&row.kinds),
     )
 }

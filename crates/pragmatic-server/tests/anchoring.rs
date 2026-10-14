@@ -149,6 +149,7 @@ async fn without_anchoring_nothing_claims_to_be_anchored() {
             url: "https://tsa.example/tsr".into(),
             roots_pem: "/etc/pragmatic/tsa/root.pem".into(),
             operator: "example".into(),
+            name: String::new(),
         });
     })
     .await;

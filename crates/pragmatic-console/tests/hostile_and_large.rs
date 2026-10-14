@@ -186,12 +186,22 @@ fn payload_in_every_field_is_inert() {
         independent: false,
         operators: vec![X.into()],
         time: Some(X.into()),
-        witnesses: vec![pragmatic_console::AnchorWitness {
-            operator: X.into(),
-            kind: X.into(),
-            trust: pragmatic_console::WitnessTrust::Failed,
-            root: Some(X.into()),
-        }],
+        witnesses: vec![
+            pragmatic_console::AnchorWitness {
+                operator: X.into(),
+                name: None,
+                kind: X.into(),
+                trust: pragmatic_console::WitnessTrust::Failed,
+                root: Some(X.into()),
+            },
+            pragmatic_console::AnchorWitness {
+                operator: X.into(),
+                name: Some(X.into()),
+                kind: X.into(),
+                trust: pragmatic_console::WitnessTrust::Trusted,
+                root: Some(X.into()),
+            },
+        ],
     };
     let nav = format!("<span>{}</span>", pragmatic_console::html::esc(X));
     let frame = pragmatic_console::html::Frame {
@@ -646,4 +656,80 @@ fn pages_keep_to_their_budget() {
         "{}",
         page.html.len()
     );
+}
+
+/// One intent with a great many results (a journal that passes audit, and
+/// one an agent token can write on Pragmatic Server): the intent's section
+/// names its first few results and counts the rest, so every page keeps to
+/// its budget and the intent shares its page with its results.
+#[test]
+fn an_intent_with_many_results_keeps_pages_bounded() {
+    let mut jn = Journal::new(None);
+    jn.append(
+        META,
+        Event::Note {
+            kind: note::RUN_START.into(),
+            data:
+                r#"{"format":2,"labels":{},"nonce":"00","run_id":"m","sdk":"x","sdk_version":"0"}"#
+                    .into(),
+            payload: vec![],
+        },
+    )
+    .unwrap();
+    let intent = jn
+        .append(
+            ROOT,
+            Event::EffectIntent {
+                name: "tool:retry".into(),
+                arg: Value::from("{}").into(),
+            },
+        )
+        .unwrap();
+    let results = 100_000u64;
+    for _ in 0..results {
+        jn.append(
+            ROOT,
+            Event::EffectResult {
+                intent,
+                outcome: EffectOutcome::Failed,
+                error_kind: "Io".into(),
+                payload: Some(Value::from("connection reset").into()),
+            },
+        )
+        .unwrap();
+    }
+    let report = jn.audit();
+    assert!(report.is_ok());
+    let view = RunView {
+        page_link: Some("/run/m?from="),
+        ..RunView::new("m", &jn, &report)
+    };
+    let t = Instant::now();
+    let mut from = Some(0);
+    let mut pages = 0;
+    while let Some(f) = from {
+        let page = render_run_page(&RunView { from: f, ..view });
+        assert!(
+            page.html.len() < PAGE_BYTES + (1 << 20),
+            "page from #{f}: {} bytes",
+            page.html.len()
+        );
+        if f == 0 {
+            // The intent is not left alone on its page: its section is as
+            // small as any other, so a full page of its results joins it.
+            assert_eq!(page.next, Some(PAGE_ENTRIES as u64));
+            assert!(page.html.contains(
+                "Results: <a class=\"m\" href=\"#c2\">#2</a>, <a class=\"m\" href=\"#c3\">#3</a>, \
+                 <a class=\"m\" href=\"#c4\">#4</a>, <a class=\"m\" href=\"#c5\">#5</a>, \
+                 <a class=\"m\" href=\"#c6\">#6</a> and 99,995 more."
+            ));
+        }
+        from = page.next;
+        pages += 1;
+    }
+    eprintln!(
+        "one intent, {results} results: {pages} pages in {:?}",
+        t.elapsed()
+    );
+    assert_eq!(pages, (jn.len() as usize).div_ceil(PAGE_ENTRIES));
 }

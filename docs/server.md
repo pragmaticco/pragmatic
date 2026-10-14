@@ -260,7 +260,7 @@ setting cannot silently fall back to its default.
 | key | default | meaning |
 |---|---|---|
 | `interval_secs` | `600` | Seconds between anchoring batches (60 to 3600). A batch also runs within 30 seconds after an agent finishes successfully. |
-| `tsa` | `[]` | RFC 3161 time-stamping authorities: `{ url, operator, roots_pem }`. `roots_pem` holds that operator's pinned trust anchors (a root, or better the CA that issues its time-stamping certificates); `operator` names who runs it and is required. Operators must not share an anchor. |
+| `tsa` | `[]` | RFC 3161 time-stamping authorities: `{ url, operator, roots_pem, name }`. `roots_pem` holds that operator's pinned trust anchors (a root, or better the CA that issues its time-stamping certificates); `operator` names who runs it and is required. Operators must not share an anchor. `name` (optional) is how the console names the service (`DigiCert`); without it the console shows `operator`. It is display only. |
 | `witness` | `[]` | C2SP tlog-witness cosigners: `{ url, vkey, operator, token_file }`. Requests go to `<url>/add-checkpoint`; `vkey` is the witness's `cosignature/v1` verifier key; `operator` defaults to the key name. |
 | `allow_self_anchoring` | `false` | Start without an independent witness. |
 | `anchor_run_ids` | `"plain"` | `"plain"` puts run ids in anchor leaves; `"hmac"` puts a keyed hash, so the anchor log reveals no run ids. `"hmac"` trades auditability for that privacy: nothing binds a run's anchor key to the run, so an administrator can rewrite an anchored run and anchor it again under a new key without any audit detecting it. Bundles from an `"hmac"` server report `anchor_id_unbound`, and `--log` audits fail with `log_unauditable`. Keep `"plain"` where the omission audit matters; a fix (run ids bound to the log key) is planned for 0.7. |
@@ -393,23 +393,28 @@ destroyed. Like the website, it is always paper.
   hash; it opens to the entries themselves, every slot with its address
   for erasure (`slot 3:1`). Attempts are groups, parallel branches nested
   lanes, and notes the server writes after the run (custody, erasure) a
-  group of their own, "After the run". Beside the sheet: its
-  **anchoring** (independently anchored, with each timestamp service and
-  the time they vouch for; signed by this server only; or not yet
-  anchored), the **evidence check** (`pragmatic verify`'s report, and for
-  auditors and administrators the evidence bundle downloads), and the
-  **run's** labels, program, model, token usage when recorded, and its
-  attempts, failures and record keeping, each a link to its place in the
-  timeline; on a wide screen that card stays in view as a long timeline
-  scrolls. For administrators, **Erase content…** at the end of the side
-  column opens on the erasure form. Without `view_raw`, content is shown
-  through the same redaction as the API, and the page says so.
+  group of their own, "After the run". Beside the sheet on a wide screen,
+  or under it: its **anchoring** (independently anchored, with each
+  timestamp service by the `name` its `[anchoring] tsa` entry gives, the
+  root its pinned anchors chain to and the time they vouch for, to the
+  second; signed by this server only; or not yet anchored), the
+  **evidence check** (`pragmatic verify`'s report, and for auditors and
+  administrators the evidence bundle downloads), and the **run's**
+  labels, program, model, token usage when recorded, and its attempts
+  (each with its start, the token that recorded it and its process id),
+  failures and record keeping, each a link to its place in the timeline;
+  on a wide screen that card stays in view as a long timeline scrolls.
+  For administrators, **Erase content…** at the end of the side column
+  opens on the erasure form. Without `view_raw`, content is shown through
+  the same redaction as the API, the user and machine each attempt ran
+  as are withheld, and the page says so.
 - **The access log**: every record for administrators, the records of
   in-scope runs for auditors, personal fields withheld without `view_raw`.
 - **Holds and retention** (administrators): place and remove holds, see
   the retention policies, run retention now.
 - **Tokens** (administrators): issue (the value is shown once) and revoke.
-- The footer names the viewer and the licensee (`[license] licensee`).
+- The footer names the viewer, and the licensee when `[license] licensee`
+  is set.
 
 Erasing, removing a hold, revoking a token and running retention each
 show a confirmation first: an erasure lists the slots it would erase,

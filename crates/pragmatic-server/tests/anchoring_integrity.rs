@@ -48,6 +48,7 @@ fn tsa_config(name: &str, t: &TsaServer) -> TsaConfig {
         url: t.url.clone(),
         roots_pem: t.tsa.root_pem(),
         operator: name.into(),
+        name: String::new(),
     }
 }
 

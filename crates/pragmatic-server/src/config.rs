@@ -190,6 +190,11 @@ pub struct TsaConfig {
     /// 4.7).
     #[serde(default)]
     pub operator: String,
+    /// The operator's name as people know it, for the console's Anchoring
+    /// card (`DigiCert`). Empty shows `operator`, set as an identifier.
+    /// Display only: it never decides what counts.
+    #[serde(default)]
+    pub name: String,
 }
 
 /// One `tlog-witness` cosigner.
@@ -859,6 +864,7 @@ mod tests {
         c.anchoring.tsa.push(TsaConfig {
             url: "https://tsa.example/tsr".into(),
             roots_pem: "/etc/roots.pem".into(),
+            name: String::new(),
             operator: String::new(),
         });
         assert!(

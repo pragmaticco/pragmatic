@@ -68,10 +68,11 @@ interval_secs = 600
 # written permission from each TSA operator before automated use (the
 # server spaces its requests to one TSA at least 15 seconds apart);
 # qualified (eIDAS) time-stamping providers are a paid option. TSA tokens
-# are verified with OpenSSL, which must be on PATH.
+# are verified with OpenSSL, which must be on PATH. name is how the console
+# names the service; it is display only.
 tsa = [
-  { url = "http://timestamp.digicert.com", operator = "digicert", roots_pem = "/etc/pragmatic/tsa-roots/digicert.pem" },
-  { url = "http://timestamp.sectigo.com", operator = "sectigo", roots_pem = "/etc/pragmatic/tsa-roots/sectigo.pem" },
+  { url = "http://timestamp.digicert.com", operator = "digicert", name = "DigiCert", roots_pem = "/etc/pragmatic/tsa-roots/digicert.pem" },
+  { url = "http://timestamp.sectigo.com", operator = "sectigo", name = "Sectigo", roots_pem = "/etc/pragmatic/tsa-roots/sectigo.pem" },
 ]
 # C2SP tlog-witness cosigners, configured by their cosignature/v1 vkey, for
 # example another Pragmatic Server in witness mode or the hosted Pragmatic

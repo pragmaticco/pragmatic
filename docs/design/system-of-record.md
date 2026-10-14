@@ -16,8 +16,8 @@ security, failure-handling and compliance review of the server (4.1 to
 6.5, 6.6, 6.7), and after the review of that layer (2.6, 2.7, 2.12, 3.1,
 4.6, 6.2 to 6.5), reconciled when the four were integrated (11), and
 amended when the server was wired to its components (4.1, 4.4, 4.7, 4.8,
-4.14, 4.17, 5.3, 11), and when the console took the website's design
-(4.14). This
+4.14, 4.17, 5.3, 11), when the console took the website's design
+(4.14), and after the review of that design (4.14). This
 document is the contract
 between the components built for 0.6. Everything marked MUST is
 normative; where code and this document disagree, one of them is a bug.
@@ -1855,7 +1855,8 @@ Server-rendered with the shared `pragmatic-console` crate:
 - holds, erasure and retention (admin)
 - access log
 - tokens (admin)
-- the licensee in the footer
+- the licensee in the footer, when one is configured (the console's own
+  chrome carries no note about configuration that is missing)
 
 The `pragmatic-console` crate (Apache-2.0, no dependencies beyond the
 core) renders these pages for the server and the CLI alike:
@@ -1883,18 +1884,33 @@ cut at 64 KiB.
   words are Garamond's own figures in ink, so the facts line is spaced
   evenly. Every state is said in words as well as by a marker, and the
   words are the same wherever a state is told (the run page, its Run card
-  and the runs list).
+  and the runs list). Recorded data never breaks mid-token: hashes, ids
+  and model ids are each one unit (a hash shortened to 12 hex characters
+  and an ellipsis), a facts line and a kinds line break only between their
+  items, and `#N` stays with the word before it. Everything focusable
+  shows focus: a button or a checkbox a 2px ring in ink, a text field its
+  edge doubled in ink; no rule that removes an outline reaches a checkbox,
+  whose native paint hides an edge.
 - **Rows, not entries.** The run page is a run sheet (the run id, a
   verification badge, a facts line, a state line, the timeline and the
-  chain, whose foot carries the full chain head to copy) beside an Evidence
-  check card and a Run card, and on the server an Anchoring card above
-  them. A local journal has no anchors, and its page says nothing about
-  anchoring rather than something negative. The Run card lists the run's
-  attempts (each with its start, principal and host, and its outcome), its
-  failures and the record keeping after it, each a link to its place in
-  the timeline; on a wide screen the card stays in view while a long
-  timeline scrolls, and the facts line's failed and erased counts link to
-  their rows. For administrators, erasure is a quiet "Erase content…"
+  chain, whose foot carries the full chain head to copy) with an Evidence
+  check card and a Run card, and on the server an Anchoring card before
+  them. The cards sit beside the sheet where the page's content is at
+  least 1,180px wide, in a 380px column, wide enough for each label and
+  its value on one line; below that they go under the sheet, in two
+  columns from 640px (the Evidence check card, the tallest, in the
+  second, the others in the first), and in one column on a phone. In a
+  card narrower than 380px the check's labels sit above their values. A
+  local journal has no anchors, and its page says nothing about anchoring
+  rather than something negative. The Run card lists the run's attempts
+  (each with its start, the Pragmatic Server token that recorded it when
+  the server's custody notes name one, its process id, and its outcome),
+  its failures and the record keeping after it, each a link to its place
+  in the timeline. The user and machine the SDK ran as are personal data
+  and stay in the attempt's note, never in the card, so a picture of the
+  page does not carry them. On a wide screen the card stays in view while
+  a long timeline scrolls, and the facts line's failed and erased counts
+  link to their rows. For administrators, erasure is a quiet "Erase content…"
   disclosure at the end of the side column that opens on its form. The
   timeline's rows are built from
   the journal by fixed rules: a step is one row from its intent and every
@@ -1907,7 +1923,13 @@ cut at 64 KiB.
   console adds a row where an attempt has no end ("No end: crashed" where
   a later attempt shows it, or at the end of the run what is known:
   running on a live lease, crashed, or for a local journal, which cannot
-  say whether a process still writes it, "Attempt 2 is open"). A call
+  say whether a process still writes it, "Attempt 2 is open"). That row
+  names the last entry the attempt wrote itself ("attempt 1 stopped after
+  #9"), never a note the server wrote (custody, erasure, torn tail), and
+  comes right after it: the custody note the server writes when the next
+  attempt takes the run follows the crash row, in the crashed attempt's
+  group, and an intent that entry left open is named ("during Tool call
+  issue_refund"). A call
   with no result that may still be under way (the last entry on its lane,
   in a last attempt that is running or may be) waits in ink; any other is
   interrupted, in terracotta. A recorded failure carries the crash row's
@@ -1921,7 +1943,9 @@ cut at 64 KiB.
   replay, its fields, and each slot with its address for erasure
   (`slot 3:1`). A title sits in a `<summary>`, which is a button, so it
   holds no link; the links (to the step performed again, to an intent on
-  an earlier page) are in the expanded row.
+  an earlier page) are in the expanded row. On a phone (a sheet narrower
+  than 480px) a row is its title and its kinds line, which wraps between
+  entries rather than being cut; the entry hash is in the expanded row.
 - **The runs list** speaks the run page's language: each run is a row with
   its state diamond, its id and verification badge, a sentence of its
   state ("Ended ok · 2 attempts · 3 model calls · 14 entries"), and its
@@ -1967,7 +1991,10 @@ cut at 64 KiB.
   grows more than seventy times), and the same cap holds a model call's
   meta and a note's data. Everything a row writes besides its entries is
   bounded too: it names at most five attempts that read it back and five
-  later results, and counts the rest, and the Run card lists at most eight
+  later results, and counts the rest; an intent's expanded row names its
+  first five results and counts the rest ("Results: #2, #3, #4, #5, #6
+  and 99,995 more"), so an intent with any number of results shares its
+  page with them; and the Run card lists at most eight
   failures and the first and last attempts of a long run. Attempts are
   found by their start or end cursor, never searched for, so a late page
   of a journal with hundreds of thousands of attempts renders as fast as
@@ -1988,11 +2015,26 @@ cut at 64 KiB.
   (the policy, fonts, navigation, and a footer naming the viewer and the
   licensee), a `SlotFilter` that shows every present slot through the
   server's redaction (4.10) for a viewer without `view_raw` (fields stay;
-  refs resolve to their target first), and a `ServerRun`: the run's status
-  and holds, its notices, the evidence downloads (auditors and
-  administrators) and the erasure disclosure (administrators). The run's
-  anchoring lists each witness of its newest independent anchor (or its
-  newest anchor) with its kind and whether the server counts its operator.
+  refs resolve to their target first; an attempt note's `principal` and
+  `host` are shown as `[withheld]`, as the access log withholds personal
+  fields, and the redaction notice says so), and a `ServerRun`: the run's
+  status and holds, its notices, the evidence downloads (auditors and
+  administrators), the erasure disclosure (administrators) and, for a
+  viewer with `view_raw` only, each token's principal, so the Run card
+  can name the token that recorded each attempt. The run's anchoring
+  lists each witness of its newest independent anchor (or its newest
+  anchor) with its kind and whether the server counts its operator: a TSA
+  by the `name` its `[anchoring] tsa` entry gives (`DigiCert`), or else by
+  its operator set as an identifier (`digicert`), and, when trusted, with
+  the root its pinned anchors chain to (the common name in the first
+  pinned certificate's issuer, read once at startup and shown, never
+  trusted: `DigiCert Trusted Root G4` for DigiCert's issuing CA,
+  `USERTrust RSA Certification Authority` for Sectigo's pinned root).
+  The time an anchor proves is shown to the second ("existed no later
+  than 14 Oct 2026, 04:24:53 UTC"): a bound rounded down to the minute
+  would claim more than the tokens do. The card's head has the hairline
+  every card has; only a partial anchor draws its share, as a 2px meter
+  on a track inside the card, above the count in words.
   The access log, holds and retention, and tokens are tables on leaves in
   the same frame, stacked as labelled rows on a narrow screen; their cells
   of ids, paths and runs never wrap mid-token. The server's policy is the crate's with `font-src 'self'` and

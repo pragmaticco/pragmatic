@@ -364,7 +364,19 @@ fn refund_20417_reads_as_designed() {
     assert!(html.contains(
         "pragmatic evidence refund-20417 \\\n    -o refund-20417.evidence.json \\\n    --dir journals</code>"
     ));
-    assert!(html.contains("<dt>model</dt><dd>anthropic:claude-sonnet-5-5</dd>"));
+    assert!(html
+        .contains("<dt>model</dt><dd><span class=\"id\">anthropic:claude-sonnet-5-5</span></dd>"));
+    // Each attempt in the Run card: when it began and its process. The
+    // user and machine the SDK ran as stay in the attempt's note.
+    assert!(html.contains(
+        "<span class=\"who\"><span class=\"nw\">00:29:52</span> \u{b7} <span class=\"nw\">pid 9919</span></span>"
+    ));
+    let side = &html[html.find("<aside").unwrap()..html.find("</aside>").unwrap()];
+    assert!(!side.contains("build-host") && !side.contains("local:"));
+    assert!(
+        html.contains("local:agent@build-host"),
+        "in the attempt's note"
+    );
     assert!(html.contains("<dt>tokens</dt><dd><span class=\"s\">not recorded</span></dd>"));
     assert!(!html.contains(" in / "), "tokens are never shown as 0");
     assert!(html.contains("<span class=\"out alarm\">No end: crashed</span>"));
@@ -490,8 +502,12 @@ fn anchor_status_is_shown_when_known() {
     let html = render_run(&view);
     assert!(html.contains(">Anchored up to #19</h2>"));
     assert!(html.contains("20 of 32 entries"));
-    assert!(html.contains("<span class=\"nm\">digicert</span><span class=\"st\">trusted</span>"));
-    assert!(html.contains("<span style=\"width:62.50%\"></span>"));
+    // Operators the server gives no name for are set as identifiers.
+    assert!(html.contains("<span class=\"nm m\">digicert</span><span class=\"st\">trusted</span>"));
+    // A partial anchor draws its share as a meter inside the card.
+    assert!(html.contains(
+        "<div class=\"card-b\"><div class=\"meter\" aria-hidden=\"true\"><span style=\"width:62.50%\"></span></div>"
+    ));
     let operator_only = AnchorStatus {
         independent: false,
         ..status.clone()
@@ -505,13 +521,15 @@ fn anchor_status_is_shown_when_known() {
         anchored_entries: 32,
         witnesses: vec![
             AnchorWitness {
-                operator: "Alpha".into(),
+                operator: "alpha".into(),
+                name: Some("Alpha".into()),
                 kind: "RFC 3161".into(),
                 trust: WitnessTrust::Trusted,
                 root: Some("Alpha Root".into()),
             },
             AnchorWitness {
-                operator: "Beta".into(),
+                operator: "beta".into(),
+                name: None,
                 kind: "RFC 3161".into(),
                 trust: WitnessTrust::Waiting,
                 root: None,
@@ -525,13 +543,20 @@ fn anchor_status_is_shown_when_known() {
     };
     let html = render_run(&view);
     assert!(html.contains(">Anchored by 2 independent timestamp services</h2>"));
+    // The bound keeps its seconds: rounding it down would claim more than
+    // the tokens prove.
     assert!(html.contains(
-        "existed no later than <span class=\"nw\">13 Oct 2026, <span class=\"m\">12:00</span> UTC</span>"
+        "existed no later than 13\u{a0}Oct\u{a0}2026, <span class=\"m nw\">12:00:00</span>\u{a0}UTC"
     ));
+    // Every entry anchored: the head's rule is the hairline every card has.
+    assert!(html.contains("</div><div class=\"rule\"></div><ul class=\"ops\">"));
+    assert!(!html.contains("class=\"meter\""));
+    // A named operator, and the root its pinned anchors chain to.
     assert!(html.contains(
-        "<span class=\"st\">RFC 3161 \u{b7} trusted</span><span class=\"root\">Alpha Root</span>"
+        "<span class=\"nm\">Alpha</span><span class=\"st\">RFC 3161 \u{b7} trusted</span>\
+         <span class=\"root\">Alpha Root</span>"
     ));
-    assert!(html.contains("<span class=\"st\">waiting</span>"));
+    assert!(html.contains("<span class=\"nm m\">beta</span><span class=\"st\">waiting</span>"));
 }
 
 /// A journal whose every field and slot carries markup.
@@ -1194,6 +1219,7 @@ fn a_filtered_framed_page_shows_no_raw_content() {
             notices: "<p class=\"notice\">notice here</p>",
             evidence: Some("<p>evidence foot</p>"),
             erase: Some("<section class=\"card erase\">erase card</section>"),
+            principals: &[],
         }),
         ..RunView::new("support-ticket-4127", &j, &report)
     };
@@ -1299,4 +1325,301 @@ fn the_end_of_a_run_says_what_is_known() {
     assert!(titles(&dangling).contains(
         &"No end: crashed · attempt 2 stopped after #12 · an effect was left open".to_string()
     ));
+}
+
+/// A custody note as Pragmatic Server writes one when a lease ends.
+fn custody(from: u64, to: u64, requests: u64, end: &str) -> String {
+    format!(
+        r#"{{"clock_skew":false,"end":"{end}","first_received":0,"from_entries":{from},"last_received":0,"lease":"00","principal":"tok_agent","requests":{requests},"to_entries":{to},"token":"tok_agent"}}"#
+    )
+}
+
+/// `src` as Pragmatic Server holds it: before each later attempt starts,
+/// the server ends the lease the attempt before it held (a custody note),
+/// and it releases the last lease after the run.
+fn on_server(src: &Journal) -> Journal {
+    on_server_without(src, None)
+}
+
+/// [`on_server`], leaving out the entry at `skip`.
+fn on_server_without(src: &Journal, skip: Option<u64>) -> Journal {
+    let mut j = Journal::new(None);
+    let mut lease_from = 0;
+    // Where each entry of `src` lands, for the results that name intents.
+    let mut moved = std::collections::HashMap::new();
+    for e in src.entries().iter().filter(|e| Some(e.cursor) != skip) {
+        if e.event.note_kind() == Some("attempt.start") && e.cursor > 1 {
+            let to = j.len();
+            j.append_server_note(
+                e.at,
+                note::CUSTODY,
+                &custody(lease_from, to, 9, "expired"),
+                vec![],
+            )
+            .unwrap();
+            lease_from = j.len();
+        }
+        let mut event = e.event.clone();
+        if let Event::DrawResult { intent, .. } | Event::EffectResult { intent, .. } = &mut event {
+            *intent = moved[intent];
+        }
+        moved.insert(e.cursor, j.append_at(e.at, &e.branch, event).unwrap());
+    }
+    let (to, at) = (j.len(), src.entries().last().map_or(AT, |e| e.at + 1));
+    j.append_server_note(
+        at,
+        note::CUSTODY,
+        &custody(lease_from, to, 4, "released"),
+        vec![],
+    )
+    .unwrap();
+    j
+}
+
+/// On Pragmatic Server, the custody note the server writes when the next
+/// attempt takes the run is not attempt 1's: the crash row names the last
+/// entry attempt 1 wrote itself, and comes before the server's note.
+#[test]
+fn a_crash_row_names_the_attempts_own_last_entry() {
+    let j = on_server(&refund_journal());
+    let report = j.audit();
+    assert!(report.is_ok());
+    let html = render_run(&RunView {
+        server: Some(ServerRun {
+            status: "idle",
+            principals: &[("tok_agent".into(), "refund-agent".into())],
+            ..ServerRun::default()
+        }),
+        ..RunView::new("refund-20417", &j, &report)
+    });
+    every_cursor_once(&html, &j);
+    let got: Vec<(String, String)> = rows(&html)
+        .into_iter()
+        .map(|(_, t, k)| (strip(&t), k))
+        .collect();
+    let at = |title: &str| got.iter().position(|(t, _)| t.starts_with(title)).unwrap();
+    let crash = at("No end: crashed");
+    assert_eq!(got[crash].0, "No end: crashed · attempt 1 stopped after #9");
+    assert_eq!(got[crash - 1].1, "effect.intent #8 · effect.ok #9");
+    assert_eq!(
+        got[crash + 1],
+        (
+            "Lease custody · tok_agent · entries 0 to 10, 9 requests".to_string(),
+            "note.custody #10".to_string()
+        )
+    );
+    assert!(got[crash + 2].0.starts_with("Attempt 2"));
+    // The custody row stays in attempt 1's group: the server taking its
+    // lease back, after it stopped.
+    let group1 = &html[html.find(">Attempt 1 \u{b7} run").unwrap()
+        ..html.find(">Attempt 2 \u{b7} resume").unwrap()];
+    assert!(group1.contains("note.custody\u{a0}#10"));
+    // The Run card names the token that recorded each attempt, and its
+    // process; never the user and machine the SDK ran as.
+    assert!(html.contains(
+        "<span class=\"who\"><span class=\"nw\">00:29:52</span> \u{b7} <span class=\"nw\">refund-agent</span> \u{b7} <span class=\"nw\">pid 9919</span></span>"
+    ));
+    let side = &html[html.find("<aside").unwrap()..html.find("</aside>").unwrap()];
+    assert!(!side.contains("build-host"));
+
+    // A crash during a call: attempt 1's own last entry is the intent no
+    // result closed, and the row says so even though the server's note
+    // follows it.
+    let j = on_server_without(&refund_journal(), Some(9));
+    let report = j.audit();
+    let html = render_run(&RunView::new("refund-20417", &j, &report));
+    assert!(titles(&html).contains(
+        &"No end: crashed · attempt 1 stopped after #8 · during Tool call issue_refund".to_string()
+    ));
+}
+
+/// For a viewer who may not see content raw, the user and machine an
+/// attempt ran as are withheld wherever the page would show them.
+#[test]
+fn redacted_viewers_do_not_see_who_ran_an_attempt() {
+    let j = on_server(&refund_journal());
+    let report = j.audit();
+    let filter = |b: &[u8]| -> Vec<u8> { b.to_vec() };
+    let html = render_run(&RunView {
+        filter: Some(SlotFilter(&filter)),
+        server: Some(ServerRun {
+            status: "idle",
+            // The server gives redacted viewers no principals; the page
+            // does not use them for such a viewer even if it were given.
+            principals: &[("tok_agent".into(), "refund-agent".into())],
+            ..ServerRun::default()
+        }),
+        ..RunView::new("refund-20417", &j, &report)
+    });
+    assert!(!html.contains("build-host"), "host and principal withheld");
+    assert!(!html.contains("refund-agent"));
+    assert!(
+        html.contains("&quot;principal&quot;</span>: <span class=\"js\">&quot;[withheld]&quot;")
+    );
+    assert!(html.contains("&quot;host&quot;</span>: <span class=\"js\">&quot;[withheld]&quot;"));
+    assert!(html.contains("the user and machine each attempt ran as are withheld"));
+    assert!(html.contains(
+        "<span class=\"who\"><span class=\"nw\">00:29:52</span> \u{b7} <span class=\"nw\">pid 9919</span></span>"
+    ));
+}
+
+/// A run whose last attempt wrote `steps` effect pairs after its start
+/// (ending it when `ended`), then `notes` custody notes the server wrote a
+/// day later.
+fn run_then_notes(steps: u64, ended: bool, notes: u64) -> Journal {
+    let mut j = Journal::new(None);
+    let at = |c: u64| AT + c * 1_000_000;
+    j.append_at(
+        at(0),
+        META,
+        Event::Note {
+            kind: note::RUN_START.into(),
+            data:
+                r#"{"format":2,"labels":{},"nonce":"00","run_id":"r","sdk":"x","sdk_version":"0"}"#
+                    .into(),
+            payload: vec![],
+        },
+    )
+    .unwrap();
+    j.append_at(
+        at(1),
+        META,
+        Event::Note {
+            kind: "attempt.start".into(),
+            data: r#"{"attempt":1,"mode":"run","pid":1}"#.into(),
+            payload: vec![],
+        },
+    )
+    .unwrap();
+    for _ in 0..steps {
+        let c = j.len();
+        let i = j
+            .append_at(
+                at(c),
+                ROOT,
+                Event::EffectIntent {
+                    name: "tool:t".into(),
+                    arg: Value::from("{}").into(),
+                },
+            )
+            .unwrap();
+        j.append_at(
+            at(c + 1),
+            ROOT,
+            Event::EffectResult {
+                intent: i,
+                outcome: EffectOutcome::Ok,
+                error_kind: String::new(),
+                payload: Some(Value::from("{}").into()),
+            },
+        )
+        .unwrap();
+    }
+    if ended {
+        let c = j.len();
+        j.append_at(
+            at(c),
+            META,
+            Event::Note {
+                kind: "attempt.end".into(),
+                data: r#"{"attempt":1,"outcome":"ok","fresh":1,"replayed":0}"#.into(),
+                payload: vec![],
+            },
+        )
+        .unwrap();
+    }
+    let later = AT + 86_400_000_000_000;
+    for k in 0..notes {
+        let to = j.len();
+        j.append_server_note(
+            later + k,
+            note::CUSTODY,
+            &custody(0, to, 1, "released"),
+            vec![],
+        )
+        .unwrap();
+    }
+    j
+}
+
+/// Record keeping written after the run is a group of its own, "After the
+/// run", wherever the page boundary falls: every entry is in one row, the
+/// row for a last attempt with no end appears once, on the page where the
+/// run's own entries end, the group continues on the next page, and the
+/// run's recorded span leaves the notes out.
+#[test]
+fn record_keeping_after_the_run_survives_page_boundaries() {
+    let per = PAGE_ENTRIES as u64;
+    // (effect pairs, ended, notes): the run's own entries end exactly at
+    // the boundary, or two before it with the notes across it.
+    for (steps, ended, notes) in [
+        ((per - 2) / 2, false, 3),
+        ((per - 4) / 2, false, 6),
+        ((per - 5) / 2, true, 6),
+    ] {
+        let j = run_then_notes(steps, ended, notes);
+        let report = j.audit();
+        let run_end = j.len() - notes;
+        let view = RunView {
+            page_link: Some("/run/r?from="),
+            ..RunView::new("r", &j, &report)
+        };
+        let mut pages = Vec::new();
+        let mut from = Some(0);
+        while let Some(f) = from {
+            let page = render_run_page(&RunView { from: f, ..view });
+            from = page.next;
+            pages.push((f, page.next.unwrap_or(j.len()), page.html));
+        }
+        assert_eq!(pages.len(), 2, "{steps} {ended} {notes}");
+        let mut seen = vec![0usize; j.len() as usize];
+        for (_, _, h) in &pages {
+            for (i, _) in h.match_indices("<span id=\"c") {
+                let rest = &h[i + 11..];
+                let c: usize = rest[..rest.find('"').unwrap()].parse().unwrap();
+                seen[c] += 1;
+            }
+        }
+        assert!(seen.iter().all(|&n| n == 1), "every cursor once");
+        let open_row = "no note.attempt.end for attempt\u{a0}1 yet";
+        let opens: Vec<bool> = pages.iter().map(|(_, _, h)| h.contains(open_row)).collect();
+        if ended {
+            assert_eq!(opens, [false, false]);
+        } else {
+            // On the page that holds the run's last own entry.
+            let holder = pages
+                .iter()
+                .position(|(f, e, _)| *f < run_end && run_end <= *e)
+                .unwrap();
+            assert_eq!(opens.iter().filter(|&&o| o).count(), 1);
+            assert!(opens[holder]);
+            let (_, _, h) = &pages[holder];
+            let last = run_end - 1;
+            assert!(titles(h).contains(&format!("Attempt 1 is open · last entry #{last}")));
+            // It closes the run's own rows, before the record keeping.
+            if let Some(after) = h.find(">After the run") {
+                assert!(h.find(open_row).unwrap() < after);
+            }
+        }
+        for (f, e, h) in &pages {
+            let has_notes = *e > run_end;
+            if !has_notes {
+                assert!(!h.contains("grp after"));
+            } else if *f > run_end {
+                assert!(h.contains(">After the run <span class=\"nc s\">(continued)</span></h3>"));
+            } else {
+                assert!(h.contains(">After the run</h3>"));
+                assert!(!h.contains(">After the run <span"));
+            }
+            // The span is the run's own: the notes a day later do not
+            // stretch it.
+            let state = &h[h.find("<p class=\"state\">").unwrap()..];
+            let state = strip(&state[..state.find("</p>").unwrap()]);
+            assert!(
+                state.contains("recorded 14 Oct 2026, 00:29:52 to"),
+                "{state}"
+            );
+            assert!(!state.contains("15 Oct"), "{state}");
+        }
+    }
 }

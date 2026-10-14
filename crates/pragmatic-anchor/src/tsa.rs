@@ -477,10 +477,9 @@ impl TsaConfig {
     }
 }
 
-/// The SHA-256 fingerprints of the certificates (DER) in a PEM file of
-/// trust anchors. Fails if the file cannot be read or holds no
-/// certificate.
-pub fn anchor_fingerprints(roots_pem: &Path) -> Result<Vec<Digest>, AnchorError> {
+/// The certificates (DER) in a PEM file of trust anchors. Fails if the
+/// file cannot be read or holds no certificate.
+fn anchor_certificates(roots_pem: &Path) -> Result<Vec<Vec<u8>>, AnchorError> {
     let text = std::fs::read_to_string(roots_pem).map_err(AnchorError::io(format!(
         "reading pinned TSA anchors {}",
         roots_pem.display()
@@ -492,9 +491,7 @@ pub fn anchor_fingerprints(roots_pem: &Path) -> Result<Vec<Digest>, AnchorError>
         match (line, body.as_mut()) {
             ("-----BEGIN CERTIFICATE-----", None) => body = Some(String::new()),
             ("-----END CERTIFICATE-----", Some(b64)) => {
-                let der =
-                    base64_decode(b64).map_err(|_| bad("a certificate is not valid base64"))?;
-                out.push(sha256(&der));
+                out.push(base64_decode(b64).map_err(|_| bad("a certificate is not valid base64"))?);
                 body = None;
             }
             (_, Some(b64)) => b64.push_str(line),
@@ -505,6 +502,112 @@ pub fn anchor_fingerprints(roots_pem: &Path) -> Result<Vec<Digest>, AnchorError>
         return Err(bad("holds no PEM certificate"));
     }
     Ok(out)
+}
+
+/// The SHA-256 fingerprints of the certificates (DER) in a PEM file of
+/// trust anchors. Fails if the file cannot be read or holds no
+/// certificate.
+pub fn anchor_fingerprints(roots_pem: &Path) -> Result<Vec<Digest>, AnchorError> {
+    Ok(anchor_certificates(roots_pem)?
+        .iter()
+        .map(|der| sha256(der))
+        .collect())
+}
+
+/// The name of the root a file of pinned anchors chains to, for people to
+/// read: the common name in its first certificate's issuer. For a root,
+/// that is its own name; for an issuing CA, the root that issued it
+/// (`DigiCert Trusted Root G4` for DigiCert's time-stamping CA). `None`
+/// when the file cannot be read or the name cannot be found. It is shown,
+/// never trusted: verification pins the certificates themselves.
+pub fn anchor_root_name(roots_pem: &Path) -> Option<String> {
+    let certs = anchor_certificates(roots_pem).ok()?;
+    issuer_common_name(certs.first()?)
+}
+
+/// One DER element: its tag, its content and what follows it. Only
+/// single-byte tags and definite lengths of up to four bytes.
+fn der_element(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, rest) = input.split_first()?;
+    let (&first, rest) = rest.split_first()?;
+    let (len, rest) = if first < 0x80 {
+        (usize::from(first), rest)
+    } else {
+        let n = usize::from(first & 0x7f);
+        if n == 0 || n > 4 || rest.len() < n {
+            return None;
+        }
+        let len = rest[..n]
+            .iter()
+            .fold(0usize, |acc, &b| (acc << 8) | usize::from(b));
+        (len, &rest[n..])
+    };
+    if tag & 0x1f == 0x1f || rest.len() < len {
+        return None;
+    }
+    Some((tag, &rest[..len], &rest[len..]))
+}
+
+/// The common name (OID 2.5.4.3) in a certificate's issuer, the last one
+/// when it has several.
+fn issuer_common_name(cert: &[u8]) -> Option<String> {
+    const SEQUENCE: u8 = 0x30;
+    const SET: u8 = 0x31;
+    const COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
+    let (SEQUENCE, cert, _) = der_element(cert)? else {
+        return None;
+    };
+    let (SEQUENCE, tbs, _) = der_element(cert)? else {
+        return None;
+    };
+    // [0] version (optional), serialNumber, signature, then the issuer.
+    let (tag, _, mut rest) = der_element(tbs)?;
+    if tag == 0xa0 {
+        rest = der_element(rest)?.2;
+    }
+    let (SEQUENCE, _, rest) = der_element(rest)? else {
+        return None;
+    };
+    let (SEQUENCE, mut rdns, _) = der_element(rest)? else {
+        return None;
+    };
+    let mut found = None;
+    while !rdns.is_empty() {
+        let (tag, mut set, next) = der_element(rdns)?;
+        rdns = next;
+        if tag != SET {
+            return None;
+        }
+        while !set.is_empty() {
+            let (tag, pair, next) = der_element(set)?;
+            set = next;
+            if tag != SEQUENCE {
+                return None;
+            }
+            let (0x06, oid, value) = der_element(pair)? else {
+                return None;
+            };
+            if oid != COMMON_NAME {
+                continue;
+            }
+            let (tag, text, _) = der_element(value)?;
+            found = match tag {
+                // UTF8String, PrintableString, IA5String.
+                0x0c | 0x13 | 0x16 => std::str::from_utf8(text).ok().map(str::to_string),
+                // BMPString: UTF-16BE.
+                0x1e if text.len() % 2 == 0 => {
+                    let units: Vec<u16> = text
+                        .chunks_exact(2)
+                        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                        .collect();
+                    String::from_utf16(&units).ok()
+                }
+                _ => None,
+            }
+            .or(found);
+        }
+    }
+    found.filter(|n| !n.trim().is_empty())
 }
 
 /// Refuse TSAs of different operators that share a trust anchor.
@@ -849,5 +952,34 @@ mod tests {
         }
         let missing = cfg("http://x", "x", &dir.path().join("missing.pem"));
         assert!(check_operator_anchors(&[&missing]).is_err());
+    }
+
+    /// The console names the root each operator's pinned anchors chain to:
+    /// the issuer of DigiCert's time-stamping CA, and USERTrust's own name.
+    /// Anything that is not a certificate gives no name, never a panic.
+    #[test]
+    fn anchors_name_the_root_they_chain_to() {
+        let roots = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/tsa-roots");
+        assert_eq!(
+            anchor_root_name(&roots.join("digicert.pem")).as_deref(),
+            Some("DigiCert Trusted Root G4")
+        );
+        assert_eq!(
+            anchor_root_name(&roots.join("sectigo.pem")).as_deref(),
+            Some("USERTrust RSA Certification Authority")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let fake = pem(dir.path(), "fake.pem", &[b"root one"]);
+        assert_eq!(anchor_root_name(&fake), None);
+        assert_eq!(anchor_root_name(&dir.path().join("missing.pem")), None);
+        let der = anchor_certificates(&roots.join("digicert.pem"))
+            .unwrap()
+            .remove(0);
+        for cut in 0..der.len().min(400) {
+            let _ = issuer_common_name(&der[..cut]);
+            let mut flipped = der.clone();
+            flipped[cut] ^= 0x80;
+            let _ = issuer_common_name(&flipped);
+        }
     }
 }

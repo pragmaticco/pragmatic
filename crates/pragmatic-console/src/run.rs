@@ -86,6 +86,10 @@ pub struct ServerRun<'a> {
     /// The erasure disclosure (escaped HTML), for administrators: the
     /// last thing in the side column.
     pub erase: Option<&'a str>,
+    /// Who each server token is, as `(token id, principal)`: the Run card
+    /// names the token that recorded each attempt. Empty for a viewer who
+    /// may not see personal data.
+    pub principals: &'a [(String, String)],
 }
 
 /// What a page needs to show one run.
@@ -163,8 +167,11 @@ pub enum WitnessTrust {
 /// One timestamp service or witness of a run's anchor.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AnchorWitness {
-    /// The operator's name.
+    /// The operator, as an identifier (`digicert`).
     pub operator: String,
+    /// The operator's name as people know it (`DigiCert`), when the server
+    /// was given one; without one, the card sets the identifier in mono.
+    pub name: Option<String>,
     /// `RFC 3161`, `cosignature` or `server signature`.
     pub kind: String,
     pub trust: WitnessTrust,
@@ -288,16 +295,18 @@ impl Span<'_> {
     }
 }
 
-/// `14 Oct 2026, 00:31 UTC` for an RFC 3339 time, as HTML: the day in
-/// words, the time in mono, kept together.
-pub(crate) fn time_html(rfc: &str) -> String {
-    match rfc.get(11..16) {
-        Some(hm) if rfc.len() >= 20 => format!(
-            "<span class=\"nw\">{}, <span class=\"m\">{}</span> UTC</span>",
-            esc(&text::day_of(rfc)),
-            esc(hm)
+/// An RFC 3339 UTC time as the console sets it in a sentence: `14 Oct
+/// 2026, 04:24:53 UTC`, the time in mono; the line breaks only after the
+/// comma. Seconds are always shown: a bound such as "no later than"
+/// rounded down to the minute would claim more than its token proves.
+pub(crate) fn when(rfc: &str) -> String {
+    match (rfc.get(11..19), rfc.len() >= 20) {
+        (Some(hms), true) if rfc.as_bytes().get(10) == Some(&b'T') => format!(
+            "{}, <span class=\"m nw\">{}</span>\u{a0}UTC",
+            esc(&text::day_of(rfc)).replace(' ', "\u{a0}"),
+            esc(hms)
         ),
-        _ => mono(&text::clip(rfc, 40)),
+        _ => format!("<span class=\"m nw\">{}</span>", esc(&text::clip(rfc, 40))),
     }
 }
 
@@ -528,6 +537,11 @@ fn sheet_head(view: &RunView<'_>, facts: &Facts, t: &Totals, page: &Span<'_>) ->
             plural(open.len() as u64, "interrupted call", "interrupted calls")
         ));
     }
+    // Each fact is kept whole; the line breaks only between facts.
+    let items: Vec<String> = items
+        .into_iter()
+        .map(|i| format!("<span class=\"nw\">{i}</span>"))
+        .collect();
     let mut facts_line = items.join(" \u{b7} ");
     if view.filter.is_some() {
         facts_line.push_str(&tag("Redacted"));
@@ -567,8 +581,9 @@ fn sheet_head(view: &RunView<'_>, facts: &Facts, t: &Totals, page: &Span<'_>) ->
     if view.filter.is_some() {
         out.push_str(&notice(
             "Content is redacted for you: personal data and secrets the server finds are \
-             replaced, and attachments are summarised. Redaction does not inspect images, PDFs \
-             or audio, and is not de-identification.",
+             replaced, attachments are summarised, and the user and machine each attempt ran \
+             as are withheld. Redaction does not inspect images, PDFs or audio, and is not \
+             de-identification.",
             false,
         ));
     }
@@ -864,18 +879,29 @@ fn entry_section(ctx: &Ctx<'_>, e: &Entry) -> String {
     let mut links = String::new();
     match &e.event {
         Event::DrawIntent { .. } | Event::EffectIntent { .. } => {
-            let rs = ctx
-                .facts
-                .results
-                .get(&e.cursor)
-                .cloned()
-                .unwrap_or_default();
+            let rs: &[Cursor] = ctx.facts.results.get(&e.cursor).map_or(&[], |v| v);
             if rs.is_empty() {
                 links = " No result recorded.".into();
             } else {
-                let l: Vec<String> = rs.iter().map(|&c| ctx.cursor(c)).collect();
+                // The first few, linked, and a count of the rest: an intent
+                // can have any number of results, and its section must not
+                // grow with them.
+                let l: Vec<String> = rs
+                    .iter()
+                    .take(rows::SHOWN)
+                    .map(|&c| ctx.cursor(c))
+                    .collect();
+                let more = rs.len() - l.len();
                 let word = if rs.len() == 1 { "Result" } else { "Results" };
-                links = format!(" {word}: {}.", l.join(", "));
+                links = if more == 0 {
+                    format!(" {word}: {}.", l.join(", "))
+                } else {
+                    format!(
+                        " {word}: {} and {} more.",
+                        l.join(", "),
+                        text::count(more as u64)
+                    )
+                };
             }
         }
         Event::DrawResult { intent, .. } | Event::EffectResult { intent, .. } => {
@@ -890,6 +916,7 @@ fn entry_section(ctx: &Ctx<'_>, e: &Entry) -> String {
         meaning(e)
     );
     let mut fields: Vec<(&str, String)> = Vec::new();
+    let mut withheld: Option<String> = None;
     let mut block: Option<(&str, &str)> = None;
     match &e.event {
         Event::DrawIntent { provenance, .. } => fields.push(("provenance", field(provenance))),
@@ -953,7 +980,12 @@ fn entry_section(ctx: &Ctx<'_>, e: &Entry) -> String {
         Event::Marker { name } => fields.push(("patch", field(name))),
         Event::Note { kind, data, .. } => {
             fields.push(("kind", field(kind)));
-            block = Some(("data", data));
+            // The user and machine an attempt ran as are personal data: a
+            // viewer who may not see content raw does not see them.
+            if ctx.filter.is_some() && kind == "attempt.start" {
+                withheld = withhold_identity(data);
+            }
+            block = Some(("data", withheld.as_deref().unwrap_or(data)));
         }
         Event::Random { source, args, .. } => {
             fields.push(("source", field(source)));
@@ -1028,6 +1060,27 @@ fn entry_section(ctx: &Ctx<'_>, e: &Entry) -> String {
     }
     out.push_str("</section>");
     out
+}
+
+/// What a viewer without `view_raw` sees in place of a personal field, as
+/// Pragmatic Server's access log shows it.
+const WITHHELD: &str = "[withheld]";
+
+/// An attempt note's data with its `principal` and `host` withheld, or
+/// `None` when the data is not a JSON object.
+fn withhold_identity(data: &str) -> Option<String> {
+    let Ok(Json::Object(members)) = Json::parse(data) else {
+        return None;
+    };
+    let members = members
+        .into_iter()
+        .map(|(k, v)| match (k.as_str(), &v) {
+            ("principal" | "host", Json::Null) => (k, v),
+            ("principal" | "host", _) => (k, Json::String(WITHHELD.into())),
+            _ => (k, v),
+        })
+        .collect();
+    Some(Json::Object(members).to_string())
 }
 
 /// A format 1 entry in full: each recorded value (prompt, outcome,
@@ -1143,6 +1196,7 @@ pub(crate) fn anchor_card(anchor: Option<&AnchorStatus>, entries: u64) -> String
             .iter()
             .map(|o| AnchorWitness {
                 operator: o.clone(),
+                name: None,
                 kind: String::new(),
                 trust: if a.independent {
                     WitnessTrust::Trusted
@@ -1190,7 +1244,7 @@ pub(crate) fn anchor_card(anchor: Option<&AnchorStatus>, entries: u64) -> String
         let when = a
             .time
             .as_deref()
-            .map(|t| format!(" \u{b7} existed no later than {}", time_html(t)))
+            .map(|t| format!(" \u{b7} existed no later than {}", when(t)))
             .unwrap_or_default();
         let body = if anchored >= entries {
             format!(
@@ -1229,14 +1283,23 @@ pub(crate) fn anchor_card(anchor: Option<&AnchorStatus>, entries: u64) -> String
         } else {
             format!("{} \u{b7} {note}", text::clip(&w.kind, 24))
         };
+        // The root a trusted witness's pinned anchors chain to.
         let root = w
             .root
             .as_deref()
+            .filter(|_| w.trust == WitnessTrust::Trusted)
             .map(|r| format!("<span class=\"root\">{}</span>", esc(&text::clip(r, 80))))
             .unwrap_or_default();
+        // A name as people know it, or else the identifier, set as one.
+        let name = match w.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            Some(n) => format!("<span class=\"nm\">{}</span>", esc(&text::clip(n, 64))),
+            None => format!(
+                "<span class=\"nm m\">{}</span>",
+                esc(&text::clip(&w.operator, 64))
+            ),
+        };
         ops.push_str(&format!(
-            "<li class=\"op\">{mark}<span class=\"nm\">{}</span><span class=\"st\">{}</span>{root}</li>",
-            esc(&text::clip(&w.operator, 64)),
+            "<li class=\"op\">{mark}{name}<span class=\"st\">{}</span>{root}</li>",
             esc(&st)
         ));
     }
@@ -1245,11 +1308,20 @@ pub(crate) fn anchor_card(anchor: Option<&AnchorStatus>, entries: u64) -> String
     } else {
         format!("<ul class=\"ops\">{ops}</ul>")
     };
+    // The card's head is divided by a hairline like every card's. Only a
+    // partial anchor draws its share, as a meter inside the card above the
+    // count it shows in words, so it never reads as a border.
+    let meter = if anchored > 0 && anchored < entries {
+        format!(
+            "<div class=\"meter\" aria-hidden=\"true\"><span style=\"width:{share:.2}%\"></span></div>"
+        )
+    } else {
+        String::new()
+    };
     format!(
         "<section class=\"card anchor\" aria-labelledby=\"h-anchor\"><div class=\"card-h\">\
          <h2 class=\"{class}\" id=\"h-anchor\">{}</h2>{}</div>\
-         <div class=\"rule\"><span style=\"width:{share:.2}%\"></span></div>{ops}\
-         <div class=\"card-b\">{body}{caveat}</div></section>",
+         <div class=\"rule\"></div>{ops}<div class=\"card-b\">{meter}{body}{caveat}</div></section>",
         esc(&title),
         tag("Preview")
     )
@@ -1314,7 +1386,10 @@ fn check_card(view: &RunView<'_>) -> String {
         ),
         (
             "head",
-            format!("<span title=\"{head}\">{}\u{2026}</span>", &head[..16]),
+            format!(
+                "<span class=\"id\" title=\"{head}\">{}\u{2026}</span>",
+                &head[..12]
+            ),
         ),
         ("chain", chain),
         ("unaccounted erasures", list(&r.unaccounted_erasures)),
@@ -1420,10 +1495,12 @@ fn run_card(view: &RunView<'_>, facts: &Facts, t: &Totals, page: &Span<'_>) -> S
             esc(&labels.join(" "))
         },
     ));
+    // Names, hashes and model ids are units: each on one line.
+    let id = |s: &str| format!("<span class=\"id\">{}</span>", esc(s));
     rows.push((
         "program",
         match &t.program {
-            Some((name, hash)) => esc(&format!("{name} {}", text::clip(hash, 12))),
+            Some((name, hash)) => format!("{} {}", id(name), id(&text::clip(hash, 12))),
             None => not_recorded.clone(),
         },
     ));
@@ -1432,7 +1509,7 @@ fn run_card(view: &RunView<'_>, facts: &Facts, t: &Totals, page: &Span<'_>) -> S
         if t.models.is_empty() {
             not_recorded.clone()
         } else {
-            esc(&t.models.iter().cloned().collect::<Vec<_>>().join(" "))
+            t.models.iter().map(|m| id(m)).collect::<Vec<_>>().join(" ")
         },
     ));
     rows.push((
@@ -1479,7 +1556,7 @@ fn run_card(view: &RunView<'_>, facts: &Facts, t: &Totals, page: &Span<'_>) -> S
         "<section class=\"card run\" aria-labelledby=\"h-run\"><div class=\"card-h\">\
          <h2 class=\"card-t\" id=\"h-run\">Run</h2></div><div class=\"card-b\">{}{}</div></section>",
         data_list("n", &rows),
-        run_lists(view.journal, facts, t, page)
+        run_lists(view, facts, t, page)
     )
 }
 
@@ -1529,7 +1606,15 @@ fn step_words(j: &Journal, intent: Cursor) -> String {
 /// the last), then its failures and the record keeping after it, each a
 /// link to its place in the timeline. On a wide screen the card stays in
 /// view while a long timeline scrolls.
-fn run_lists(j: &Journal, facts: &Facts, t: &Totals, page: &Span<'_>) -> String {
+fn run_lists(view: &RunView<'_>, facts: &Facts, t: &Totals, page: &Span<'_>) -> String {
+    let j = view.journal;
+    // The server token that recorded an attempt, for a viewer who may see
+    // personal data. The SDK's own identity (the user and machine it ran
+    // as) stays in the attempt's note.
+    let principals = match (view.server, view.filter) {
+        (Some(s), None) => s.principals,
+        _ => &[],
+    };
     let item = |href: Option<String>, inner: String| match href {
         Some(h) => format!("<li><a href=\"{h}\">{inner}</a></li>"),
         None => format!("<li><span class=\"ja\">{inner}</span></li>"),
@@ -1576,20 +1661,30 @@ fn run_lists(j: &Journal, facts: &Facts, t: &Totals, page: &Span<'_>) -> String 
             } else {
                 esc(&text::clock(a.at))
             };
-            let who = match (a.principal.is_empty(), a.host.is_empty()) {
-                (true, true) => String::new(),
-                (false, true) => a.principal.clone(),
-                (true, false) => a.host.clone(),
-                (false, false) if a.principal.contains(a.host.as_str()) => a.principal.clone(),
-                (false, false) => format!("{} on {}", a.principal, a.host),
-            };
-            let who = esc(&text::clip(&who, 160));
+            // When it began, which token recorded it and its process, each
+            // kept whole: the line breaks only between them.
+            let mut parts: Vec<String> = Vec::new();
+            if !when.is_empty() {
+                parts.push(when);
+            }
+            if let Some((_, who)) = principals
+                .iter()
+                .find(|(id, _)| !a.token.is_empty() && *id == a.token)
+            {
+                parts.push(esc(&text::clip(who, 64)));
+            }
+            if !a.pid.is_empty() {
+                parts.push(esc(&format!("pid {}", text::clip(&a.pid, 16))));
+            }
             let out_class = if alarm { "out alarm" } else { "out" };
-            let who = match (when.is_empty(), who.is_empty()) {
-                (true, true) => String::new(),
-                (false, true) => format!("<span class=\"who\">{when}</span>"),
-                (true, false) => format!("<span class=\"who\">{who}</span>"),
-                (false, false) => format!("<span class=\"who\">{when} \u{b7} {who}</span>"),
+            let who = if parts.is_empty() {
+                String::new()
+            } else {
+                let parts: Vec<String> = parts
+                    .iter()
+                    .map(|p| format!("<span class=\"nw\">{p}</span>"))
+                    .collect();
+                format!("<span class=\"who\">{}</span>", parts.join(" \u{b7} "))
             };
             body.push_str(&item(
                 page.href(a.start, &format!("a{}", a.start)),

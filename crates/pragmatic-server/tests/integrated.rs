@@ -51,7 +51,57 @@ fn tsa_config(name: &str, t: &TsaServer) -> TsaConfig {
         url: t.url.clone(),
         roots_pem: t.tsa.root_pem(),
         operator: name.into(),
+        name: String::new(),
     }
+}
+
+/// A console page as `token` sees it: signed in through the form, the
+/// session cookie kept.
+async fn console_page(ts: &TestServer, token: &str, path: &str) -> String {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let cookie = |resp: &reqwest::Response| {
+        resp.headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap().split(';').next().unwrap().to_string())
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let resp = client
+        .get(format!("{}/console/sign-in", ts.url))
+        .send()
+        .await
+        .unwrap();
+    let jar = cookie(&resp);
+    let html = resp.text().await.unwrap();
+    let field = "name=\"csrf\" value=\"";
+    let at = html.find(field).unwrap() + field.len();
+    let csrf = &html[at..at + html[at..].find('"').unwrap()];
+    let body: String = form_urlencoded::Serializer::new(String::new())
+        .extend_pairs([("token", token), ("csrf", csrf)])
+        .finish();
+    let resp = client
+        .post(format!("{}/console/sign-in", ts.url))
+        .header("cookie", jar)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("sec-fetch-site", "same-origin")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let session = cookie(&resp);
+    let resp = client
+        .get(format!("{}{path}", ts.url))
+        .header("cookie", session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "{path}");
+    resp.text().await.unwrap()
 }
 
 /// A bundle as `GET /v1/runs/{id}/evidence` serves it.
@@ -127,7 +177,13 @@ async fn bundles_verify_offline_against_pinned_roots_and_fail_without_them() {
     let ts = TestServer::start_integrated(
         |c| {
             c.anchoring.allow_self_anchoring = false;
-            c.anchoring.tsa = vec![tsa_config("alpha", &alpha), tsa_config("beta", &beta)];
+            c.anchoring.tsa = vec![
+                TsaConfig {
+                    name: "Alpha Time".into(),
+                    ..tsa_config("alpha", &alpha)
+                },
+                tsa_config("beta", &beta),
+            ];
         },
         fast(),
     )
@@ -188,6 +244,25 @@ async fn bundles_verify_offline_against_pinned_roots_and_fail_without_them() {
     assert_eq!(
         metric(&metrics(&ts).await, "pragmatic_anchor_lag_seconds"),
         Some(0.0)
+    );
+    // The console names each service as configured, or by its operator
+    // set as an identifier, with the root its pinned anchors chain to.
+    let html = console_page(&ts, &auditor, "/console/runs/case-1").await;
+    assert!(
+        html.contains(">Anchored by 2 independent timestamp services</h2>"),
+        "{html}"
+    );
+    assert!(html.contains(
+        "<span class=\"nm\">Alpha Time</span><span class=\"st\">RFC 3161 \u{b7} trusted</span>\
+         <span class=\"root\">alpha Test Root</span>"
+    ));
+    assert!(html.contains(
+        "<span class=\"nm m\">beta</span><span class=\"st\">RFC 3161 \u{b7} trusted</span>\
+         <span class=\"root\">beta Test Root</span>"
+    ));
+    assert!(
+        !html.contains("class=\"meter\""),
+        "fully anchored: a hairline"
     );
 
     // Without pinned roots nothing counts: unanchored. With one operator's
