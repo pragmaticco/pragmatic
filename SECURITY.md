@@ -4,9 +4,9 @@
 
 | Version | Supported |
 |---|---|
-| 0.4.x | ✅ |
-| 0.3.x | ✅ |
-| < 0.3 | ❌ |
+| 0.6 (design-partner preview) | ✅ |
+| 0.5.x | ✅ |
+| < 0.5 | ❌ |
 
 ## Reporting a vulnerability
 
