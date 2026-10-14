@@ -14,6 +14,14 @@ run:
 examples/demo/run.sh
 ```
 
+If you have not downloaded it yet, these commands do, from the
+`system-of-record` branch where the demo lives until it reaches `main`:
+
+```sh
+git clone -b system-of-record https://github.com/pragmaticco/pragmatic
+cd pragmatic
+```
+
 The first run builds Pragmatic from source, which takes a few minutes.
 Later runs take about a minute. Add `--open` to open the auditor's report
 in your browser at the end:

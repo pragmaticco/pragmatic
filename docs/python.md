@@ -9,9 +9,12 @@ how to use it with agent frameworks. The design it implements is
 ## Install
 
 This guide describes 0.6.0. It is not on PyPI yet, so install it from a
-clone of the repository (this needs a Rust toolchain):
+clone of the repository's `system-of-record` branch, where 0.6 is until
+it is merged to `main` (this needs a Rust toolchain):
 
 ```sh
+git clone -b system-of-record https://github.com/pragmaticco/pragmatic
+cd pragmatic
 pip install "./crates/pragmatic-python[anthropic]"     # anthropic>=1.0
 pip install "./crates/pragmatic-python[openai]"        # openai>=3.0
 ```
@@ -23,8 +26,10 @@ and its journals (format 1) are read-only under 0.6.
 
 The journaled clients need `anthropic>=1.0` or `openai>=3.0`, the first
 releases built on `httpx2`. Clients from older releases raise
-`pragmatic.Unsupported` naming the upgrade to make. The runtime itself
-supports Python 3.9 and later.
+`pragmatic.Unsupported` naming the upgrade to make. Those SDK releases,
+and `httpx2`, need Python 3.10 or later, so `ctx.wrap` does too. The
+native runtime is built as one `abi3` extension for Python 3.9 and later,
+and is tested on Python 3.10 and 3.13.
 
 ## A first run
 
@@ -43,7 +48,7 @@ def research(ctx):
     return msg.content[0].text
 
 report = rt.run("research-42", research)     # record
-rt.resume("research-42", research)           # after a crash: nothing is repeated
+rt.resume("research-42", research)           # after a crash: recorded results are reused
 rt.replay("research-42", research)           # audit: nothing is called at all
 assert rt.verify("research-42")              # the hash chain and every commitment
 ```
@@ -95,6 +100,14 @@ The difference between the two:
 - `pragmatic.wrap(client)` records into whichever run calls it. Build it
   once, at module level or in a framework's configuration, and use it from
   any number of runs.
+
+An async client keeps its pooled connections on the event loop that
+opened them, so use one async client from one event loop: from
+`await rt.arun(...)` inside your long-lived loop, or from `rt.run(...)`
+calls on one thread, which drive async agents on a private loop that the
+thread keeps from one call to the next. Calling `asyncio.run(rt.arun(...))`
+again and again, or `rt.run` from several threads, gives calls different
+loops; there, build the client inside the agent with `ctx.wrap`.
 
 ### What a model call records
 
@@ -227,7 +240,10 @@ and read its `error`.
 ### Calls outside a run
 
 A journaled client called outside every run (or from a thread that does not
-carry the run's context) raises `NotInRun`. With
+carry the run's context) raises `pragmatic.JournalFault` carrying
+`NotInRun`: catch `JournalFault` and read its `.error`, because
+`except pragmatic.NotInRun` does not catch the carrier (see
+[Faults inside the SDK](#faults-inside-the-sdk)). With
 `pragmatic.wrap(client, outside="passthrough")` such calls are sent
 unrecorded instead, for code that uses one client both inside and outside
 durable runs. With `ctx.wrap(client, outside="passthrough")`, calls made
@@ -396,8 +412,12 @@ from `ctx.gather` children.
 ## Async, threads and ownership
 
 Async agents run with `await rt.arun(...)` (and `aresume`, `areplay`) in
-your event loop, or with `rt.run(...)` from synchronous code. Storage work
-runs on a dedicated thread per attempt, so the loop never waits on it.
+your event loop, or with `rt.run(...)` from synchronous code. `rt.run`
+drives an async agent on a private event loop, one per thread, kept from
+one call to the next so that an async client built once keeps its
+connections; each call still cancels the tasks the agent left running, as
+`asyncio.run` does, and a crash closes the loop. Storage work runs on a
+dedicated thread per attempt, so the loop never waits on it.
 
 An attempt belongs to the thread that runs it (sync) or to its root task
 and the `ctx.gather` children (async); threads started with
@@ -428,8 +448,8 @@ normally, and replay waits at that step until the timeout fires again.
 `asyncio.wait_for` does the same from Python 3.12. Before 3.12 it runs the
 step in a task of its own, which the attempt does not own, so a tool or
 `ctx.adraw` under it raises `NotInRun` (calls through a journaled client
-are accepted); `asyncio.shield` does so on every version. On Python 3.9
-and 3.10, use a timeout that runs in the caller's task, such as the
+are accepted); `asyncio.shield` does so on every version. Before Python
+3.11, use a timeout that runs in the caller's task, such as the
 `async-timeout` package.
 
 Cancelling the run itself (the task that awaits `rt.arun`) is a crash:

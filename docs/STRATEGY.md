@@ -43,10 +43,11 @@ Why:
   4. anchoring with independent timestamp authorities and witnesses;
   5. evidence bundles that an auditor verifies offline, trusting only
      roots they chose.
-- **Observability tools are partners, not rivals.** Langfuse, LangSmith
-  and Datadog keep traces in editable databases, keep them for a limited
-  time, and their audit logs cover admin actions only. Teams already use
-  them. We sit beside them as the record that holds up to an outsider.
+- **Observability tools are partners, not rivals.** Tracing tools such as
+  Langfuse, LangSmith and Datadog keep traces in editable databases, with
+  retention set by a hosted plan or by the operator's own configuration.
+  Teams already use them. We sit beside them as the record that holds up
+  to an outsider.
 - **The formal results are credibility, not the headline.** T1 (replay
   soundness, proved on paper) backs the replay claim. Buyers buy "we can
   answer the auditor", not theorems.
@@ -222,8 +223,9 @@ silently, and the journal is an anchored, exportable audit record rather
 than engine-internal history.
 
 **Why not our observability tool?** Keep it for debugging and dashboards.
-Its traces sit in an editable database and expire. Pragmatic is the
-record you hand to someone who does not trust you.
+Its traces sit in an editable database, kept for as long as its retention
+settings say. Pragmatic is the record you hand to someone who does not
+trust you.
 
 **Why self-hosted?** Regulated buyers do not want agent prompts and
 outputs in another vendor's cloud. Self-hosting makes us a software

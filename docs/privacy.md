@@ -83,7 +83,8 @@ erased):
 - commitments and chain hashes (with the salt gone, a commitment can no
   longer be linked to the content it covered);
 - anchor-log leaves, which contain run ids unless the server is set to
-  `anchor_run_ids = "hmac"`;
+  `anchor_run_ids = "hmac"` (which weakens what anchoring proves; see
+  [run ids](#labels-subjects-and-run-ids));
 - the server's access log (token ids, principals, source addresses, user
   agents, run ids, times), which run retention policies never shred;
 - the erasure ledger, which records every erasure so restores can repeat
@@ -127,6 +128,19 @@ rt.run("claim-7781", triage_agent,
 **Run ids** appear in file names (hashed), in the access log, in webhooks
 and, unless you choose `anchor_run_ids = "hmac"`, in the anchor log. Use
 opaque ids such as `claim-7781` or a UUID, never an email or a name.
+Opaque ids are the better way to keep run ids private, because
+`anchor_run_ids = "hmac"` trades auditability for that privacy:
+
+- nothing binds a run's anchor key to the run, so a server administrator
+  can rewrite an anchored run and anchor it again under a new key, and no
+  audit detects it;
+- every bundle from such a server reports `anchor_id_unbound`, and an
+  auditor's `--log` audit fails with `log_unauditable` instead of showing
+  that no anchor was left out.
+
+Keep the default, `"plain"`, wherever an auditor must be able to rule out
+hidden or rewritten anchors. Run ids bound to the log key, which would
+remove this trade-off, are planned for 0.7.
 
 ## Subject requests and erasure
 

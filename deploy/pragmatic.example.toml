@@ -79,7 +79,9 @@ tsa = [
 # witness = [ { url = "https://witness.example", vkey = "witness.example+<key id>+<base64>", operator = "example", token_file = "/etc/pragmatic/witness.token" } ]
 witness = []
 allow_self_anchoring = false
-# "plain" puts run ids in anchor leaves; "hmac" puts a keyed hash instead.
+# "plain" puts run ids in anchor leaves; "hmac" puts a keyed hash instead,
+# which hides run ids but lets an administrator anchor a rewritten run again
+# under a new key without any audit detecting it (see docs/server.md).
 anchor_run_ids = "plain"
 # Distinct witness operators a checkpoint needs to count as independently
 # anchored.

@@ -37,9 +37,15 @@ Either of these implements every check:
   independent programs agreeing on a bundle is stronger evidence than one.
 
 Both check everything, including the Ed25519 signatures of the log, the
-witnesses and the bundle, and both take the same flags. Neither is on a
-package registry yet: from a clone of the repository, install the first
-with `cargo install --path crates/pragmatic-cli`, and run the second as
+witnesses and the bundle, and both take the same trust and audit flags
+(`--tsa-roots`, `--witness-key`, `--log-key`, `--min-operators`, `--log`
+and `--witness-log`). `--openssl`, `--no-openssl` and `--explain` belong
+to `pragmatic verify-evidence` only, and `--json` (the report as JSON) to
+the reference verifier only. Neither is on a package registry yet: from
+a clone of the repository's `system-of-record` branch (`git clone -b
+system-of-record https://github.com/pragmaticco/pragmatic`; `main` holds
+0.4.0 until 0.6 is merged), install the first with `cargo install --path
+crates/pragmatic-cli`, and run the second as
 `python3 tools/verify_evidence.py`. To watch a bundle being produced by
 Pragmatic Server and checked both ways, including with the wrong roots and
 with one byte changed, run the demo (`examples/demo/run.sh`, step 6).
@@ -49,8 +55,10 @@ use the first `openssl` on your `PATH` that can. macOS ships LibreSSL as
 `/usr/bin/openssl`, which cannot check a time-stamp at the time it was
 made; it is skipped, and if it is the only one the report says the
 time-stamps were not checked (install OpenSSL 3, for example with
-Homebrew, and put it first on `PATH`). `--openssl` makes a missing or
-unusable OpenSSL an error instead.
+Homebrew, and put it first on `PATH`). For `pragmatic verify-evidence`,
+`--openssl` makes a missing or unusable OpenSSL an error instead; the
+reference verifier uses the `openssl` named by the `OPENSSL` environment
+variable, if set.
 
 `pragmatic verify-evidence --explain` prints the procedure the tool
 implements, so you can compare it with the published document.
@@ -110,7 +118,7 @@ configuration pins, with their fingerprints and where to obtain each
 yourself. The log key is the vkey `pragmatic-server keygen` printed; get
 it from the operator out of band.)
 
-or with the reference verifier, with the same flags:
+or with the reference verifier, with the same trust flags:
 
 ```sh
 python3 tools/verify_evidence.py support-ticket-4127.evidence.json \
@@ -131,7 +139,7 @@ The last line, and the exit code, give the verdict:
 
 | verdict | exit | meaning |
 |---|---|---|
-| `VERIFIED` | 0 | The whole journal is anchored by at least two independent operators you trust. |
+| `VERIFIED` | 0 | The whole journal is anchored by at least `--min-operators` (by default two) independent operators you trust. |
 | `VERIFIED (PARTIAL)` | 2 | A prefix is anchored that way; the report says how many entries at the end are not. Entries after the last anchor could have been changed by the operator without detection. |
 | `UNANCHORED` | 3 | The journal is internally intact, but nothing you trust ties it to a time. It could have been rewritten whole. |
 | `FAILED` | 1 | Something does not check out: the bundle is not what it claims to be, or an audit you asked for (`--log`, `--witness-log`) could not be completed. |
@@ -201,10 +209,11 @@ head the server chose. To rule out a server that forked its log (one
 history for you, another for everyone else), check it against a witness
 that cosigns the log: pass its cosigned history and its key. A Pragmatic
 Server in witness mode serves the history at
-`GET /v1/witness/log/{name}?after=`; the file is `{"witness": <the
-page's witness>, "origin": <its origin_line>, "checkpoints": [every
-page's cosigned[].checkpoint, in order]}`, each checkpoint carrying the
-witness's cosignature line.
+`GET /v1/witness/log/{name}?after=<cursor>` (leave `after` out for the
+first page, then pass each page's `next` until it is null); the file is
+`{"witness": <the page's witness>, "origin": <its origin_line>,
+"checkpoints": [every page's cosigned[].checkpoint, in order]}`, each
+checkpoint carrying the witness's cosignature line.
 
 ```sh
 pragmatic verify-evidence bundle.json ... --log anchors-log.json \
