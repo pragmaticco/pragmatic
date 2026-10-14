@@ -778,6 +778,22 @@ pub async fn erase(
         if !app.holds.matching(&id).is_empty() {
             return Ok(refused_with(&back, "on_hold"));
         }
+        // A preview of "every slot containing" says whether the run holds
+        // that text, which is a read of its content: it is logged as a raw
+        // read before it is made, so probing a run leaves the same record
+        // as reading it.
+        if let Selector::Match(_) = &selector {
+            durable_intent(
+                &app,
+                intent(
+                    "read_raw",
+                    &c.principal,
+                    Some(&id),
+                    json!({"what": "erase_preview"}),
+                ),
+            )
+            .await?;
+        }
         return erase_confirmation(&app, &c, &id, &back, &form, &selector).await;
     }
     let request = EraseRequest {

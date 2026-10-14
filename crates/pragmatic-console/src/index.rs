@@ -1,4 +1,4 @@
-//! The run index: one row per run, in a table on a leaf.
+//! The run index: one row per run, on a leaf, in the timeline's language.
 
 use pragmatic::encoding::hex_encode;
 use pragmatic::evidence::time::now_rfc3339;
@@ -7,7 +7,9 @@ use pragmatic::json::Json;
 use pragmatic::sha256::Digest;
 use pragmatic::VerifyReport;
 
-use crate::html::{diamond, document, empty, esc, masthead, mono, source_note, Crumb, Frame, Page};
+use crate::html::{
+    diamond, dir_name, document, empty, esc, masthead, mono, tag, Crumb, Frame, Page,
+};
 use crate::rows::quote;
 use crate::{gist, text};
 
@@ -107,64 +109,80 @@ pub fn render_index(rows: &[RunRow]) -> String {
 }
 
 /// The index page, naming where the runs live (`source`), in `frame`
-/// (`pragmatic serve`'s), or as a single file without one.
+/// (`pragmatic serve`'s), or as a single file without one. Each run is a
+/// row in the language of the run page's timeline: its state diamond, its
+/// id and verification, a sentence of its state, and its last time and
+/// head.
 pub fn render_index_of(rows: &[RunRow], source: Option<&str>, frame: Option<&Frame<'_>>) -> String {
     let readable: Vec<&RunRow> = rows.iter().filter(|r| r.error.is_none()).collect();
     let verified = readable.iter().filter(|r| r.verified).count();
     let entries: u64 = readable.iter().map(|r| r.entries).sum();
-    let open: usize = readable.iter().map(|r| r.open_intents).sum();
     let n = |x: String| format!("<span class=\"n\">{x}</span>");
-    let mut facts = format!(
-        "{} {} \u{b7} {} journal {} \u{b7} {} of {} chains verified",
+    let mut facts = vec![format!(
+        "{} {}",
         n(text::count(rows.len() as u64)),
-        if rows.len() == 1 { "run" } else { "runs" },
-        n(text::count(entries)),
-        if entries == 1 { "entry" } else { "entries" },
-        n(text::count(verified as u64)),
-        n(text::count(rows.len() as u64)),
-    );
-    if open > 0 {
-        facts.push_str(&format!(
-            " \u{b7} <span class=\"alarm\">{} open {}</span>",
-            n(text::count(open as u64)),
-            if open == 1 { "call" } else { "calls" }
+        if rows.len() == 1 { "run" } else { "runs" }
+    )];
+    if !rows.is_empty() {
+        facts.push(format!(
+            "{} {}",
+            n(text::count(entries)),
+            if entries == 1 { "entry" } else { "entries" }
         ));
+        facts.push(if verified == rows.len() {
+            match rows.len() {
+                1 => "its chain verified".to_string(),
+                2 => "both chains verified".to_string(),
+                k => format!("all {} chains verified", n(text::count(k as u64))),
+            }
+        } else {
+            format!(
+                "<span class=\"alarm\">{} of {} chains verified</span>",
+                n(text::count(verified as u64)),
+                n(text::count(rows.len() as u64))
+            )
+        });
     }
-    if let Some(s) = source {
-        facts.push_str(&format!(" \u{b7} in {}", mono(s)));
-    }
-    let table = if rows.is_empty() {
-        let dir = source.map(mono).unwrap_or_else(|| "this directory".into());
-        empty(&format!(
-            "No runs in {dir} yet. Point an agent's runtime here, for example \
-             <span class=\"m\">pragmatic.Runtime(\"journals\")</span>, and runs appear as they \
-             record. Refresh to follow."
-        ))
+    let body = if rows.is_empty() {
+        let (dir, example) = match source {
+            Some(s) => (
+                mono(s),
+                format!(
+                    " Point an agent's runtime at it, for example \
+                     <span class=\"m\">pragmatic.Runtime({})</span>, and runs appear here as \
+                     they record.",
+                    esc(&pragmatic::json::Json::String(s.to_string()).to_string())
+                ),
+            ),
+            None => ("this directory".to_string(), String::new()),
+        };
+        empty(&format!("No runs in {dir} yet.{example}"))
     } else {
         let this_year = now_rfc3339();
         let this_year = this_year.get(..4).unwrap_or("");
-        let body: String = rows.iter().map(|r| index_row(r, this_year)).collect();
+        let list: String = rows.iter().map(|r| index_row(r, this_year)).collect();
         format!(
-            "<div class=\"tscroll\"><table class=\"stack\"><caption class=\"sr-only\">Runs</caption>\
-             <thead><tr><th class=\"caps\"><span class=\"sr-only\">State</span></th>\
-             <th class=\"caps\" scope=\"col\">Run</th><th class=\"caps\" scope=\"col\">Last outcome</th>\
-             <th class=\"caps\" scope=\"col\">Chain</th><th class=\"caps r\" scope=\"col\">Entries</th>\
-             <th class=\"caps r\" scope=\"col\">Model calls</th><th class=\"caps r\" scope=\"col\">Attempts</th>\
-             <th class=\"caps\" scope=\"col\">Open calls</th><th class=\"caps\" scope=\"col\">Last activity (UTC)</th>\
-             <th class=\"caps\" scope=\"col\">Head</th></tr></thead><tbody>{body}</tbody></table></div>"
+            "<p class=\"cols caps\" aria-hidden=\"true\"><span>Run</span>\
+             <span class=\"c-time\">Last entry (UTC) \u{b7} head</span>\
+             <span class=\"c-hash\">Last entry (UTC)</span></p><ol class=\"rl\">{list}</ol>"
         )
     };
-    let main = format!(
-        "<div class=\"page-h\"><h1 class=\"title\">Runs</h1><p class=\"facts\">{facts}</p></div>\
-         <section class=\"tsheet\" aria-label=\"Runs\">{table}</section>"
-    );
-    let nav = source_note(source.unwrap_or(""), true);
-    let file = Frame {
-        nav: &nav,
-        ..Frame::FILE
+    let facts = if rows.is_empty() {
+        String::new()
+    } else {
+        format!("<p class=\"facts\">{}</p>", facts.join(" \u{b7} "))
     };
-    let frame = frame.unwrap_or(&file);
-    let mast = masthead(frame.home, &[Crumb::word("Runs", None)], frame.nav);
+    let main = format!(
+        "<div class=\"page-h\"><h1 class=\"title\">Runs</h1>{facts}</div>\
+         <section class=\"tsheet runs\" aria-label=\"Runs\">{body}</section>"
+    );
+    let frame = frame.unwrap_or(&Frame::FILE);
+    let crumbs: Vec<Crumb<'_>> = source
+        .and_then(dir_name)
+        .map(|d| Crumb::word(d, None))
+        .into_iter()
+        .collect();
+    let mast = masthead(frame.home, &crumbs, frame.nav);
     document(
         frame,
         &Page {
@@ -177,58 +195,92 @@ pub fn render_index_of(rows: &[RunRow], source: Option<&str>, frame: Option<&Fra
     )
 }
 
+/// One run in the list.
 fn index_row(r: &RunRow, this_year: &str) -> String {
-    let name = match &r.href {
+    let id = format!(
+        "<span class=\"rid\">{}</span>",
+        esc(&text::clip(&r.run_id, 80))
+    );
+    let wrap = |mark: &str, inner: String| match &r.href {
         Some(h) => format!(
-            "<a class=\"m\" href=\"{}\">{}</a>",
-            esc(h),
-            esc(&text::clip(&r.run_id, 80))
+            "<li class=\"rr {mark}\"><a class=\"rr-a\" href=\"{}\">{inner}</a></li>",
+            esc(h)
         ),
-        None => mono(&text::clip(&r.run_id, 80)),
+        None => format!("<li class=\"rr {mark}\"><div class=\"rr-a\">{inner}</div></li>"),
     };
     if let Some(e) = &r.error {
-        return format!(
-            "<tr><td class=\"mk\">{}</td><td class=\"head m\">{name}</td>\
-             <td colspan=\"8\"><span class=\"alarm\">Unreadable</span> \
-             <span class=\"s\">\u{b7}</span> {}</td></tr>",
-            diamond(true, true),
-            quote(&gist::excerpt(e, 120))
+        return wrap(
+            "mk-alarm",
+            format!(
+                "<span class=\"rr-t\">{id}<span class=\"badge alarm\">Unreadable</span></span>\
+                 <span class=\"rr-s\">{}</span>",
+                quote(&gist::excerpt(e, 120))
+            ),
         );
     }
     let failed = matches!(r.last_outcome.as_deref(), Some(o) if o != "ok");
-    let mark = if !r.verified || (failed && !r.open_attempt) {
-        diamond(true, true)
-    } else if r.open_intents > 0 {
-        diamond(false, true)
-    } else if r.last_outcome.as_deref() == Some("ok") && !r.open_attempt {
-        diamond(true, false)
+    let (state, mark) = if r.format == 1 {
+        ("Format 1, from Pragmatic 0.4 or 0.5".to_string(), "mk-fill")
+    } else if r.open_attempt {
+        ("Open".to_string(), "mk-hollow")
     } else {
-        diamond(false, false)
+        match r.last_outcome.as_deref() {
+            Some("ok") => ("Ended ok".to_string(), "mk-fill"),
+            Some("fault") => (
+                "<span class=\"alarm\">Ended with a fault</span>".to_string(),
+                "mk-alarm-big",
+            ),
+            Some(o) => (format!("Ended {}", mono(&text::clip(o, 16))), "mk-fill"),
+            None => ("No attempts".to_string(), "mk-hollow"),
+        }
     };
-    let outcome = match r.last_outcome.as_deref() {
-        _ if r.open_attempt => "<span class=\"s\">no end yet</span>".to_string(),
-        Some("ok") => "ok".to_string(),
-        Some(o) => format!("<span class=\"alarm\">{}</span>", esc(&text::clip(o, 16))),
-        None => "<span class=\"s dim\">none</span>".to_string(),
-    };
-    let chain = if r.verified {
-        "Verified".to_string()
+    let mark = if !r.verified {
+        "mk-alarm"
+    } else if r.open_intents > 0 && !r.open_attempt {
+        "mk-alarm-hollow"
+    } else if failed && mark == "mk-fill" {
+        "mk-alarm"
     } else {
-        "<span class=\"alarm\">Broken</span>".to_string()
+        mark
     };
-    let open = if r.open_intents > 0 {
+    let mut sentence = vec![state];
+    let count = |k: usize, one: &str, many: &str| {
         format!(
-            "<span class=\"alarm\">{} open</span>",
-            text::count(r.open_intents as u64)
+            "{} {}",
+            text::count(k as u64),
+            if k == 1 { one } else { many }
+        )
+    };
+    if r.format == 2 {
+        sentence.push(count(r.attempts, "attempt", "attempts"));
+    }
+    sentence.push(count(r.draws, "model call", "model calls"));
+    sentence.push(count(r.entries as usize, "entry", "entries"));
+    if r.open_intents > 0 && !r.open_attempt {
+        sentence.push(format!(
+            "<span class=\"alarm\">{}</span>",
+            count(r.open_intents, "interrupted call", "interrupted calls")
+        ));
+    }
+    if r.torn_bytes > 0 {
+        sentence.push(format!(
+            "{} ignored",
+            count(r.torn_bytes as usize, "torn byte", "torn bytes")
+        ));
+    }
+    let badge = if r.verified {
+        format!(
+            "<span class=\"badge\">{}Verified</span>",
+            diamond(true, false)
         )
     } else {
-        "<span class=\"s dim\">settled</span>".to_string()
-    };
-    let torn = if r.torn_bytes > 0 {
         format!(
-            "<span class=\"note\">{} torn bytes ignored</span>",
-            text::count(r.torn_bytes)
+            "<span class=\"badge alarm\">{}Chain broken</span>",
+            diamond(false, true)
         )
+    };
+    let read_only = if r.format == 1 {
+        tag("Read-only")
     } else {
         String::new()
     };
@@ -238,18 +290,15 @@ fn index_row(r: &RunRow, this_year: &str) -> String {
         .unwrap_or_default();
     let last = r
         .last_at
-        .map(|a| text::short_time(&text::time(a), this_year, false))
+        .map(|a| text::short_time(&text::time(a), this_year, true))
         .unwrap_or_default();
-    format!(
-        "<tr><td class=\"mk\">{mark}</td><td class=\"head m\">{name}{torn}</td>\
-         <td data-label=\"Last outcome\">{outcome}</td><td data-label=\"Chain\">{chain}</td>\
-         <td class=\"m r\" data-label=\"Entries\">{}</td><td class=\"m r\" data-label=\"Model calls\">{}</td>\
-         <td class=\"m r\" data-label=\"Attempts\">{}</td><td data-label=\"Open calls\">{open}</td>\
-         <td class=\"m nw\" data-label=\"Last activity\">{}</td>\
-         <td class=\"m dim\" data-label=\"Head\">{head}</td></tr>",
-        text::count(r.entries),
-        text::count(r.draws as u64),
-        text::count(r.attempts as u64),
-        esc(&last),
+    wrap(
+        mark,
+        format!(
+            "<span class=\"rr-t\">{id}{badge}{read_only}</span><span class=\"rr-tm\">{}</span>\
+             <span class=\"rr-s\">{}</span><span class=\"rr-h\">{head}</span>",
+            esc(&last),
+            sentence.join(" \u{b7} ")
+        ),
     )
 }

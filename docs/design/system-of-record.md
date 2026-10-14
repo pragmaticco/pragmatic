@@ -1187,7 +1187,9 @@ All under `/v1`. Bearer auth. Errors are
 **RunSummary:** `{run_id, entries, head, created_at, updated_at, status:
 "active"|"idle"|"dangling"|"regressed"|"missing", erased_slots,
 anchored_entries, unanchored_entries, holds: [id], labels, program,
-created_by, last_outcome, usage: {...}}`.
+created_by, last_outcome, attempts, attempt_open, usage: {...}}`.
+`attempt_open` is true when an attempt has started and not ended (it is
+running, or it crashed), so `last_outcome` belongs to an earlier attempt.
 
 **Entry JSON:** `{cursor, at, branch, kind, fields: {name: value}, slots:
 [{state: "sealed"|"erased"|"withheld"|"ref", commitment, text|null,
@@ -1869,27 +1871,63 @@ cut at 64 KiB.
   paper (`#f2efe6`) with lighter leaves on it, hairline rules, EB Garamond
   for words and IBM Plex Mono for data, no bold, square corners, the
   brand's diamond as the only icon, and one colour, terracotta, kept for
-  what stopped, failed or broke, or is about to be destroyed. It follows
-  `prefers-color-scheme` (no switch: a switch needs script) and prints in
-  the light scheme. Every state is said in words as well as by a marker.
+  what stopped, failed or broke, or is about to be destroyed. Like the
+  website it is always paper: it has no dark scheme and declares
+  `color-scheme: light`, so it looks the same on a machine set to dark.
+  The masthead is the website's, on the paper with no rule: the mark and
+  wordmark, then a breadcrumb (`Pragmatic / journals / refund-20417`
+  locally, `Pragmatic / Runs / refund-20417` on the server; a top-level
+  page has none, its navigation says where it is). It is a working tool,
+  so its type is larger than the website's miniature of it: data at least
+  12.5px, labels 11px, every text at least 4.5:1. Numbers in a line of
+  words are Garamond's own figures in ink, so the facts line is spaced
+  evenly. Every state is said in words as well as by a marker, and the
+  words are the same wherever a state is told (the run page, its Run card
+  and the runs list).
 - **Rows, not entries.** The run page is a run sheet (the run id, a
   verification badge, a facts line, a state line, the timeline and the
-  chain) beside an Anchoring, an Evidence check and a Run card, and for
-  administrators an Erase content card. The timeline's rows are built from
+  chain, whose foot carries the full chain head to copy) beside an Evidence
+  check card and a Run card, and on the server an Anchoring card above
+  them. A local journal has no anchors, and its page says nothing about
+  anchoring rather than something negative. The Run card lists the run's
+  attempts (each with its start, principal and host, and its outcome), its
+  failures and the record keeping after it, each a link to its place in
+  the timeline; on a wide screen the card stays in view while a long
+  timeline scrolls, and the facts line's failed and erased counts link to
+  their rows. For administrators, erasure is a quiet "Erase content…"
+  disclosure at the end of the side column that opens on its form. The
+  timeline's rows are built from
   the journal by fixed rules: a step is one row from its intent and every
   result recorded for it (its state follows the latest); `run.start` and
   the first `attempt.start` are one row; each attempt is a group; a result
   whose intent is on an earlier page, or that names no intent, is a row of
-  its own; every other entry is a row; and the console adds a row where an
-  attempt has no end ("No end: crashed" where a later attempt shows it, or
-  at the end of the run what is known: running on a live lease, crashed,
-  or for a local journal "running, or crashed"). Every entry of a page is
+  its own; every other entry is a row; record keeping written after the
+  run's last attempt (erasure and custody notes) is its own group, "After
+  the run", which does not stretch the run's recorded span; and the
+  console adds a row where an attempt has no end ("No end: crashed" where
+  a later attempt shows it, or at the end of the run what is known:
+  running on a live lease, crashed, or for a local journal, which cannot
+  say whether a process still writes it, "Attempt 2 is open"). A call
+  with no result that may still be under way (the last entry on its lane,
+  in a last attempt that is running or may be) waits in ink; any other is
+  interrupted, in terracotta. A recorded failure carries the crash row's
+  terracotta rule and wash. Every entry of a page is
   in exactly one row, and each row names all of its entries
   (`draw.intent #2 · draw.ok #3`), the time of its first and the hash of
   its last. Steps an attempt read back (its `replayed` equals the steps
-  completed before it) are marked so. A row expands (`<details>`, no
-  script) to its entries: what each means for replay, its fields, and each
-  slot with its address for erasure (`slot 3:1`).
+  completed before it) carry a ring, which the attempt's row repeats in
+  its words ("4 steps read back") and explains when expanded. A row
+  expands (`<details>`, no script) to its entries: what each means for
+  replay, its fields, and each slot with its address for erasure
+  (`slot 3:1`). A title sits in a `<summary>`, which is a button, so it
+  holds no link; the links (to the step performed again, to an intent on
+  an earlier page) are in the expanded row.
+- **The runs list** speaks the run page's language: each run is a row with
+  its state diamond, its id and verification badge, a sentence of its
+  state ("Ended ok · 2 attempts · 3 model calls · 14 entries"), and its
+  last time and head. On the server the sentence says the state from the
+  run summary (which carries `attempts` and `attempt_open`), its entries,
+  how far it is anchored and its holds.
 - **The console never makes things up.** A row's title is the console's
   own phrase ("Model call", "Tool call", "Run started"), recorded data in
   mono, and accents in the console's words. Recorded content reaches a
@@ -1908,18 +1946,36 @@ cut at 64 KiB.
   serve the fonts from their own origin (`/assets/` and `/console/assets/`,
   no credential, under names that carry a hash of the font, with
   `Cache-Control: public, max-age=31536000, immutable`), and their
-  policies allow `font-src 'self'` and nothing else from anywhere. Every
-  face tries installed fonts first (`local()`), then the bundled file; the
-  crate bundles EB Garamond (SIL OFL 1.1, `assets/fonts/OFL.txt`), and
-  each further font is one line in `fonts::BUNDLED`.
+  policies allow `font-src 'self'` and nothing else from anywhere. The
+  crate bundles all four faces, the unmodified Latin subsets Google Fonts
+  serves: EB Garamond roman and italic, and IBM Plex Mono regular and
+  medium (SIL OFL 1.1, `assets/fonts/OFL-EBGaramond.txt` and
+  `OFL-IBMPlexMono.txt`; Plex keeps its Reserved Font Name). Every face
+  loads from its bundled file only, never from an installed copy that may
+  be another version, so a page looks the same everywhere; Georgia and
+  Menlo, scaled to the bundled faces' metrics, stand in while a file
+  loads.
 - **Pages are bounded.** A run's timeline is shown a page at a time: a
   page ends after 5,000 entries, or before the entry whose detail would
   take the page past 16 MiB of HTML, whichever comes first, and links to
   the next (`RunView.from` and `RunView.page_link`; an exported file names
   the `pragmatic export --from` command that writes the next), so every
   entry is on some page and no page grows with the journal (a 1 GiB
-  journal would otherwise be a multi-gigabyte page). A ref slot links to
-  the slot it repeats rather than showing its content again.
+  journal would otherwise be a multi-gigabyte page). What a slot shows is
+  capped at 64 KiB of HTML, not of input: indenting and marking up JSON
+  can make it many times larger than the text (a nested array of zeros
+  grows more than seventy times), and the same cap holds a model call's
+  meta and a note's data. Everything a row writes besides its entries is
+  bounded too: it names at most five attempts that read it back and five
+  later results, and counts the rest, and the Run card lists at most eight
+  failures and the first and last attempts of a long run. Attempts are
+  found by their start or end cursor, never searched for, so a late page
+  of a journal with hundreds of thousands of attempts renders as fast as
+  the first. A ref slot links to the slot it repeats rather than showing
+  its content again. Recorded field values in an expanded row are set on
+  one line with control and bidirectional characters escaped, clipped at
+  4,096 characters, and data in mono is isolated (`unicode-bidi:
+  isolate`) so right-to-left letters cannot reorder a line.
 - **CSV carries its verdict.** `render_csv` takes the report: every row
   carries the verdict and whether the entry is independently anchored, and
   rows are decoded from the bundle's journal, never taken from its
@@ -1934,12 +1990,12 @@ cut at 64 KiB.
   server's redaction (4.10) for a viewer without `view_raw` (fields stay;
   refs resolve to their target first), and a `ServerRun`: the run's status
   and holds, its notices, the evidence downloads (auditors and
-  administrators) and the Erase content card (administrators). The run's
+  administrators) and the erasure disclosure (administrators). The run's
   anchoring lists each witness of its newest independent anchor (or its
   newest anchor) with its kind and whether the server counts its operator.
-  The other pages (runs, access log, holds and retention, tokens) are
-  tables on leaves in the same frame, stacked as labelled rows on a narrow
-  screen. The server's policy is the crate's with `font-src 'self'` and
+  The access log, holds and retention, and tokens are tables on leaves in
+  the same frame, stacked as labelled rows on a narrow screen; their cells
+  of ids, paths and runs never wrap mid-token. The server's policy is the crate's with `font-src 'self'` and
   `form-action 'self'` (and `frame-ancestors 'none'`), sent as a header
   and in the page; it still loads nothing from anywhere else and runs
   nothing. Its referrer policy is `same-origin`: under `no-referrer` a
@@ -1963,7 +2019,10 @@ cut at 64 KiB.
   `confirm=1` and the CSRF token, acts. An erasure's confirmation lists the
   slots it would erase, resolved from the stored journal exactly as the
   erasure resolves them (`Journal::erase_targets`); a run under a hold is
-  refused before anything is asked.
+  refused before anything is asked. Previewing "every slot containing"
+  says whether the run holds that text, which is a read of its content:
+  the preview is recorded in the access log as a raw read
+  (`read_raw`, `what: erase_preview`) before it is made.
 - **Errors are pages.** A console request that fails is answered with an
   HTML page in the console's frame, with the API's status and
   `Retry-After` (and, for 503 `starting` only, a reload after 5 seconds),

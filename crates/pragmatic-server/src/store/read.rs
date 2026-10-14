@@ -388,6 +388,8 @@ impl Store {
             "program": m.summary.program,
             "created_by": m.created_by,
             "last_outcome": m.summary.last_outcome,
+            "attempts": m.summary.attempts,
+            "attempt_open": m.summary.attempt_open,
             "usage": m.summary.usage,
         })
     }

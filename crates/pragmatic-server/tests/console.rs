@@ -366,6 +366,35 @@ async fn the_console_signs_in_shows_runs_redacted_and_guards_its_forms() {
     assert_eq!(location(&resp), "/console/runs/case-1?done=erased");
     let j = stored(&ts, "case-1");
     assert!(note_kinds(&j).iter().any(|k| k == "erasure"));
+    // A preview of "every slot containing" says whether the run holds the
+    // text: it is logged as a raw read before it is made, so a probe
+    // leaves the record a read does.
+    let probe = [
+        ("slots", ""),
+        ("match", "hello"),
+        ("reason_code", "dsar"),
+        ("reason", ""),
+        ("csrf", csrf.as_str()),
+    ];
+    let resp = b
+        .post("/console/runs/case-1/erase", &probe, "same-origin")
+        .await;
+    assert!(resp.status().is_success() || resp.status().is_redirection());
+    ts.app().access.flush().await.unwrap();
+    let audit: Value = ts
+        .get("/v1/audit?run_id=case-1", &ts.admin)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        audit["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["action"] == "read_raw" && r["what"] == "erase_preview"),
+        "{audit}"
+    );
     // Retention, and a token issued and revoked.
     let resp = b
         .post("/console/retention/run", &[("csrf", &csrf)], "same-origin")

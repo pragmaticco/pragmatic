@@ -30,11 +30,11 @@ use pragmatic::json::Json;
 use pragmatic::VerifyReport;
 
 use crate::html::{
-    data_list, diamond, document, empty, esc, masthead, mono, notice, pretty_json_html,
-    source_note, tag, Crumb, Frame, Page,
+    command, data_list, diamond, dir_name, document, empty, esc, esc_capped, masthead, mono,
+    notice, pretty_json_html_capped, tag, Crumb, Frame, Page,
 };
-use crate::rows::{self, Ctx, Facts, Liveness};
-use crate::slots::{slot_html, value_html, RefTarget, SlotAt};
+use crate::rows::{self, Attempt, Ctx, Facts, Liveness};
+use crate::slots::{slot_html, value_html, RefTarget, SlotAt, MAX_INLINE};
 use crate::text;
 
 /// The most timeline entries one page shows.
@@ -45,7 +45,14 @@ pub const PAGE_ENTRIES: usize = 5_000;
 pub const PAGE_BYTES: usize = 16 << 20;
 
 /// What a row adds to its entries' detail, at most, for the page budget.
-const ROW_BYTES: usize = 1200;
+/// Everything a row writes besides its entries' sections is bounded: its
+/// title's excerpts and gists are clipped, and it names at most
+/// [`rows::SHOWN`] attempts that read it back and later results.
+const ROW_BYTES: usize = 2048;
+
+/// How many failures, and attempts at each end of a run, the attempts
+/// card lists to jump to.
+const JUMPS: usize = 8;
 
 /// Content shown in place of each present slot's content, for a viewer
 /// who may not see it raw (Pragmatic Server's redaction for tokens without
@@ -76,7 +83,8 @@ pub struct ServerRun<'a> {
     /// The Evidence check card's foot (escaped HTML): the bundle downloads,
     /// for auditors and administrators.
     pub evidence: Option<&'a str>,
-    /// The Erase content card (escaped HTML), for administrators.
+    /// The erasure disclosure (escaped HTML), for administrators: the
+    /// last thing in the side column.
     pub erase: Option<&'a str>,
 }
 
@@ -197,6 +205,11 @@ pub fn render_run_page(view: &RunView<'_>) -> RunPage {
     let facts = Facts::of(j, live);
     let totals = totals(j, &facts);
     let (timeline, next) = timeline(j, &facts, view, view.from);
+    let page = Span {
+        from: view.from.min(j.len()),
+        end: next.unwrap_or(j.len()),
+        link: view.page_link,
+    };
     let mut main = String::new();
     if let Some(s) = view.server {
         main.push_str(s.notices);
@@ -204,38 +217,44 @@ pub fn render_run_page(view: &RunView<'_>) -> RunPage {
     main.push_str("<div class=\"run-grid\">");
     main.push_str(&format!(
         "<article class=\"sheet\" aria-labelledby=\"run-title\">{}{timeline}{}</article>",
-        sheet_head(view, &facts, &totals),
+        sheet_head(view, &facts, &totals, &page),
         chain_foot(view.report, j)
     ));
     main.push_str("<aside class=\"side\" aria-label=\"About this run\">");
-    main.push_str(&anchor_card(view.anchor, j.len(), view.server.is_some()));
+    // Anchoring is Pragmatic Server's: a local journal has none, and its
+    // page says nothing about it rather than something negative.
+    if view.server.is_some() || view.anchor.is_some() {
+        main.push_str(&anchor_card(view.anchor, j.len()));
+    }
     main.push_str(&check_card(view));
-    main.push_str(&run_card(view, &facts, &totals));
+    main.push_str("<div class=\"stick\">");
+    main.push_str(&run_card(view, &facts, &totals, &page));
     if let Some(erase) = view.server.and_then(|s| s.erase) {
         main.push_str(erase);
     }
-    main.push_str("</aside></div>");
+    main.push_str("</div></aside></div>");
 
-    let source = view.source.unwrap_or("");
-    let file_nav = source_note(source, false);
     let footer = view
         .exported
         .map(|t| format!("Exported {}", esc(&time_words(t))))
         .unwrap_or_default();
     let file_frame = Frame {
-        nav: &file_nav,
         footer: &footer,
         ..Frame::FILE
     };
     let frame = view.frame.unwrap_or(&file_frame);
-    let mast = masthead(
-        frame.home,
-        &[
-            Crumb::word("Runs", frame.home),
-            Crumb::id(view.run_id, None),
-        ],
-        frame.nav,
-    );
+    // Pragmatic Server: Runs / refund-20417. A directory of journals:
+    // journals / refund-20417.
+    let up = if view.server.is_some() {
+        Some(Crumb::word("Runs", frame.home))
+    } else {
+        view.source
+            .and_then(dir_name)
+            .map(|d| Crumb::word(d, frame.home))
+    };
+    let mut crumbs: Vec<Crumb<'_>> = up.into_iter().collect();
+    crumbs.push(Crumb::id(view.run_id, None));
+    let mast = masthead(frame.home, &crumbs, frame.nav);
     let html = document(
         frame,
         &Page {
@@ -247,6 +266,39 @@ pub fn render_run_page(view: &RunView<'_>) -> RunPage {
         },
     );
     RunPage { html, next }
+}
+
+/// The page of the timeline a run page shows, for links to rows on it or
+/// on other pages.
+struct Span<'a> {
+    from: Cursor,
+    end: Cursor,
+    link: Option<&'a str>,
+}
+
+impl Span<'_> {
+    /// The `href` of an anchor (`c14`, `a10`) at cursor `c`, or none in a
+    /// file that does not hold it.
+    fn href(&self, c: Cursor, anchor: &str) -> Option<String> {
+        if c >= self.from && c < self.end {
+            Some(format!("#{anchor}"))
+        } else {
+            self.link.map(|l| format!("{}{c}#{anchor}", esc(l)))
+        }
+    }
+}
+
+/// `14 Oct 2026, 00:31 UTC` for an RFC 3339 time, as HTML: the day in
+/// words, the time in mono, kept together.
+pub(crate) fn time_html(rfc: &str) -> String {
+    match rfc.get(11..16) {
+        Some(hm) if rfc.len() >= 20 => format!(
+            "<span class=\"nw\">{}, <span class=\"m\">{}</span> UTC</span>",
+            esc(&text::day_of(rfc)),
+            esc(hm)
+        ),
+        _ => mono(&text::clip(rfc, 40)),
+    }
 }
 
 /// `14 Oct 2026, 00:31 UTC` for an RFC 3339 time.
@@ -282,7 +334,11 @@ struct Totals {
     effect_failed: usize,
     effect_off: usize,
     failed: usize,
+    /// The intents of failed steps, the first [`JUMPS`] of them by cursor.
+    failures: Vec<Cursor>,
     erased: usize,
+    /// The first entry with an erased slot.
+    first_erased: Option<Cursor>,
     withheld: usize,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
@@ -298,14 +354,20 @@ fn totals(j: &Journal, facts: &Facts) -> Totals {
         ..Totals::default()
     };
     let is_tool = |name: &str| name.starts_with("tool:") && name.len() > 5;
+    // The run's own span: record keeping written after it (an erasure
+    // hours later) does not stretch it.
+    let run_end = facts.run_end(j);
     for e in j.entries() {
-        if e.at > 0 {
+        if e.at > 0 && e.cursor < run_end {
             t.first_at = Some(t.first_at.map_or(e.at, |f| f.min(e.at)));
             t.last_at = Some(t.last_at.map_or(e.at, |l| l.max(e.at)));
         }
         for c in e.event.slot_contents() {
             match c {
-                Content::Erased => t.erased += 1,
+                Content::Erased => {
+                    t.erased += 1;
+                    t.first_erased.get_or_insert(e.cursor);
+                }
                 Content::Withheld => t.withheld += 1,
                 Content::Sealed(_) => {}
             }
@@ -348,6 +410,7 @@ fn totals(j: &Journal, facts: &Facts) -> Totals {
             {
                 if text::draw_meta(meta).outcome == "error" {
                     t.failed += 1;
+                    t.failures.push(intent);
                 }
             }
             continue;
@@ -365,9 +428,12 @@ fn totals(j: &Journal, facts: &Facts) -> Totals {
             *slot += 1;
             if *outcome == EffectOutcome::Failed {
                 t.failed += 1;
+                t.failures.push(intent);
             }
         }
     }
+    t.failures.sort_unstable();
+    t.failures.truncate(JUMPS);
     // Format 1 records commits and write-offs, not failures.
     for e in j.entries() {
         if let Event::Legacy(l) = &e.event {
@@ -386,7 +452,7 @@ fn totals(j: &Journal, facts: &Facts) -> Totals {
 
 /// The title block: run id and verification badge, facts, state, and the
 /// notices that belong to the sheet.
-fn sheet_head(view: &RunView<'_>, facts: &Facts, t: &Totals) -> String {
+fn sheet_head(view: &RunView<'_>, facts: &Facts, t: &Totals, page: &Span<'_>) -> String {
     let j = view.journal;
     let report = view.report;
     let problems = text::verify_problems(report);
@@ -416,50 +482,53 @@ fn sheet_head(view: &RunView<'_>, facts: &Facts, t: &Totals) -> String {
     } else {
         String::new()
     };
-    let mut facts_line = format!(
-        "Format {} \u{b7} {}",
-        n(j.format()),
-        plural(j.len(), "entry", "entries")
-    );
+    // A count that leads to its rows, when the page can link to them.
+    let linked = |words: String, at: Option<Cursor>, anchor: &dyn Fn(Cursor) -> String| match at
+        .and_then(|c| page.href(c, &anchor(c)))
+    {
+        Some(h) => format!("<a href=\"{h}\">{words}</a>"),
+        None => words,
+    };
+    let mut items = vec![
+        format!("Format {}", n(j.format())),
+        plural(j.len(), "entry", "entries"),
+    ];
     if j.format() == 2 {
-        facts_line.push_str(&format!(
-            " \u{b7} {}",
-            plural(text::attempts(j) as u64, "attempt", "attempts")
-        ));
+        items.push(plural(text::attempts(j) as u64, "attempt", "attempts"));
     }
-    facts_line.push_str(&format!(
-        "<span class=\"br\"></span><span class=\"sp\"> \u{b7} </span>{} \u{b7} {}",
-        plural(t.draws as u64, "model call", "model calls"),
-        plural(t.tools as u64, "tool call", "tool calls")
-    ));
+    items.push(plural(t.draws as u64, "model call", "model calls"));
+    items.push(plural(t.tools as u64, "tool call", "tool calls"));
     if t.effects > 0 {
-        facts_line.push_str(&format!(
-            " \u{b7} {}",
-            plural(t.effects as u64, "effect", "effects")
-        ));
+        items.push(plural(t.effects as u64, "effect", "effects"));
     }
     if t.failed > 0 {
-        facts_line.push_str(&format!(
-            " \u{b7} <span class=\"alarm\">{} failed</span>",
-            n(t.failed)
+        items.push(format!(
+            "<span class=\"alarm\">{}</span>",
+            linked(
+                format!("{} failed", n(text::count(t.failed as u64))),
+                t.failures.first().copied(),
+                &|c| format!("c{c}")
+            )
         ));
     }
     if t.erased > 0 {
-        facts_line.push_str(&format!(
-            " \u{b7} {} erased",
-            plural(t.erased as u64, "slot", "slots")
+        items.push(linked(
+            format!("{} erased", plural(t.erased as u64, "slot", "slots")),
+            t.first_erased,
+            &|c| format!("c{c}"),
         ));
     }
     if t.withheld > 0 {
-        facts_line.push_str(&format!(" \u{b7} {} withheld", n(t.withheld)));
+        items.push(format!("{} withheld", n(text::count(t.withheld as u64))));
     }
     let open = open_calls(view, facts);
     if !open.is_empty() {
-        facts_line.push_str(&format!(
-            " \u{b7} <span class=\"alarm\">{}</span>",
-            plural(open.len() as u64, "open call", "open calls")
+        items.push(format!(
+            "<span class=\"alarm\">{}</span>",
+            plural(open.len() as u64, "interrupted call", "interrupted calls")
         ));
     }
+    let mut facts_line = items.join(" \u{b7} ");
     if view.filter.is_some() {
         facts_line.push_str(&tag("Redacted"));
     }
@@ -470,7 +539,10 @@ fn sheet_head(view: &RunView<'_>, facts: &Facts, t: &Totals) -> String {
         state_line(view, facts, t)
     );
     // Notices that belong to the sheet.
-    let link = |c: Cursor| format!("<a class=\"m\" href=\"#c{c}\">#{c}</a>");
+    let link = |c: Cursor| match page.href(c, &format!("c{c}")) {
+        Some(h) => format!("<a class=\"m\" href=\"{h}\">#{c}</a>"),
+        None => format!("<span class=\"m\">#{c}</span>"),
+    };
     for p in &problems {
         out.push_str(&notice(&esc(p), true));
     }
@@ -504,21 +576,28 @@ fn sheet_head(view: &RunView<'_>, facts: &Facts, t: &Totals) -> String {
     out
 }
 
-/// The calls without a result that are not simply running now.
+/// The calls without a result that a crash interrupted: not those of a
+/// last attempt that is running, or that may be (a local journal's).
 fn open_calls(view: &RunView<'_>, facts: &Facts) -> Vec<Cursor> {
-    let open = text::open_intents(view.journal);
-    match (facts.live, facts.open_last()) {
-        (Liveness::Running, Some(a)) => open.into_iter().filter(|&c| c < a.start).collect(),
-        _ => open,
-    }
+    text::open_intents(view.journal)
+        .into_iter()
+        .filter(|&c| !facts.pending(view.journal, c))
+        .collect()
 }
 
-/// `recorded 14 Oct 2026, 00:29:52 to 00:29:58 UTC`.
+/// `recorded 14 Oct 2026, 00:29:52 to 00:29:58 UTC`: the run's own entries,
+/// not the record keeping after it.
 fn span(t: &Totals) -> String {
     let (Some(a), Some(b)) = (t.first_at, t.last_at) else {
         return String::new();
     };
-    if text::day(a) == text::day(b) {
+    if text::clock(a) == text::clock(b) && text::day(a) == text::day(b) {
+        format!(
+            "recorded {}, {} UTC",
+            esc(&text::day(a)),
+            mono(&text::clock(a))
+        )
+    } else if text::day(a) == text::day(b) {
         format!(
             "recorded {}, {} to {} UTC",
             esc(&text::day(a)),
@@ -582,9 +661,12 @@ fn state_line(view: &RunView<'_>, facts: &Facts, t: &Totals) -> String {
                 diamond(false, true),
                 esc(&a.name())
             ),
+            // A local journal cannot say whether a process still writes
+            // it: the line says only what the journal holds.
             (None, Liveness::Unknown) => with_span(format!(
-                "{}No end yet: running, or crashed",
-                diamond(false, false)
+                "{}Open \u{b7} {}",
+                diamond(false, false),
+                esc(&a.name())
             )),
         },
     };
@@ -595,6 +677,10 @@ fn state_line(view: &RunView<'_>, facts: &Facts, t: &Totals) -> String {
                 " \u{b7} <span class=\"alarm\">{}</span>",
                 esc(s.status)
             )),
+            "dangling" => {
+                out.push_str(" \u{b7} <span class=\"alarm\">an effect was left open</span>")
+            }
+            "idle" => {}
             other => out.push_str(&format!(" \u{b7} {}", esc(other))),
         }
         if s.holds > 0 {
@@ -758,6 +844,15 @@ fn meaning(e: &Entry) -> &'static str {
     }
 }
 
+/// The longest field value an expanded row shows, in characters.
+const FIELD: usize = 4096;
+
+/// A recorded field's value in mono: on one line, control and bidi
+/// characters escaped, clipped.
+fn field(value: &str) -> String {
+    mono(&text::clip(value, FIELD))
+}
+
 /// One entry in an expanded row: its kind, cursor and time, what it means,
 /// its fields and its slots.
 fn entry_section(ctx: &Ctx<'_>, e: &Entry) -> String {
@@ -797,12 +892,12 @@ fn entry_section(ctx: &Ctx<'_>, e: &Entry) -> String {
     let mut fields: Vec<(&str, String)> = Vec::new();
     let mut block: Option<(&str, &str)> = None;
     match &e.event {
-        Event::DrawIntent { provenance, .. } => fields.push(("provenance", mono(provenance))),
+        Event::DrawIntent { provenance, .. } => fields.push(("provenance", field(provenance))),
         Event::DrawResult { meta, .. } => {
             let m = text::draw_meta(meta);
-            fields.push(("outcome", mono(&m.outcome)));
+            fields.push(("outcome", field(&m.outcome)));
             if !m.model.is_empty() {
-                fields.push(("model", mono(&m.model)));
+                fields.push(("model", field(&m.model)));
             }
             if m.input_tokens.is_some() || m.output_tokens.is_some() {
                 fields.push((
@@ -818,58 +913,58 @@ fn entry_section(ctx: &Ctx<'_>, e: &Entry) -> String {
                 fields.push(("latency", esc(&format!("{} ms", text::count(ms)))));
             }
             if !m.stop_reason.is_empty() {
-                fields.push(("stop reason", mono(&m.stop_reason)));
+                fields.push(("stop reason", field(&m.stop_reason)));
             }
             if let Some(st) = m.status {
                 fields.push(("status", esc(&st.to_string())));
             }
             if !m.error_kind.is_empty() {
-                fields.push(("error kind", mono(&m.error_kind)));
+                fields.push(("error kind", field(&m.error_kind)));
             }
             if !m.error_type.is_empty() {
-                fields.push(("error type", mono(&m.error_type)));
+                fields.push(("error type", field(&m.error_type)));
             }
             block = Some(("meta", meta));
         }
-        Event::EffectIntent { name, .. } => fields.push(("effect", mono(name))),
+        Event::EffectIntent { name, .. } => fields.push(("effect", field(name))),
         Event::EffectResult {
             outcome,
             error_kind,
             ..
         } => {
-            fields.push(("outcome", mono(outcome.as_str())));
+            fields.push(("outcome", field(outcome.as_str())));
             if !error_kind.is_empty() {
-                fields.push(("error kind", mono(error_kind)));
+                fields.push(("error kind", field(error_kind)));
             }
         }
-        Event::ChannelRecv { channel, .. } => fields.push(("channel", mono(channel))),
+        Event::ChannelRecv { channel, .. } => fields.push(("channel", field(channel))),
         Event::Clock { nanos } => {
             fields.push(("read", mono(&rfc3339_nanos(*nanos))));
             fields.push(("nanoseconds", mono(&nanos.to_string())));
         }
         Event::Program { name, hash } => {
-            fields.push(("name", mono(name)));
-            fields.push(("hash", mono(hash)));
+            fields.push(("name", field(name)));
+            fields.push(("hash", field(hash)));
         }
         Event::Fork { base, children } => {
             fields.push(("first branch", mono(&base.to_string())));
             fields.push(("branches", mono(&children.to_string())));
         }
-        Event::Marker { name } => fields.push(("patch", mono(name))),
+        Event::Marker { name } => fields.push(("patch", field(name))),
         Event::Note { kind, data, .. } => {
-            fields.push(("kind", mono(kind)));
+            fields.push(("kind", field(kind)));
             block = Some(("data", data));
         }
         Event::Random { source, args, .. } => {
-            fields.push(("source", mono(source)));
-            fields.push(("arguments", mono(args)));
+            fields.push(("source", field(source)));
+            fields.push(("arguments", field(args)));
         }
         Event::Refusal { step, name, fault } => {
-            fields.push(("step", mono(step)));
+            fields.push(("step", field(step)));
             if !name.is_empty() {
-                fields.push(("name", mono(name)));
+                fields.push(("name", field(name)));
             }
-            fields.push(("fault", mono(fault)));
+            fields.push(("fault", field(fault)));
         }
         _ => {}
     }
@@ -886,10 +981,22 @@ fn entry_section(ctx: &Ctx<'_>, e: &Entry) -> String {
     out.push_str(&data_list("", &fields));
     if let Some((label, json)) = block {
         out.push_str(&format!("<p class=\"slot-l caps\">{label}</p>"));
-        out.push_str(&match pretty_json_html(json) {
-            Some(h) => format!("<pre class=\"json\">{h}</pre>"),
-            None => format!("<pre>{}</pre>", esc(json)),
-        });
+        // Capped like a slot: indentation and markup make the HTML far
+        // larger than the JSON.
+        let (html, cut) = match pretty_json_html_capped(json, MAX_INLINE) {
+            Some((h, cut)) => (format!("<pre class=\"json\">{h}</pre>"), cut),
+            None => {
+                let (h, cut) = esc_capped(json, MAX_INLINE);
+                (format!("<pre>{h}</pre>"), cut)
+            }
+        };
+        out.push_str(&html);
+        if cut {
+            out.push_str(&format!(
+                "<p class=\"slot-n\">Showing the first 64 KiB of {} bytes.</p>",
+                text::count(json.len() as u64)
+            ));
+        }
     }
     if let Event::Legacy(l) = &e.event {
         out.push_str(&legacy_detail(l));
@@ -936,35 +1043,35 @@ fn legacy_detail(l: &LegacyEvent) -> String {
             provenance,
         } => format!(
             "{}{}{}",
-            fields(&[("provenance", mono(provenance))]),
+            fields(&[("provenance", field(provenance))]),
             value("prompt", prompt),
             value("outcome", outcome)
         ),
         LegacyEvent::ChannelRecv { channel, value: v } => {
             format!(
                 "{}{}",
-                fields(&[("channel", mono(channel))]),
+                fields(&[("channel", field(channel))]),
                 value("value", v)
             )
         }
         LegacyEvent::EffectIntent { name, arg } => {
             format!(
                 "{}{}",
-                fields(&[("effect", mono(name))]),
+                fields(&[("effect", field(name))]),
                 value("argument", arg)
             )
         }
         LegacyEvent::EffectCommit { name, result } => {
             format!(
                 "{}{}",
-                fields(&[("effect", mono(name))]),
+                fields(&[("effect", field(name))]),
                 value("result", result)
             )
         }
-        LegacyEvent::EffectCompensated { name } => fields(&[("effect", mono(name))]),
+        LegacyEvent::EffectCompensated { name } => fields(&[("effect", field(name))]),
         LegacyEvent::Clock { nanos } => fields(&[("nanoseconds", mono(&nanos.to_string()))]),
         LegacyEvent::Program { name, hash } => {
-            fields(&[("name", mono(name)), ("hash", mono(hash))])
+            fields(&[("name", field(name)), ("hash", field(hash))])
         }
     }
 }
@@ -997,44 +1104,32 @@ fn chain_foot(report: &VerifyReport, j: &Journal) -> String {
     } else {
         String::new()
     };
+    // The full head, to copy: it breaks only at its middle.
     format!(
         "<p class=\"chain\">{}<span>Chain verified</span><span class=\"s\">\u{b7} {}</span>\
-         <span class=\"m\" title=\"{head}\">\u{b7} head {}</span>{extra}{torn}</p>",
+         <span class=\"m hd\"><span class=\"d\">\u{b7} </span>head <span class=\"hx\">{}<wbr>{}</span></span>{extra}{torn}</p>",
         diamond(true, false),
         if j.len() == 1 {
             "1 entry".to_string()
         } else {
             format!("{} entries", text::count(j.len()))
         },
-        &head[..16]
+        &head[..32],
+        &head[32..]
     )
 }
 
-/// The Anchoring card.
-pub(crate) fn anchor_card(anchor: Option<&AnchorStatus>, entries: u64, server: bool) -> String {
+/// The Anchoring card, on Pragmatic Server.
+pub(crate) fn anchor_card(anchor: Option<&AnchorStatus>, entries: u64) -> String {
     let caveat = "<p class=\"note\">An anchor proves these entries existed by then, not that \
                   they were true.</p>";
     let Some(a) = anchor else {
-        let (title, body) = if server {
-            (
-                "Not yet anchored",
-                "No timestamp service has witnessed this run yet.",
-            )
-        } else {
-            (
-                "Not anchored",
-                "A local journal carries no anchors: nothing ties it to a time.",
-            )
-        };
-        let tag_html = if server {
-            tag("Preview")
-        } else {
-            String::new()
-        };
         return format!(
             "<section class=\"card anchor\" aria-labelledby=\"h-anchor\"><div class=\"card-h\">\
-             <h2 class=\"card-t o\" id=\"h-anchor\">{title}</h2>{tag_html}</div>\
-             <div class=\"rule\"></div><div class=\"card-b\"><p>{body}</p></div></section>"
+             <h2 class=\"card-t o\" id=\"h-anchor\">Not yet anchored</h2>{}</div>\
+             <div class=\"rule\"></div><div class=\"card-b\"><p>No timestamp service has \
+             witnessed this run yet.</p></div></section>",
+            tag("Preview")
         );
     };
     let anchored = a.anchored_entries.min(entries);
@@ -1095,12 +1190,7 @@ pub(crate) fn anchor_card(anchor: Option<&AnchorStatus>, entries: u64, server: b
         let when = a
             .time
             .as_deref()
-            .map(|t| {
-                format!(
-                    " \u{b7} existed no later than <span class=\"m nw\">{}</span>",
-                    esc(&time_words(t))
-                )
-            })
+            .map(|t| format!(" \u{b7} existed no later than {}", time_html(t)))
             .unwrap_or_default();
         let body = if anchored >= entries {
             format!(
@@ -1242,18 +1332,30 @@ fn check_card(view: &RunView<'_>) -> String {
             .map(|f| format!("<div class=\"card-f\">{f}</div>"))
             .unwrap_or_default(),
         None => {
-            let dir = view
+            let run = shell_word(view.run_id);
+            let dir: Vec<String> = view
                 .source
-                .map(|d| format!(" --dir {}", esc(&shell_word(d))))
-                .unwrap_or_default();
-            let run = esc(&shell_word(view.run_id));
+                .map(|d| format!("--dir {}", shell_word(d)))
+                .into_iter()
+                .collect();
+            let verify = [vec![format!("pragmatic verify {run}")], dir.clone()].concat();
+            let bundle = [
+                vec![
+                    format!("pragmatic evidence {run}"),
+                    format!(
+                        "-o {}",
+                        shell_word(&format!("{}.evidence.json", view.run_id))
+                    ),
+                ],
+                dir,
+            ]
+            .concat();
             format!(
-                "<div class=\"card-f\"><p class=\"lbl\">Check it yourself</p>\
-                 <code class=\"cmd\">pragmatic verify {run}{dir}</code>\
-                 <p class=\"lbl\">Make an evidence bundle</p>\
-                 <code class=\"cmd\">pragmatic evidence {run} -o {run}.evidence.json{dir}</code>\
-                 <p class=\"note\">Local bundles are unanchored: they prove integrity, not \
-                 time.</p></div>"
+                "<div class=\"card-f\"><p class=\"lbl\">Check it yourself</p>{}\
+                 <p class=\"lbl\">Make an evidence bundle {}</p>{}</div>",
+                command(&verify),
+                tag("Preview"),
+                command(&bundle)
             )
         }
     };
@@ -1281,26 +1383,10 @@ fn shell_word(s: &str) -> String {
 }
 
 /// The Run card: what the sheet does not say.
-fn run_card(view: &RunView<'_>, facts: &Facts, t: &Totals) -> String {
+fn run_card(view: &RunView<'_>, facts: &Facts, t: &Totals, page: &Span<'_>) -> String {
     let j = view.journal;
+    // The run's state, status and holds are on the sheet's state line.
     let mut rows: Vec<(&str, String)> = Vec::new();
-    if let Some(s) = view.server {
-        let status = match s.status {
-            "regressed" | "missing" | "dangling" => {
-                format!("<span class=\"alarm\">{}</span>", esc(s.status))
-            }
-            other => esc(other),
-        };
-        rows.push(("status", status));
-        let holds = esc(&s.holds.to_string());
-        rows.push((
-            "holds",
-            match (s.holds_href, s.holds) {
-                (Some(h), k) if k > 0 => format!("<a class=\"m\" href=\"{}\">{holds}</a>", esc(h)),
-                _ => holds,
-            },
-        ));
-    }
     let labels = j
         .entries()
         .iter()
@@ -1324,12 +1410,12 @@ fn run_card(view: &RunView<'_>, facts: &Facts, t: &Totals) -> String {
             })
         })
         .unwrap_or_default();
-    let none = "<span class=\"s\">none</span>".to_string();
+    let none = "<span class=\"s\">none</span>";
     let not_recorded = "<span class=\"s\">not recorded</span>".to_string();
     rows.push((
         "labels",
         if labels.is_empty() {
-            none.clone()
+            none.to_string()
         } else {
             esc(&labels.join(" "))
         },
@@ -1361,11 +1447,15 @@ fn run_card(view: &RunView<'_>, facts: &Facts, t: &Totals) -> String {
         },
     ));
     // Format 1 records commits and write-offs, not failures.
+    // Each count keeps its words on one line.
     let outcomes = |ok: usize, failed: usize, off: usize| {
         if j.format() == 1 {
-            format!("{ok} ok \u{b7} {off} written off \u{b7} format 1 records no failures")
+            format!(
+                "{ok}\u{a0}ok \u{b7} {off}\u{a0}written\u{a0}off \u{b7} format 1 records no \
+                 failures"
+            )
         } else {
-            format!("{ok} ok \u{b7} {failed} failed \u{b7} {off} written off")
+            format!("{ok}\u{a0}ok \u{b7} {failed}\u{a0}failed \u{b7} {off}\u{a0}written\u{a0}off")
         }
     };
     rows.push((
@@ -1381,104 +1471,180 @@ fn run_card(view: &RunView<'_>, facts: &Facts, t: &Totals) -> String {
     rows.push((
         "slots",
         esc(&format!(
-            "{} erased \u{b7} {} withheld",
+            "{}\u{a0}erased \u{b7} {}\u{a0}withheld",
             t.erased, t.withheld
         )),
     ));
-    if let (Some(a), Some(b)) = (t.first_at, t.last_at) {
-        let when = if text::day(a) == text::day(b) {
-            format!(
-                "{} {} to {} UTC",
-                text::day(a),
-                text::clock_ms(a),
-                text::clock_ms(b)
-            )
-        } else {
-            format!(
-                "{} {} to {} {} UTC",
-                text::day(a),
-                text::clock_ms(a),
-                text::day(b),
-                text::clock_ms(b)
-            )
-        };
-        rows.push(("recorded", esc(&when)));
-    }
-    rows.push((
-        "source",
-        match (view.server, view.source) {
-            (Some(_), _) => "<span class=\"s\">Pragmatic Server</span>".to_string(),
-            (None, Some(s)) => esc(s),
-            (None, None) => none,
-        },
-    ));
-    let mut attempts = String::new();
-    if !facts.attempts.is_empty() {
-        attempts.push_str("<p class=\"caps\">Attempts</p><ul class=\"attempts\">");
-        for a in facts.attempts.iter().take(50) {
-            let who = format!("{} on {}", a.principal, a.host);
-            let outcome = match &a.end {
-                Some(e) if e.outcome == "ok" => {
-                    let mut s = String::from("ok");
-                    if let (Some(f), Some(r)) = (e.fresh, e.replayed) {
-                        s.push_str(&format!(", {f} fresh, {r} replayed"));
-                    }
-                    format!("<span class=\"s\">{}</span>", esc(&s))
-                }
-                Some(e) => format!(
-                    "<span class=\"s alarm\">{}</span>",
-                    esc(&if e.fault_kind.is_empty() {
-                        e.outcome.clone()
-                    } else {
-                        format!("{}, {}", e.outcome, e.fault_kind)
-                    })
-                ),
-                None if a.until.is_some() || facts.live != Liveness::Running => {
-                    if a.until.is_some() || facts.live != Liveness::Unknown {
-                        "<span class=\"s alarm\">no end</span>".to_string()
-                    } else {
-                        "<span class=\"s\">no end yet</span>".to_string()
-                    }
-                }
-                None => "<span class=\"s\">running</span>".to_string(),
-            };
-            let number = a.n.map_or("?".to_string(), |n| n.to_string());
-            let mut parts = vec![format!(
-                "<a class=\"m\" href=\"#a{}\">{}</a>",
-                a.start,
-                esc(&number)
-            )];
-            if !a.mode.is_empty() {
-                parts.push(esc(&a.mode));
-            }
-            if a.at > 0 {
-                parts.push(mono(&text::clock_ms(a.at)));
-            }
-            let who = if a.principal.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "<span class=\"m who\" title=\"{}\">{}</span>",
-                    esc(&who),
-                    esc(&a.principal)
-                )
-            };
-            attempts.push_str(&format!(
-                "<li><span>{}</span><span class=\"out\">{outcome}</span>{who}</li>",
-                parts.join(" \u{b7} ")
-            ));
-        }
-        if facts.attempts.len() > 50 {
-            attempts.push_str(&format!(
-                "<li><span class=\"s\">and {} more</span></li>",
-                text::count(facts.attempts.len() as u64 - 50)
-            ));
-        }
-        attempts.push_str("</ul>");
-    }
     format!(
-        "<section class=\"card\" aria-labelledby=\"h-run\"><div class=\"card-h\">\
-         <h2 class=\"card-t\" id=\"h-run\">Run</h2></div><div class=\"card-b\">{}{attempts}</div></section>",
-        data_list("n", &rows)
+        "<section class=\"card run\" aria-labelledby=\"h-run\"><div class=\"card-h\">\
+         <h2 class=\"card-t\" id=\"h-run\">Run</h2></div><div class=\"card-b\">{}{}</div></section>",
+        data_list("n", &rows),
+        run_lists(view.journal, facts, t, page)
     )
+}
+
+/// The words an attempt's outcome is told in, everywhere it is told, and
+/// whether they are trouble.
+fn attempt_outcome(a: &Attempt, live: Liveness, last: bool) -> (String, bool) {
+    match &a.end {
+        Some(e) if e.outcome == "ok" => {
+            let mut s = String::from("Ended ok");
+            if let (Some(f), Some(r)) = (e.fresh, e.replayed) {
+                s.push_str(&format!(" \u{b7} {f} fresh, {r} replayed"));
+            }
+            (s, false)
+        }
+        Some(e) if e.outcome == "fault" => {
+            let mut s = String::from("Ended with a fault");
+            if !e.fault_kind.is_empty() {
+                s.push_str(&format!(" \u{b7} {}", e.fault_kind));
+            }
+            (s, true)
+        }
+        Some(e) => (format!("Ended {}", e.outcome), false),
+        None if !last => ("No end: crashed".into(), true),
+        None => match live {
+            Liveness::Running => ("Running".into(), false),
+            Liveness::Unknown => ("Open".into(), false),
+            Liveness::Stopped | Liveness::Dangling => ("No end: crashed".into(), true),
+        },
+    }
+}
+
+/// "Tool call issue_refund", "Model call": a step's words, for a list.
+fn step_words(j: &Journal, intent: Cursor) -> String {
+    match j.get(intent).map(|e| &e.event) {
+        Some(Event::EffectIntent { name, .. }) => match name.strip_prefix("tool:") {
+            Some(tool) if !tool.is_empty() => {
+                format!("Tool call {}", mono(&text::clip(tool, 40)))
+            }
+            _ => format!("Effect {}", mono(&text::clip(name, 40))),
+        },
+        Some(Event::DrawIntent { .. }) => "Model call".to_string(),
+        _ => "Step".to_string(),
+    }
+}
+
+/// The Run card's lists: every attempt (or, in a long run, the first and
+/// the last), then its failures and the record keeping after it, each a
+/// link to its place in the timeline. On a wide screen the card stays in
+/// view while a long timeline scrolls.
+fn run_lists(j: &Journal, facts: &Facts, t: &Totals, page: &Span<'_>) -> String {
+    let item = |href: Option<String>, inner: String| match href {
+        Some(h) => format!("<li><a href=\"{h}\">{inner}</a></li>"),
+        None => format!("<li><span class=\"ja\">{inner}</span></li>"),
+    };
+    let mut body = String::new();
+    let count = facts.attempts.len();
+    if count > 0 {
+        // A long run lists its first attempts and its last ones.
+        let (head, tail) = if count > 2 * JUMPS {
+            (JUMPS / 2, JUMPS)
+        } else {
+            (count, 0)
+        };
+        let shown = facts.attempts[..head].iter().enumerate().chain(
+            facts.attempts[count - tail..]
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (count - tail + i, a)),
+        );
+        body.push_str(&format!(
+            "<p class=\"caps\" id=\"attempts\">{}</p><ol class=\"jl\">",
+            if count == 1 {
+                "Attempt".to_string()
+            } else {
+                format!("{} attempts", text::count(count as u64))
+            }
+        ));
+        for (i, a) in shown {
+            if tail > 0 && i == count - tail {
+                body.push_str(&format!(
+                    "<li class=\"more\">and {} more</li>",
+                    text::count((count - head - tail) as u64)
+                ));
+            }
+            let (outcome, alarm) = attempt_outcome(a, facts.live, i + 1 == count);
+            let mut words = esc(&a.title());
+            if !a.mode.is_empty() {
+                words.push_str(&format!(" \u{b7} {}", esc(&text::clip(&a.mode, 16))));
+            }
+            let when = if a.at == 0 {
+                String::new()
+            } else if facts.multi_day {
+                esc(&format!("{} {}", text::day(a.at), text::clock(a.at)))
+            } else {
+                esc(&text::clock(a.at))
+            };
+            let who = match (a.principal.is_empty(), a.host.is_empty()) {
+                (true, true) => String::new(),
+                (false, true) => a.principal.clone(),
+                (true, false) => a.host.clone(),
+                (false, false) if a.principal.contains(a.host.as_str()) => a.principal.clone(),
+                (false, false) => format!("{} on {}", a.principal, a.host),
+            };
+            let who = esc(&text::clip(&who, 160));
+            let out_class = if alarm { "out alarm" } else { "out" };
+            let who = match (when.is_empty(), who.is_empty()) {
+                (true, true) => String::new(),
+                (false, true) => format!("<span class=\"who\">{when}</span>"),
+                (true, false) => format!("<span class=\"who\">{who}</span>"),
+                (false, false) => format!("<span class=\"who\">{when} \u{b7} {who}</span>"),
+            };
+            body.push_str(&item(
+                page.href(a.start, &format!("a{}", a.start)),
+                format!(
+                    "<span class=\"w\">{words}</span><span class=\"{out_class}\">{}</span>{who}",
+                    esc(&outcome)
+                ),
+            ));
+        }
+        body.push_str("</ol>");
+    }
+    if t.failed > 0 {
+        body.push_str("<p class=\"caps\">Failures</p><ol class=\"jl\">");
+        for &c in &t.failures {
+            body.push_str(&item(
+                page.href(c, &format!("c{c}")),
+                format!(
+                    "<span class=\"w\">{}</span><span class=\"out\">{}</span>",
+                    step_words(j, c),
+                    mono(&format!("#{c}"))
+                ),
+            ));
+        }
+        if t.failed > t.failures.len() {
+            body.push_str(&format!(
+                "<li class=\"more\">and {} more</li>",
+                text::count((t.failed - t.failures.len()) as u64)
+            ));
+        }
+        body.push_str("</ol>");
+    }
+    if let Some(after) = facts.after {
+        body.push_str("<p class=\"caps\">After the run</p><ol class=\"jl\">");
+        let notes = &j.entries()[after as usize..];
+        for e in notes.iter().take(JUMPS) {
+            let words = match e.event.note_kind() {
+                Some("erasure") => "Erasure",
+                Some("custody") => "Lease custody",
+                _ => "Note",
+            };
+            body.push_str(&item(
+                page.href(e.cursor, &format!("c{}", e.cursor)),
+                format!(
+                    "<span class=\"w\">{words}</span><span class=\"out\">{}</span>",
+                    mono(&format!("#{}", e.cursor))
+                ),
+            ));
+        }
+        if notes.len() > JUMPS {
+            body.push_str(&format!(
+                "<li class=\"more\">and {} more</li>",
+                text::count((notes.len() - JUMPS) as u64)
+            ));
+        }
+        body.push_str("</ol>");
+    }
+    body
 }

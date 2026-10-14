@@ -50,7 +50,7 @@ pub fn render_evidence(bundle: &Bundle, report: &EvidenceReport) -> String {
         _ => main.push_str(&records_table(&bundle.records)),
     }
     let right = format!(
-        "<span class=\"src-note\">bundle made {} \u{b7} unsigned time</span>",
+        "<span class=\"mast-note\">Bundle made {} \u{b7} an unsigned time</span>",
         esc(&time_words(&text::clip(&bundle.generated_at, 40)))
     );
     let mast = masthead(
@@ -73,6 +73,51 @@ pub fn render_evidence(bundle: &Bundle, report: &EvidenceReport) -> String {
     )
 }
 
+/// An RFC 3339 UTC time as the console sets it in a sentence: `14 Oct
+/// 2026, 04:01:30 UTC`, the time in mono and kept on one line.
+fn when(rfc: &str) -> String {
+    match (rfc.get(11..19), rfc.len() >= 20) {
+        (Some(hms), true) if rfc.as_bytes().get(10) == Some(&b'T') => format!(
+            "{}, <span class=\"m nw\">{}</span> UTC",
+            esc(&text::day_of(rfc)),
+            esc(hms)
+        ),
+        _ => format!("<span class=\"m nw\">{}</span>", esc(&text::clip(rfc, 40))),
+    }
+}
+
+/// `1 operator`, `2 operators`.
+fn operators(n: usize) -> String {
+    if n == 1 {
+        "1 independent operator".to_string()
+    } else {
+        format!("{n} independent operators")
+    }
+}
+
+/// Text with the command-line flags in it (`--log-key`) set in mono, as
+/// escaped HTML.
+fn flags_in_mono(text: &str) -> String {
+    let mut out = String::new();
+    for (i, word) in text.split(' ').enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let lead = word.len() - word.trim_start_matches(['(', '"']).len();
+        let core = &word[lead..];
+        let core_end = core.trim_end_matches([')', '.', ',', ';', ':', '"']).len();
+        let (flag, tail) = core.split_at(core_end);
+        if flag.len() > 2 && flag.starts_with("--") {
+            out.push_str(&esc(&word[..lead]));
+            out.push_str(&format!("<span class=\"m\">{}</span>", esc(flag)));
+            out.push_str(&esc(tail));
+        } else {
+            out.push_str(&esc(word));
+        }
+    }
+    out
+}
+
 fn verdict(b: &Bundle, r: &EvidenceReport) -> String {
     let min = r.min_operators.max(1);
     let time = |entries: u64| {
@@ -81,7 +126,7 @@ fn verdict(b: &Bundle, r: &EvidenceReport) -> String {
             .filter(|a| a.independent && a.entries == entries)
             .filter_map(|a| a.earliest)
             .min()
-            .map(|t| format!(" no later than {}", t.rfc3339()))
+            .map(|t| format!(" no later than {}", when(&t.rfc3339())))
             .unwrap_or_default()
     };
     let (badge, text) = match r.verdict {
@@ -91,9 +136,10 @@ fn verdict(b: &Bundle, r: &EvidenceReport) -> String {
                 diamond(true, false)
             ),
             format!(
-                "All {} entries are anchored: witnesses from at least {min} independent \
-                 operator(s) the verifier trusts vouch that the journal up to its head existed{}.",
-                r.entries,
+                "All {} entries are anchored: witnesses from at least {} the verifier trusts \
+                 vouch that the journal up to its head existed{}.",
+                text::count(r.entries),
+                operators(min),
                 time(r.anchored_entries)
             ),
         ),
@@ -104,11 +150,17 @@ fn verdict(b: &Bundle, r: &EvidenceReport) -> String {
                 r.anchored_entries.saturating_sub(1)
             ),
             format!(
-                "The first {} of {} entries are independently anchored{}; the last {unanchored} \
-                 are not anchored by at least {min} trusted operator(s).",
-                r.anchored_entries,
-                r.entries,
-                time(r.anchored_entries)
+                "The first {} of {} entries are independently anchored{}; the last {} not \
+                 anchored by at least {} the verifier trusts.",
+                text::count(r.anchored_entries),
+                text::count(r.entries),
+                time(r.anchored_entries),
+                if unanchored == 1 {
+                    "is".to_string()
+                } else {
+                    format!("{} are", text::count(unanchored))
+                },
+                operators(min)
             ),
         ),
         Verdict::Unanchored => (
@@ -117,8 +169,9 @@ fn verdict(b: &Bundle, r: &EvidenceReport) -> String {
                 diamond(false, false)
             ),
             format!(
-                "The journal's integrity checks pass, but no anchor is witnessed by at least \
-                 {min} independent operator(s) the verifier trusts, so nothing ties it to a time."
+                "The journal's integrity checks pass, but no anchor is witnessed by at least {} \
+                 the verifier trusts, so nothing ties it to a time.",
+                operators(min)
             ),
         ),
         Verdict::Failed => (
@@ -185,14 +238,22 @@ fn verdict(b: &Bundle, r: &EvidenceReport) -> String {
          </section>",
         r.verdict.label(),
         r.exit_code(),
-        esc(&text),
+        text,
         facts.join(" \u{b7} ")
     )
 }
 
 fn checks(r: &EvidenceReport) -> String {
     let mut rows = String::new();
+    let mut step = "";
     for c in &r.checks {
+        // A step with several checks shows its number once.
+        let shown = if c.step == step {
+            "<span class=\"sr-only\">same step</span>".to_string()
+        } else {
+            esc(c.step)
+        };
+        step = c.step;
         let (mark, word) = match c.status {
             CheckStatus::Pass => (diamond(true, false), "pass".to_string()),
             CheckStatus::Fail => (
@@ -206,16 +267,19 @@ fn checks(r: &EvidenceReport) -> String {
             CheckStatus::Info => (diamond(false, false), "info".to_string()),
         };
         rows.push_str(&format!(
-            "<tr><td class=\"mk\">{mark}</td><td class=\"m r\" data-label=\"Step\">{}</td>\
+            "<tr><td class=\"mk\">{mark}</td><td class=\"m r\" data-label=\"Step\">{shown}</td>\
              <td class=\"head\">{}</td><td data-label=\"Result\">{word}</td>\
              <td class=\"m\" data-label=\"Detail\">{}</td></tr>",
-            esc(c.step),
             esc(c.name),
             esc(&text::sanitize(&c.detail))
         ));
     }
     format!(
-        "<section class=\"sect\"><h2 class=\"rhead\">Checks</h2><div class=\"tsheet\"><div class=\"tscroll\">\
+        "<section class=\"sect\"><h2 class=\"rhead\">Checks</h2><p class=\"lede\">Numbered by \
+         the steps of the verification procedure, which <span class=\"m\">pragmatic \
+         verify-evidence --explain</span> prints. A step with more than one check shows its \
+         number once, and a step this bundle gives nothing to check is left out.</p>\
+         <div class=\"tsheet\"><div class=\"tscroll\">\
          <table class=\"stack\"><caption class=\"sr-only\">Checks</caption><thead><tr>\
          <th class=\"caps\"><span class=\"sr-only\">State</span></th><th class=\"caps r\" scope=\"col\">Step</th>\
          <th class=\"caps\" scope=\"col\">Check</th><th class=\"caps\" scope=\"col\">Result</th>\
@@ -240,7 +304,7 @@ fn findings(r: &EvidenceReport) -> String {
             "<tr><td class=\"m head\">{}</td><td data-label=\"Severity\">{sev}</td>\
              <td data-label=\"Finding\">{}</td></tr>",
             f.code.as_str(),
-            esc(&text::sanitize(&f.message))
+            flags_in_mono(&text::sanitize(&f.message))
         ));
     }
     format!(
@@ -256,8 +320,9 @@ fn anchors(r: &EvidenceReport) -> String {
         return format!(
             "<section class=\"sect\"><h2 class=\"rhead\">Anchors</h2><div class=\"tsheet\">{}</div></section>",
             empty(
-                "No anchors: nothing ties this journal to a time. Bundles from a local journal \
-                 are always unanchored in 0.6."
+                "This bundle carries no anchors, so nothing ties its journal to a time. Bundles \
+                 made from a local journal carry none in 0.6; Pragmatic Server anchors the runs \
+                 it stores."
             )
         );
     }
@@ -289,7 +354,7 @@ fn anchor(a: &AnchorReport) -> String {
     };
     let time = a
         .earliest
-        .map(|t| format!(" \u{b7} no later than {}", mono(&t.rfc3339())))
+        .map(|t| format!(" \u{b7} no later than {}", when(&t.rfc3339())))
         .unwrap_or_default();
     let mut out = format!(
         "<div class=\"anc\"><p>{mark}Anchor {} \u{b7} {status} \u{b7} {} entries \u{b7} leaf {} of a \
@@ -313,17 +378,24 @@ fn anchor(a: &AnchorReport) -> String {
             ),
             (None, None) => String::new(),
         };
-        let when = w
-            .time
-            .map(|t| format!(" \u{b7} {}", mono(&t.rfc3339())))
-            .unwrap_or_default();
+        // The parts that are there, joined: no separator leads.
+        let mut parts = Vec::new();
+        if !operator.is_empty() {
+            parts.push(operator);
+        }
+        if let Some(t) = w.time {
+            parts.push(when(&t.rfc3339()));
+        }
+        if !w.detail.is_empty() {
+            parts.push(flags_in_mono(&text::sanitize(&w.detail)));
+        }
         out.push_str(&format!(
             "<li class=\"op\">{i}<span class=\"nm\">{}</span><span class=\"st\">{} \u{b7} {}</span>\
-             <span class=\"root\">{operator}{when} \u{b7} {}</span></li>",
+             <span class=\"root\">{}</span></li>",
             esc(&text::clip(&w.label, 64)),
             esc(w.kind),
             esc(w.class.as_str()),
-            esc(&text::sanitize(&w.detail))
+            parts.join(" \u{b7} ")
         ));
     }
     out.push_str("</ul></div>");
@@ -459,6 +531,20 @@ fn csv_cell(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn times_and_flags_are_set_as_data() {
+        assert_eq!(
+            when("2026-10-14T04:01:30Z"),
+            "14 Oct 2026, <span class=\"m nw\">04:01:30</span> UTC"
+        );
+        assert_eq!(when("<x>"), "<span class=\"m nw\">&lt;x&gt;</span>");
+        assert_eq!(
+            flags_in_mono("pin a key (pass --log-key). <b>"),
+            "pin a key (pass <span class=\"m\">--log-key</span>). &lt;b&gt;"
+        );
+        assert_eq!(flags_in_mono("-- --"), "-- --");
+    }
 
     #[test]
     fn csv_cells_are_quoted_and_defused() {

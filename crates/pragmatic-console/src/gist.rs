@@ -24,8 +24,10 @@ use crate::text;
 /// The default length of an excerpt, in characters.
 pub const EXCERPT: usize = 56;
 
-/// The length of an excerpt or gist inside a tool call's row.
-pub const GIST: usize = 44;
+/// The length of an excerpt or gist inside a tool call's row. A title
+/// holds two lines at most; the stylesheet ends a longer one at the width
+/// the row has, so this is a ceiling, not the usual cut.
+pub const GIST: usize = 64;
 
 /// Recorded prose, collapsed, escaped and clipped to `limit` characters at
 /// the last sentence end past 60% of the limit, else at the last word
@@ -91,9 +93,9 @@ fn member(key: &str, v: &Json) -> Option<String> {
     })
 }
 
-/// A string member's text, clipped to 20 characters.
+/// A string member's text, clipped to 32 characters.
 fn clip_quoted(s: &str) -> String {
-    let c = text::clip(s, 20);
+    let c = text::clip(s, 32);
     match c.strip_suffix('\u{2026}') {
         Some(head) => format!("{}\u{2026}", head.trim_end()),
         None => c,
@@ -507,7 +509,7 @@ mod tests {
         // Nothing left after skipping: the gist is made without skipping.
         assert_eq!(
             gist_json(&input, Some(&input), GIST),
-            Gist::Data("amount 129.00, charge_id ch_8812, \u{2026}".into())
+            Gist::Data("amount 129.00, charge_id ch_8812, order_id 20417".into())
         );
     }
 
@@ -516,7 +518,7 @@ mod tests {
         let g = |s: &str| gist_bytes(s.as_bytes(), None, GIST);
         assert_eq!(
             g(r#"{"note":"duplicate charge on the card","n":3,"ok":true,"x":null}"#),
-            Gist::Data("note \"duplicate charge on\u{2026}\", n 3, ok true".into())
+            Gist::Data("note \"duplicate charge on the card\", n 3, ok true".into())
         );
         assert_eq!(
             g(r#"{"a":{"b":1},"c":[1,2,3]}"#),

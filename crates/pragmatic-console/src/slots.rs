@@ -5,7 +5,7 @@
 //! inside JSON (images, documents, audio) are replaced by a summary of
 //! media type, size and SHA-256 using [`pragmatic::redact::binary`], and a
 //! slot that is not UTF-8 is summarized as a whole, so a page never inlines
-//! base64. Text is cut at [`MAX_INLINE`] bytes. Erased, withheld and ref
+//! base64. What a slot shows is cut at [`MAX_INLINE`] bytes of HTML. Erased, withheld and ref
 //! slots say what they are; a ref links to the slot it repeats instead of
 //! showing the same content again, so a conversation whose every request
 //! repeats the earlier messages does not grow its page quadratically.
@@ -14,11 +14,14 @@ use pragmatic::encoding::hex_encode;
 use pragmatic::journal::{Content, Cursor, SlotMeta, SlotState};
 use pragmatic::redact::binary;
 
-use crate::html::{esc, pretty_json_html};
+use crate::html::{esc, esc_capped, pretty_json_html_capped};
 use crate::text;
 
-/// The most bytes of a slot's text a page shows.
+/// The most bytes of HTML a page shows of one slot's text.
 pub const MAX_INLINE: usize = 64 * 1024;
+
+/// The most binary values inside one slot that are listed one by one.
+const MAX_BINARY_NOTES: usize = 16;
 
 /// Where a slot is, for its address and for refs.
 #[derive(Clone, Copy, Debug)]
@@ -131,22 +134,36 @@ fn sealed_html(bytes: &[u8]) -> String {
              text.</p>",
         );
     }
-    if textual.len() <= MAX_INLINE {
-        match pretty_json_html(&textual) {
-            Some(html) => out.push_str(&format!("<pre class=\"json\">{html}</pre>")),
-            None => out.push_str(&format!("<pre>{}</pre>", esc(&textual))),
-        }
+    // The cap is on the HTML written, not on the text: escaping and
+    // indentation make HTML larger than what it shows.
+    let pretty = if textual.len() <= MAX_INLINE {
+        pretty_json_html_capped(&textual, MAX_INLINE)
     } else {
-        // Too long to pretty-print: the first 64 KiB as recorded.
-        let shown = textual;
-        let (cut, _) = truncate(&shown, MAX_INLINE);
-        out.push_str(&format!("<pre>{}</pre>", esc(cut)));
-        out.push_str(&format!(
-            "<p class=\"slot-n\">Showing the first 64 KiB of {} bytes.</p>",
-            text::count(shown.len() as u64)
-        ));
+        None
+    };
+    match pretty {
+        Some((html, cut)) => {
+            out.push_str(&format!("<pre class=\"json\">{html}</pre>"));
+            if cut {
+                out.push_str(&format!(
+                    "<p class=\"slot-n\">Showing the first 64 KiB of this JSON, indented; it \
+                     holds {} bytes.</p>",
+                    text::count(textual.len() as u64)
+                ));
+            }
+        }
+        None => {
+            let (html, cut) = esc_capped(&textual, MAX_INLINE);
+            out.push_str(&format!("<pre>{html}</pre>"));
+            if cut {
+                out.push_str(&format!(
+                    "<p class=\"slot-n\">Showing the first 64 KiB of {} bytes.</p>",
+                    text::count(textual.len() as u64)
+                ));
+            }
+        }
     }
-    for f in &scanned.binary {
+    for f in scanned.binary.iter().take(MAX_BINARY_NOTES) {
         out.push_str(&format!(
             "<p class=\"slot-n\">Binary content at <span class=\"m\">{}</span>, not shown: {}, \
              {} bytes, sha256 <span class=\"m\">{}</span>.</p>",
@@ -154,6 +171,12 @@ fn sealed_html(bytes: &[u8]) -> String {
             esc(&f.media_type),
             text::count(f.bytes),
             hex_encode(&f.sha256)
+        ));
+    }
+    if scanned.binary.len() > MAX_BINARY_NOTES {
+        out.push_str(&format!(
+            "<p class=\"slot-n\">And {} more binary values, not shown.</p>",
+            text::count((scanned.binary.len() - MAX_BINARY_NOTES) as u64)
         ));
     }
     out
@@ -230,6 +253,34 @@ mod tests {
         );
         assert!(h.contains("Showing the first 64 KiB of 80,000 bytes."));
         assert!(h.len() < 70_000);
+    }
+
+    #[test]
+    fn indented_json_is_cut_by_what_it_writes() {
+        // 64 KiB of nested arrays and of zeros grow many times over when
+        // indented and marked up: the HTML still stops near 64 KiB.
+        let nested = format!("{}0{}", "[".repeat(63), "]".repeat(63));
+        let nested = format!("[{}]", vec![nested; 400].join(","));
+        let zeros = format!("[{}0]", "0,".repeat(30_000));
+        for doc in [nested, zeros] {
+            assert!(doc.len() <= MAX_INLINE);
+            let h = slot_html(
+                AT,
+                &meta(SlotState::Sealed),
+                &Content::Sealed(doc.into()),
+                None,
+            );
+            assert!(h.len() < MAX_INLINE + 1024, "{}", h.len());
+            assert!(h.contains("Showing the first 64 KiB of this JSON"));
+        }
+        let quotes = "\"".repeat(60_000);
+        let h = slot_html(
+            AT,
+            &meta(SlotState::Sealed),
+            &Content::Sealed(quotes.into()),
+            None,
+        );
+        assert!(h.len() < MAX_INLINE + 1024, "{}", h.len());
     }
 
     #[test]

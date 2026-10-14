@@ -41,7 +41,7 @@ const OWN: &[&str] = &[
     "th", "/th", "td", "/td", "details", "/details", "summary", "/summary", "section", "/section",
     "article", "/article", "aside", "/aside", "header", "/header", "footer", "/footer", "main",
     "/main", "nav", "/nav", "ol", "/ol", "ul", "/ul", "li", "/li", "dl", "/dl", "dt", "/dt", "dd",
-    "/dd", "code", "/code", "bdi", "/bdi",
+    "/dd", "code", "/code", "bdi", "/bdi", "wbr>",
 ];
 
 /// No element the page did not write itself: every `<` in the output opens
@@ -347,20 +347,37 @@ fn refund_20417_reads_as_designed() {
         "title=\"{hash}\" aria-hidden=\"true\">{}</span>",
         &hash[..10]
     )));
-    // The side cards: not anchored, the check as `pragmatic verify` prints
-    // it, the run's model, tokens not recorded, and its attempts.
-    assert!(html.contains("<h2 class=\"card-t o\" id=\"h-anchor\">Not anchored</h2>"));
+    // The full head, to copy, at the sheet's foot.
+    let head = pragmatic::encoding::hex_encode(&j.head());
+    assert!(html.contains(&format!(
+        "head <span class=\"hx\">{}<wbr>{}</span>",
+        &head[..32],
+        &head[32..]
+    )));
+    // The side cards: the check as `pragmatic verify` prints it, with the
+    // commands to repeat it set as commands, and the run with its
+    // attempts. A local journal has no anchors, and its page says
+    // nothing about anchoring rather than something negative.
+    assert!(!html.contains("h-anchor") && !html.contains("nchored"));
     assert!(html.contains("<dt>chain</dt><dd>every link, commitment and ref verifies</dd>"));
-    assert!(html.contains("pragmatic verify refund-20417 --dir journals"));
+    assert!(html.contains("pragmatic verify refund-20417 \\\n    --dir journals</code>"));
+    assert!(html.contains(
+        "pragmatic evidence refund-20417 \\\n    -o refund-20417.evidence.json \\\n    --dir journals</code>"
+    ));
     assert!(html.contains("<dt>model</dt><dd>anthropic:claude-sonnet-5-5</dd>"));
     assert!(html.contains("<dt>tokens</dt><dd><span class=\"s\">not recorded</span></dd>"));
     assert!(!html.contains(" in / "), "tokens are never shown as 0");
-    assert!(html.contains("<span class=\"s alarm\">no end</span>"));
-    assert!(html.contains("ok, 1 fresh, 4 replayed"));
+    assert!(html.contains("<span class=\"out alarm\">No end: crashed</span>"));
+    assert!(html.contains("<span class=\"out\">Ended ok \u{b7} 1 fresh, 4 replayed</span>"));
+    assert!(html.contains("<a href=\"#a10\"><span class=\"w\">Attempt 2 \u{b7} resume</span>"));
     assert!(html.contains("Read back by attempt 2: replayed from the journal, not repeated."));
-    // The masthead of a file, and its policy.
+    assert!(html.contains("<i class=\"dm rb\" aria-hidden=\"true\"></i>4 steps read back"));
+    // The masthead of a file: its directory and the run, and its policy.
     assert!(html.contains("<title>refund-20417 \u{b7} Pragmatic</title>"));
-    assert!(html.contains("<span class=\"src\">journals</span>"));
+    assert!(html.contains(
+        "<span class=\"c up\"><span class=\"sep\" aria-hidden=\"true\">/</span><span>journals</span></span>"
+    ));
+    assert!(!html.contains("refresh"));
     assert!(html.contains("font-src data:"));
     every_cursor_once(&html, &j);
 }
@@ -508,9 +525,9 @@ fn anchor_status_is_shown_when_known() {
     };
     let html = render_run(&view);
     assert!(html.contains(">Anchored by 2 independent timestamp services</h2>"));
-    assert!(
-        html.contains("existed no later than <span class=\"m nw\">13 Oct 2026, 12:00 UTC</span>")
-    );
+    assert!(html.contains(
+        "existed no later than <span class=\"nw\">13 Oct 2026, <span class=\"m\">12:00</span> UTC</span>"
+    ));
     assert!(html.contains(
         "<span class=\"st\">RFC 3161 \u{b7} trusted</span><span class=\"root\">Alpha Root</span>"
     ));
@@ -615,6 +632,38 @@ fn hostile_journal() -> Journal {
     )
     .unwrap();
     j
+}
+
+/// Recorded field values in an expanded row are on one line with control
+/// and bidirectional characters escaped, as in titles, and clipped.
+#[test]
+fn fields_cannot_reorder_or_flood_a_row() {
+    let mut j = Journal::new(None);
+    let intent = j
+        .append(
+            ROOT,
+            Event::EffectIntent {
+                name: format!("tool:evil\u{202e}gpj.exe{}", "x".repeat(10_000)),
+                arg: Value::from("{}").into(),
+            },
+        )
+        .unwrap();
+    j.append(
+        ROOT,
+        Event::EffectResult {
+            intent,
+            outcome: EffectOutcome::Ok,
+            error_kind: String::new(),
+            payload: Some(Value::from("{}").into()),
+        },
+    )
+    .unwrap();
+    let html = run_page(&j);
+    assert!(!html.contains('\u{202e}'), "no raw bidi override anywhere");
+    assert!(html.contains("<dt>effect</dt><dd><span class=\"m\">tool:evil\\u{202e}gpj.exe"));
+    let field = &html[html.find("<dt>effect</dt>").unwrap()..];
+    let field = &field[..field.find("</dd>").unwrap()];
+    assert!(field.len() < 4_200, "{}", field.len());
 }
 
 #[test]
@@ -875,7 +924,7 @@ fn every_kind_of_entry_has_its_row() {
     let t = titles(&html);
     for want in [
         "Run started · pragmatic-python 0.6.0 · a=1 b=2 c=3 · + 2 labels",
-        "Tool call lookup returned an error · \u{201c}LookupError: no tool named lookup_ordr in\u{2026}\u{201d}",
+        "Tool call lookup returned an error · \u{201c}LookupError: no tool named lookup_ordr in this agent\u{201d}",
         "Tool call charge failed · Timeout · \u{201c}the payment service did not answer in time\u{201d}",
         "Tool call echo · q x",
         "Effect send_email · written off by recovery, performed again at #12",
@@ -902,7 +951,7 @@ fn every_kind_of_entry_has_its_row() {
         "Torn tail moved aside · 112 bytes at offset 4,096",
         "Erased 0 slots · reason gdpr",
         "Note app.custom · step done, n 2",
-        "No end yet · running, or crashed; refresh to see whether it continues",
+        "Attempt 1 is open · last entry #38",
     ] {
         assert!(t.iter().any(|x| x == want), "{want}\n{t:#?}");
     }
@@ -917,9 +966,10 @@ fn every_kind_of_entry_has_its_row() {
         class_of("Model call · no response recorded"),
         "mk-alarm-hollow"
     );
+    // A failure carries the crash row's rule and wash.
     assert_eq!(
         class_of("Model call failed · RateLimited · HTTP 429 · rate_limit_error"),
-        "mk-alarm"
+        "mk-alarm fail"
     );
     assert_eq!(
         class_of("Effect send_email · written off by recovery, performed again at #12"),
@@ -944,9 +994,23 @@ fn every_kind_of_entry_has_its_row() {
     let facts = strip(&facts[..facts.find("</p>").unwrap()]);
     assert_eq!(
         facts,
-        "Format 2 · 39 entries · 1 attempt · 6 model calls · 3 tool calls · 2 effects · 2 failed · 1 open call"
+        "Format 2 · 39 entries · 1 attempt · 6 model calls · 3 tool calls · 2 effects · 2 failed · 1 interrupted call"
     );
     assert!(html.contains("1 call has no result (<a class=\"m\" href=\"#c24\">#24</a>)"));
+    // The failed count leads to the first failure, and the Run card lists
+    // the failures to jump to.
+    assert!(html.contains(
+        "<span class=\"alarm\"><a href=\"#c4\"><span class=\"n\">2</span> failed</a></span>"
+    ));
+    assert!(html.contains("<p class=\"caps\">Failures</p>"));
+    // No title holds a link: a title sits in a <summary>, a button. The
+    // links go to the expanded row.
+    for chunk in html.split("<summary class=\"sum\">").skip(1) {
+        let summary = &chunk[..chunk.find("</summary>").unwrap()];
+        assert!(!summary.contains("<a "), "{summary}");
+    }
+    assert!(html.contains("the run performed it again at <a class=\"m\" href=\"#c12\">#12</a>."));
+    assert!(html.contains("The program changed at <a class=\"m\" href=\"#c3\">#3</a>."));
 }
 
 #[test]
@@ -1069,11 +1133,38 @@ fn index_lists_runs() {
     let rows = vec![RunRow::from_journal("a", &j, &report).linked("/run/a")];
     let html = render_index(&rows);
     assert_only_own_markup(&html);
-    assert!(html.contains("<a class=\"m\" href=\"/run/a\">a</a>"));
-    assert!(html.contains("of <span class=\"n\">1</span> chains verified"));
+    // Each run is a row in the run page's language: its diamond, its id
+    // and badge, a sentence of its state, its last time and head.
+    assert!(html.contains("<li class=\"rr mk-fill\"><a class=\"rr-a\" href=\"/run/a\">"));
+    assert!(html.contains(
+        "<span class=\"rid\">a</span><span class=\"badge\"><i class=\"dm\" aria-hidden=\"true\"></i>Verified</span>"
+    ));
+    let state = &html[html.find("<span class=\"rr-s\">").unwrap()..];
+    assert_eq!(
+        strip(&state[..state.find("</span>").unwrap()]),
+        "Ended ok · 2 attempts · 4 model calls · 32 entries"
+    );
+    assert!(html.contains("its chain verified"));
     assert_eq!(rows[0].attempts, 2);
     assert_eq!(rows[0].last_outcome.as_deref(), Some("ok"));
-    assert!(render_index(&[]).contains("No runs in this directory yet."));
+    let empty = render_index(&[]);
+    assert!(empty.contains("No runs in this directory yet."));
+    assert!(!empty.contains("chains verified"));
+    // An empty directory names itself in its example.
+    let empty = render_index_of(&[], Some("var/runs"), None);
+    assert!(empty.contains("pragmatic.Runtime(&quot;var/runs&quot;)"));
+    assert!(empty.contains("aria-current=\"page\">runs</span>"));
+    // A format 1 run says it is read-only, and an open one says it is open.
+    let open = RunRow {
+        open_attempt: true,
+        format: 1,
+        ..rows[0].clone()
+    };
+    let html = render_index(std::slice::from_ref(&open));
+    assert!(html.contains("<span class=\"tag\">Read-only</span>"));
+    let html = render_index(&[RunRow { format: 2, ..open }]);
+    assert!(html.contains("<li class=\"rr mk-hollow\">"));
+    assert!(html.contains("<span class=\"rr-s\">Open \u{b7} "));
 }
 
 /// A live console frames the page with its own policy and navigation,
@@ -1118,18 +1209,30 @@ fn a_filtered_framed_page_shows_no_raw_content() {
     assert!(html.contains("Content is redacted for you"));
     assert!(html.contains("<span class=\"tag\">Redacted</span>"));
     assert!(html.contains("[filtered "));
-    assert!(
-        html.contains(" \u{b7} <span class=\"alarm\">dangling</span>")
-            || html.contains("\u{b7} dangling")
-    );
+    assert!(html.contains(" \u{b7} <span class=\"alarm\">an effect was left open</span>"));
     assert!(html.contains("<a href=\"/console/holds\">2 holds</a>"));
-    assert!(html.contains("<a class=\"up\" href=\"/console\">Runs</a>"));
+    assert!(html.contains("<a href=\"/console\">Runs</a>"));
+    // What the unfiltered page shows of slot content in its titles (gists
+    // and quoted excerpts) never reaches a viewer behind the filter.
+    let raw = render_run(&RunView::new("support-ticket-4127", &j, &report));
+    for shown in [
+        "billing/duplicate-charge",
+        "9b2e4c1a-7d3f",
+        "amount 49.00, charges 2",
+        "refund_id re_8812",
+        "A screenshot of the invoice.",
+        "message_id m-77",
+        "process killed",
+    ] {
+        assert!(raw.contains(shown), "{shown}");
+        assert!(!html.contains(shown), "{shown}");
+    }
     // Every present slot of the fixture is replaced, in rows and details.
     for e in j.entries() {
         for c in e.event.slot_contents() {
             if let Some(v) = c.value() {
                 let text = String::from_utf8_lossy(v.as_bytes());
-                if text.len() >= 12 && !text.starts_with('{') && !text.starts_with('[') {
+                if text.len() >= 12 {
                     assert!(!html.contains(&*crate::html::esc(&text)), "{text}");
                 }
             }
@@ -1151,11 +1254,29 @@ fn the_end_of_a_run_says_what_is_known() {
     }
     j = open;
     let report = j.audit();
+    // A local journal cannot say whether a process still writes it: the
+    // page says only what the journal holds, calmly.
     let local = render_run(&RunView::new("refund-20417", &j, &report));
-    assert!(titles(&local).contains(
-        &"No end yet · running, or crashed; refresh to see whether it continues".to_string()
-    ));
-    assert!(local.contains("No end yet: running, or crashed"));
+    assert!(titles(&local).contains(&"Attempt 2 is open · last entry #12".to_string()));
+    let state = &local[local.find("<p class=\"state\">").unwrap()..];
+    assert_eq!(
+        strip(&state[..state.find("</p>").unwrap()]),
+        "Open · attempt 2 · recorded 14 Oct 2026, 00:29:52 to 00:29:58 UTC"
+    );
+    assert!(!local.contains("crashed;") && !local.contains("refresh"));
+    // A call the last entry started may still be under way: it waits, in
+    // ink, and is not counted as interrupted.
+    let mut started = Journal::new(None);
+    for e in &refund_journal().entries()[..3] {
+        started.append_at(e.at, &e.branch, e.event.clone()).unwrap();
+    }
+    let audit = started.audit();
+    let html = render_run(&RunView::new("refund-20417", &started, &audit));
+    let r = rows(&html);
+    assert!(r
+        .iter()
+        .any(|(c, t, _)| c == "mk-hollow" && strip(t) == "Model call · no response yet"));
+    assert!(!html.contains("interrupted") && !html.contains("has no result"));
     let server = |status: &'static str| {
         render_run(&RunView {
             server: Some(ServerRun {
@@ -1166,8 +1287,7 @@ fn the_end_of_a_run_says_what_is_known() {
         })
     };
     let running = server("active");
-    assert!(titles(&running)
-        .contains(&"Running · attempt 2 holds the lease · refresh to follow".to_string()));
+    assert!(titles(&running).contains(&"Running · attempt 2 holds the lease".to_string()));
     assert!(running.contains("<li class=\"row mk-breathe derived\">"));
     assert!(
         running.contains("Running \u{b7} attempt 2 since <span class=\"m\">00:29:57</span> UTC")

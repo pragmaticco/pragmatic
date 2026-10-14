@@ -377,10 +377,12 @@ The console is at `/console`, rendered by the server with
 run looks the same wherever it is read, and in the website's design: warm
 paper and ink, EB Garamond for words and IBM Plex Mono for data, and one
 colour, terracotta, kept for what stopped, failed or is about to be
-destroyed. It follows the browser's light or dark setting.
+destroyed. Like the website, it is always paper.
 
 - **Runs**, filtered by run id prefix, run id or label value, a label,
-  program, status and update dates, a page at a time.
+  program, status and update dates, a page at a time. Each run is a row
+  in the run page's language: its state ("Ended ok", "Running", "No end:
+  crashed"), attempts, entries, how far it is anchored, and its holds.
 - **A run**: the run sheet, with the run id and whether its journal
   verifies, its facts (entries, attempts, model calls, tool calls, and
   anything failed, erased or still open), its state (ended ok, running on
@@ -390,14 +392,18 @@ destroyed. It follows the browser's light or dark setting.
   and lists the journal entries it is made of, the time and the entry
   hash; it opens to the entries themselves, every slot with its address
   for erasure (`slot 3:1`). Attempts are groups, parallel branches nested
-  lanes. Beside the sheet: its **anchoring** (independently anchored, with
-  each timestamp service and the time they vouch for; signed by this
-  server only; or not yet anchored), the **evidence check** (`pragmatic
-  verify`'s report, and for auditors and administrators the evidence
-  bundle downloads), the **run's** status, holds, labels, program, model,
-  token usage when recorded and attempts, and for administrators **Erase
-  content**. Without `view_raw`, content is shown through the same
-  redaction as the API, and the page says so.
+  lanes, and notes the server writes after the run (custody, erasure) a
+  group of their own, "After the run". Beside the sheet: its
+  **anchoring** (independently anchored, with each timestamp service and
+  the time they vouch for; signed by this server only; or not yet
+  anchored), the **evidence check** (`pragmatic verify`'s report, and for
+  auditors and administrators the evidence bundle downloads), and the
+  **run's** labels, program, model, token usage when recorded, and its
+  attempts, failures and record keeping, each a link to its place in the
+  timeline; on a wide screen that card stays in view as a long timeline
+  scrolls. For administrators, **Erase content…** at the end of the side
+  column opens on the erasure form. Without `view_raw`, content is shown
+  through the same redaction as the API, and the page says so.
 - **The access log**: every record for administrators, the records of
   in-scope runs for auditors, personal fields withheld without `view_raw`.
 - **Holds and retention** (administrators): place and remove holds, see
@@ -408,7 +414,9 @@ destroyed. It follows the browser's light or dark setting.
 Erasing, removing a hold, revoking a token and running retention each
 show a confirmation first: an erasure lists the slots it would erase,
 found in the stored journal exactly as the erasure finds them, and only
-the confirming post acts. A request that fails is answered with a page
+the confirming post acts. Previewing an erasure of every slot containing
+some text tells whether the run holds it, so the preview is recorded in
+the access log as a raw read. A request that fails is answered with a page
 that says why (no such run, a page your role cannot open, a form that
 could not be accepted, the server starting or paused), with the API's
 status code.

@@ -43,7 +43,8 @@
 //! terminal cannot drive it.
 //!
 //! The crate has no dependencies beyond the core. It bundles EB Garamond
-//! (SIL Open Font License 1.1, `assets/fonts/OFL.txt`); see [`fonts`].
+//! and IBM Plex Mono (SIL Open Font License 1.1, `assets/fonts/`); see
+//! [`fonts`].
 
 mod evidence;
 pub mod fonts;

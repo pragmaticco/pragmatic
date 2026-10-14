@@ -848,6 +848,13 @@ fn the_ci_console_smoke_test_greps_what_the_console_renders() {
 #[test]
 fn serve_renders_the_console_on_loopback() {
     let dir = seeded("serve");
+    // A keyed run this console has no key for: it is listed, and its page
+    // says it could not be opened, and why, rather than that it is gone.
+    Runtime::on_dir(&dir, SeededOracle::new(1))
+        .unwrap()
+        .with_key(b"secret-key")
+        .run("k1", agent)
+        .unwrap();
     let port = TcpListener::bind(("127.0.0.1", 0))
         .unwrap()
         .local_addr()
@@ -868,6 +875,7 @@ fn serve_renders_the_console_on_loopback() {
     let index = get(port, "/");
     let run = get(port, "/run/refund-1");
     let missing = get(port, "/run/<script>");
+    let keyed = get(port, "/run/k1");
     // The fonts come from the console itself, cached for good.
     let name = run
         .split("url(/assets/")
@@ -885,10 +893,21 @@ fn serve_renders_the_console_on_loopback() {
     assert!(font.windows(4).any(|w| w == b"wOF2"));
     assert!(index.starts_with("HTTP/1.1 200"));
     assert!(index.contains("content-security-policy: default-src 'none'"));
-    assert!(index.contains("<a class=\"m\" href=\"/run/refund-1\">refund-1</a>"));
+    assert!(index.contains("<a class=\"rr-a\" href=\"/run/refund-1\">"));
+    assert!(index.contains("<span class=\"rid\">refund-1</span>"));
     assert!(index.contains("font-src 'self'"));
     assert!(run.contains("<span id=\"c0\"></span>"));
-    assert!(run.contains("url(/assets/eb-garamond-latin."));
+    for face in [
+        "eb-garamond-latin.",
+        "eb-garamond-italic-latin.",
+        "ibm-plex-mono-400-latin.",
+        "ibm-plex-mono-500-latin.",
+    ] {
+        assert!(run.contains(&format!("url(/assets/{face}")), "{face}");
+    }
+    assert!(!run.contains("refresh"), "the page asks for nothing");
+    assert!(keyed.starts_with("HTTP/1.1 500"), "{keyed}");
+    assert!(keyed.contains("could not be opened"));
     assert!(missing.starts_with("HTTP/1.1 404"));
     assert!(
         missing.contains("No run named"),

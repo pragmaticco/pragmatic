@@ -23,7 +23,7 @@ const OWN: &[&str] = &[
     "th", "/th", "td", "/td", "details", "/details", "summary", "/summary", "section", "/section",
     "article", "/article", "aside", "/aside", "header", "/header", "footer", "/footer", "main",
     "/main", "nav", "/nav", "ol", "/ol", "ul", "/ul", "li", "/li", "dl", "/dl", "dt", "/dt", "dd",
-    "/dd", "code", "/code", "bdi", "/bdi",
+    "/dd", "code", "/code", "bdi", "/bdi", "wbr>",
 ];
 
 fn j(x: &str) -> String {
@@ -193,7 +193,7 @@ fn payload_in_every_field_is_inert() {
             root: Some(X.into()),
         }],
     };
-    let nav = pragmatic_console::html::source_note(X, true);
+    let nav = format!("<span>{}</span>", pragmatic_console::html::esc(X));
     let frame = pragmatic_console::html::Frame {
         csp: pragmatic_console::html::SERVE_POLICY,
         fonts: pragmatic_console::html::Fonts::Served("/assets/"),
@@ -275,7 +275,9 @@ fn format_1_facts_count_committed_effects() {
     let report = jn.audit();
     let html = render_run(&RunView::new("legacy", &jn, &report));
     assert!(
-        html.contains("<dt>effects</dt><dd>3 ok \u{b7} 0 written off \u{b7} format 1 records no failures</dd>"),
+        html.contains(
+            "<dt>effects</dt><dd>3\u{a0}ok \u{b7} 0\u{a0}written\u{a0}off \u{b7} format 1 records no failures</dd>"
+        ),
         "format 1 page under-reports committed effects"
     );
     assert!(
@@ -410,6 +412,161 @@ fn attempt_ends_are_matched_in_linear_time() {
         html.len() >> 20
     );
     assert!(took.as_secs() < 5, "render took {took:?}");
+    // A late page finds its attempts as fast as the first: each start and
+    // end is looked up, never searched for.
+    let late = RunView {
+        from: jn.len() - 4000,
+        page_link: Some("/run/q?from="),
+        ..RunView::new("q", &jn, &report)
+    };
+    let t = Instant::now();
+    let page = render_run_page(&late);
+    let took = t.elapsed();
+    eprintln!("40k attempt notes, a late page: render {took:?}");
+    assert!(took.as_secs() < 5, "a late page took {took:?}");
+    assert!(page
+        .html
+        .contains(&format!("<span id=\"c{}\"></span>", jn.len() - 1)));
+}
+
+/// A run resumed many times after many steps: every step is read back by
+/// every resume, and every page still keeps to its budget, because a row
+/// names only the first few attempts that read it back and counts the
+/// rest.
+#[test]
+fn many_resumes_keep_pages_bounded() {
+    let mut jn = Journal::new(None);
+    let note = |kind: &str, data: String| Event::Note {
+        kind: kind.into(),
+        data,
+        payload: vec![],
+    };
+    jn.append(
+        META,
+        note(
+            note::RUN_START,
+            r#"{"format":2,"labels":{},"nonce":"00","run_id":"r","sdk":"x","sdk_version":"0"}"#
+                .into(),
+        ),
+    )
+    .unwrap();
+    jn.append(
+        META,
+        note("attempt.start", r#"{"attempt":1,"mode":"run"}"#.into()),
+    )
+    .unwrap();
+    let steps = 2_500u64;
+    for i in 0..steps {
+        let intent = jn
+            .append(
+                ROOT,
+                Event::EffectIntent {
+                    name: "tool:lookup".into(),
+                    arg: Value::from(format!(r#"{{"n":{i}}}"#)).into(),
+                },
+            )
+            .unwrap();
+        jn.append(
+            ROOT,
+            Event::EffectResult {
+                intent,
+                outcome: EffectOutcome::Ok,
+                error_kind: String::new(),
+                payload: Some(Value::from(r#"{"ok":true}"#).into()),
+            },
+        )
+        .unwrap();
+    }
+    for a in 2..20_002u64 {
+        jn.append(
+            META,
+            note(
+                "attempt.start",
+                format!(r#"{{"attempt":{a},"mode":"resume"}}"#),
+            ),
+        )
+        .unwrap();
+        jn.append(
+            META,
+            note(
+                "attempt.end",
+                format!(r#"{{"attempt":{a},"outcome":"ok","fresh":0,"replayed":{steps}}}"#),
+            ),
+        )
+        .unwrap();
+    }
+    let report = jn.audit();
+    let view = RunView {
+        page_link: Some("/run/r?from="),
+        ..RunView::new("r", &jn, &report)
+    };
+    let t = Instant::now();
+    let page = render_run_page(&view);
+    eprintln!(
+        "{} entries, 20,000 resumes: first page {:?}, {} KiB",
+        jn.len(),
+        t.elapsed(),
+        page.html.len() >> 10
+    );
+    assert!(
+        page.html.len() < PAGE_BYTES + (1 << 20),
+        "{}",
+        page.html.len()
+    );
+    assert!(page
+        .html
+        .contains("Read back by attempts 2, 3, 4, 5, 6 and 19,995 more"));
+    assert!(t.elapsed().as_secs() < 10, "{:?}", t.elapsed());
+}
+
+/// A model call whose request parts are deeply nested JSON: indenting and
+/// marking up 64 KiB of nested arrays makes many times as much HTML, and
+/// what a slot shows is capped on that HTML, so the page stays bounded.
+#[test]
+fn nested_json_slots_keep_pages_bounded() {
+    let mut jn = Journal::new(None);
+    jn.append(
+        META,
+        Event::Note {
+            kind: note::RUN_START.into(),
+            data:
+                r#"{"format":2,"labels":{},"nonce":"00","run_id":"n","sdk":"x","sdk_version":"0"}"#
+                    .into(),
+            payload: vec![],
+        },
+    )
+    .unwrap();
+    let deep = format!("{}0{}", "[".repeat(63), "]".repeat(63));
+    let part = format!("[{}]", vec![deep; 480].join(","));
+    assert!(part.len() < 64 << 10);
+    for k in 0..3 {
+        let parts = (0..40)
+            .map(|i| Value::from(format!("{part}{}", " ".repeat(i + k))).into())
+            .collect();
+        jn.append(
+            ROOT,
+            Event::DrawIntent {
+                provenance: "m".into(),
+                parts,
+            },
+        )
+        .unwrap();
+    }
+    let report = jn.audit();
+    let t = Instant::now();
+    let page = render_run_page(&RunView::new("n", &jn, &report));
+    eprintln!(
+        "120 nested parts: {:?}, {} KiB",
+        t.elapsed(),
+        page.html.len() >> 10
+    );
+    // Each part shows at most 64 KiB of HTML: 120 parts, about 8 MiB.
+    assert!(
+        page.html.len() < 120 * (65 << 10) + (1 << 20),
+        "{}",
+        page.html.len()
+    );
+    assert!(page.html.contains("Showing the first 64 KiB of this JSON"));
 }
 
 /// A run of many small entries is shown a page at a time, and every page

@@ -13,8 +13,10 @@
 //! - each `attempt.start` opens a group, and its `attempt.end` closes it;
 //! - an attempt that stopped without an end gets a derived row: "No end:
 //!   crashed" where a later attempt shows it crashed, or, at the end of
-//!   the run, what is known (running, crashed, or for a local journal
-//!   "running, or crashed");
+//!   the run's own entries, what is known (running, crashed, or for a
+//!   local journal, which cannot say, that the attempt is open);
+//! - record keeping written after the run's last attempt (erasure and
+//!   custody notes) is a group of its own, "After the run";
 //! - every other entry is a row of its own.
 //!
 //! Every entry on the page is in exactly one row, and every row names all
@@ -31,7 +33,7 @@ use std::collections::HashMap;
 
 use pragmatic::encoding::hex_encode;
 use pragmatic::journal::{
-    Content, Cursor, EffectOutcome, Entry, Event, Journal, LegacyEvent, META,
+    note, Content, Cursor, EffectOutcome, Entry, Event, Journal, LegacyEvent, META,
 };
 use pragmatic::json::Json;
 
@@ -39,6 +41,10 @@ use crate::gist::{self, Gist, EXCERPT, GIST};
 use crate::html::esc;
 use crate::run::SlotFilter;
 use crate::text;
+
+/// How many attempts, later results and the like a row names one by one;
+/// it counts the rest.
+pub const SHOWN: usize = 5;
 
 /// What the page knows of whether the run is still going.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +131,16 @@ pub struct Facts {
     /// Attempts whose `replayed` matches the steps completed before them:
     /// (start, attempt number), by start.
     read_back: Vec<(Cursor, u64)>,
+    /// Each attempt's index in `attempts`, by its start and by its end, so
+    /// a page finds an attempt in O(1) however many the run has.
+    by_start: HashMap<Cursor, usize>,
+    by_end: HashMap<Cursor, usize>,
+    /// Where the record keeping written after the run's last attempt
+    /// begins (erasure and custody notes): the run's own entries end there.
+    pub after: Option<Cursor>,
+    /// The last entry of each lane, to tell a call still under way (the
+    /// last on its lane) from one its lane moved past.
+    last_on_lane: HashMap<Vec<u32>, Cursor>,
     /// Effect intents by name, in cursor order.
     effects_by_name: HashMap<String, Vec<Cursor>>,
     /// Format 1: an effect intent's commit or write-off.
@@ -268,11 +284,44 @@ impl Facts {
             }
         }
         let multi_day = first_at <= last_at && text::day(first_at) != text::day(last_at);
+        let by_start = attempts
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (a.start, i))
+            .collect();
+        let by_end = attempts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| Some((a.end.as_ref()?.cursor, i)))
+            .collect();
+        // The trailing record keeping: erasure and custody notes after the
+        // last attempt began (and after its end, when it has one).
+        let after = attempts.last().and_then(|last| {
+            let floor = last.end.as_ref().map_or(last.start, |e| e.cursor);
+            let mut first = None;
+            for e in j.entries().iter().rev() {
+                let keeping = e.branch == META
+                    && matches!(e.event.note_kind(), Some(k) if k == note::ERASURE || k == note::CUSTODY);
+                if !keeping || e.cursor <= floor {
+                    break;
+                }
+                first = Some(e.cursor);
+            }
+            first
+        });
+        let mut last_on_lane: HashMap<Vec<u32>, Cursor> = HashMap::new();
+        for e in j.entries() {
+            last_on_lane.insert(e.branch.clone(), e.cursor);
+        }
         Facts {
             results,
             attempts,
             first_result,
             read_back,
+            by_start,
+            by_end,
+            after,
+            last_on_lane,
             effects_by_name,
             legacy_result,
             legacy_intent,
@@ -281,13 +330,42 @@ impl Facts {
         }
     }
 
-    /// The attempts that read the step at `intent` back from the journal.
-    pub fn read_back_by(&self, intent: Cursor) -> Vec<u64> {
+    /// The attempts that read the step at `intent` back from the journal:
+    /// the first [`SHOWN`] of them, and how many there are.
+    pub fn read_back_by(&self, intent: Cursor) -> (Vec<u64>, usize) {
         let Some(&r) = self.first_result.get(&intent) else {
-            return Vec::new();
+            return (Vec::new(), 0);
         };
         let i = self.read_back.partition_point(|&(s, _)| s <= r);
-        self.read_back[i..].iter().map(|&(_, n)| n).collect()
+        let by = &self.read_back[i..];
+        (by.iter().take(SHOWN).map(|&(_, n)| n).collect(), by.len())
+    }
+
+    /// Whether attempt `start` read steps back from the journal.
+    pub fn reads_back(&self, start: Cursor) -> bool {
+        self.read_back
+            .binary_search_by_key(&start, |&(s, _)| s)
+            .is_ok()
+    }
+
+    /// The attempt that starts at `cursor`, and the one before it.
+    pub fn attempt_starting(&self, cursor: Cursor) -> Option<(&Attempt, Option<&Attempt>)> {
+        let &i = self.by_start.get(&cursor)?;
+        Some((
+            &self.attempts[i],
+            i.checked_sub(1).map(|k| &self.attempts[k]),
+        ))
+    }
+
+    /// The attempt whose end note is at `cursor`.
+    pub fn attempt_ending(&self, cursor: Cursor) -> Option<&Attempt> {
+        self.by_end.get(&cursor).map(|&i| &self.attempts[i])
+    }
+
+    /// Where the run's own entries end: at the record keeping written
+    /// after it, or at the end of the journal.
+    pub fn run_end(&self, j: &Journal) -> Cursor {
+        self.after.unwrap_or(j.len())
     }
 
     /// The attempt whose entries include `cursor`.
@@ -310,6 +388,19 @@ impl Facts {
     /// The format 1 intent a commit or write-off closes.
     pub fn legacy_intent(&self, result: Cursor) -> Option<Cursor> {
         self.legacy_intent.get(&result).copied()
+    }
+
+    /// Whether the call at `intent` (which has no result) may still be
+    /// under way: it is in a last attempt that has not ended, on a run
+    /// that is running or may be (a local journal's), and nothing came
+    /// after it on its lane.
+    pub fn pending(&self, j: &Journal, intent: Cursor) -> bool {
+        let Some(e) = j.get(intent) else {
+            return false;
+        };
+        matches!(self.live, Liveness::Running | Liveness::Unknown)
+            && self.open_last().is_some_and(|a| intent >= a.start)
+            && self.last_on_lane.get(&e.branch) == Some(&intent)
     }
 
     /// The last attempt, when it has not ended: the run is running, or it
@@ -338,6 +429,8 @@ pub enum Mark {
     AlarmBig,
     /// Running now (it breathes).
     Breathe,
+    /// Record keeping written after the run.
+    Aside,
 }
 
 impl Mark {
@@ -351,6 +444,7 @@ impl Mark {
             Mark::Alarm => "mk-alarm",
             Mark::AlarmBig => "mk-alarm-big",
             Mark::Breathe => "mk-breathe",
+            Mark::Aside => "mk-aside",
         }
     }
 }
@@ -360,8 +454,10 @@ impl Mark {
 pub struct Row {
     /// The entries of the row on this page, by cursor.
     pub cursors: Vec<Cursor>,
-    /// Results of the row's step that are on a later page.
+    /// Results of the row's step that are on a later page: the first
+    /// [`SHOWN`], and how many.
     pub later: Vec<Cursor>,
+    pub later_total: usize,
     /// The title (escaped HTML).
     pub title: String,
     /// The kinds line (escaped HTML).
@@ -371,17 +467,46 @@ pub struct Row {
     pub depth: usize,
     /// A crash row: terracotta rule and wash.
     pub crash: bool,
-    /// The step was read back by these attempts.
+    /// A recorded failure: the same rule and wash.
+    pub fail: bool,
+    /// The step was read back by these attempts (the first [`SHOWN`]),
+    /// and by how many.
     pub read_back: Vec<u64>,
+    pub read_back_total: usize,
+    /// Sentences for the expanded row (escaped HTML), for the links a
+    /// title cannot hold: a title sits in a `<summary>`, which is a button.
+    pub notes: Vec<String>,
 }
 
-/// A group of rows: one attempt, or the entries before the first.
+impl Row {
+    fn derived(title: String, kinds: String, mark: Mark, crash: bool) -> Row {
+        Row {
+            cursors: Vec::new(),
+            later: Vec::new(),
+            later_total: 0,
+            title,
+            kinds,
+            mark,
+            depth: 0,
+            crash,
+            fail: false,
+            read_back: Vec::new(),
+            read_back_total: 0,
+            notes: Vec::new(),
+        }
+    }
+}
+
+/// A group of rows: one attempt, the entries before the first, or the
+/// record keeping after the run.
 #[derive(Clone, Debug, Default)]
 pub struct Group {
     /// The label (escaped HTML), or none.
     pub label: Option<String>,
     /// The id the label carries, for links to the group.
     pub id: String,
+    /// The record keeping written after the run.
+    pub after: bool,
     pub rows: Vec<Row>,
 }
 
@@ -419,11 +544,36 @@ impl Ctx<'_> {
         }
     }
 
-    fn running(&self, cursor: Cursor) -> bool {
-        self.facts.live == Liveness::Running
-            && self.facts.open_last().is_some_and(|a| cursor >= a.start)
+    /// A cursor as plain text, for a title (a title cannot hold a link).
+    pub fn plain(&self, c: Cursor) -> String {
+        format!("<span class=\"m\">#{c}</span>")
+    }
+
+    /// What an intent without a result means here.
+    fn open_state(&self, cursor: Cursor) -> Open {
+        if !self.facts.pending(self.j, cursor) {
+            return Open::Missing;
+        }
+        match self.facts.live {
+            Liveness::Running => Open::Running,
+            _ => Open::Pending,
+        }
     }
 }
+
+/// What an intent without a result means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Open {
+    /// Its attempt holds the server's lease: the call is under way.
+    Running,
+    /// A local journal's last attempt, which has no end: it may still be
+    /// under way.
+    Pending,
+    /// Its attempt ended or crashed without a result.
+    Missing,
+}
+
+impl Ctx<'_> {}
 
 /// An entry with every present slot's content passed through `filter`
 /// (fields are structural and shown as they are).
@@ -609,25 +759,17 @@ fn input_gist(arg: &Content) -> Gist {
 }
 
 /// A model call's title from its latest result.
-fn draw_title(result: Option<&Entry>, waiting: bool) -> (String, Mark) {
+fn draw_title(result: Option<&Entry>, open: Open) -> (String, Mark) {
     let Some(Event::DrawResult { meta, body, .. }) = result.map(|r| &r.event) else {
-        return if waiting {
-            (
-                Title::default()
-                    .words("Model call")
-                    .accent("waiting for the response")
-                    .html(),
-                Mark::Hollow,
-            )
-        } else {
-            (
-                Title::default()
-                    .words("Model call")
-                    .accent("no response recorded")
-                    .html(),
-                Mark::AlarmHollow,
-            )
+        let (words, mark) = match open {
+            Open::Running => ("waiting for the response", Mark::Hollow),
+            Open::Pending => ("no response yet", Mark::Hollow),
+            Open::Missing => ("no response recorded", Mark::AlarmHollow),
         };
+        return (
+            Title::default().words("Model call").accent(words).html(),
+            mark,
+        );
     };
     let m = text::draw_meta(meta);
     if m.outcome == "error" {
@@ -712,7 +854,8 @@ fn effect_title(
     name: &str,
     arg: &Content,
     result: Option<&Entry>,
-    waiting: bool,
+    open: Open,
+    notes: &mut Vec<String>,
 ) -> (String, Mark) {
     let (what, shown) = effect_name(name);
     let shown = text::clip(shown, 64);
@@ -724,20 +867,12 @@ fn effect_title(
         ..
     }) = result.map(|r| &r.event)
     else {
-        return if waiting {
-            (
-                base().gist(&input_gist(arg)).accent("running").html(),
-                Mark::Hollow,
-            )
-        } else {
-            (
-                base()
-                    .gist(&input_gist(arg))
-                    .accent("no result recorded")
-                    .html(),
-                Mark::AlarmHollow,
-            )
+        let (words, mark) = match open {
+            Open::Running => ("running", Mark::Hollow),
+            Open::Pending => ("no result yet", Mark::Hollow),
+            Open::Missing => ("no result recorded", Mark::AlarmHollow),
         };
+        return (base().gist(&input_gist(arg)).accent(words).html(), mark);
     };
     let result_cursor = result.map(|r| r.cursor).unwrap_or(0);
     match outcome {
@@ -794,10 +929,16 @@ fn effect_title(
         }
         EffectOutcome::Compensated => {
             let again = match ctx.facts.next_effect(name, result_cursor) {
-                Some(c) => format!(
-                    "written off by recovery, performed again at {}",
-                    ctx.cursor(c)
-                ),
+                Some(c) => {
+                    notes.push(format!(
+                        "Recovery wrote this off; the run performed it again at {}.",
+                        ctx.cursor(c)
+                    ));
+                    format!(
+                        "written off by recovery, performed again at {}",
+                        ctx.plain(c)
+                    )
+                }
                 None => "written off by recovery".to_string(),
             };
             (base().accent(&again).html(), Mark::Hollow)
@@ -842,21 +983,34 @@ fn plural(n: u64, one: &str, many: &str) -> String {
     }
 }
 
-/// The accents of an attempt's start row.
-fn attempt_start_title(ctx: &Ctx<'_>, a: &Attempt) -> String {
+/// The accents of an attempt's start row, and the notes of its expanded
+/// row.
+fn attempt_start_title(ctx: &Ctx<'_>, a: &Attempt, notes: &mut Vec<String>) -> String {
     let mut t = Title::default().words(&a.title());
     let replayed = a.end.as_ref().and_then(|e| e.replayed);
-    let read = replayed.map(|r| plural(r, "step read back", "steps read back"));
+    // The ring the steps it read back carry, repeated here so the mark
+    // explains itself.
+    let ring = if ctx.facts.reads_back(a.start) {
+        "<i class=\"dm rb\" aria-hidden=\"true\"></i>"
+    } else {
+        ""
+    };
+    let read = replayed.map(|r| {
+        format!(
+            "{ring}{}",
+            esc(&plural(r, "step read back", "steps read back"))
+        )
+    });
     match (a.mode.as_str(), a.n) {
         ("resume", _) => {
-            if let Some(r) = read {
-                t = t.accent(&esc(&r));
+            if let Some(r) = &read {
+                t = t.accent(r);
             }
         }
         ("run", Some(n)) if n > 1 => {
             t = t.accent("run again");
-            if let Some(r) = read {
-                t = t.accent(&esc(&r));
+            if let Some(r) = &read {
+                t = t.accent(r);
             }
         }
         ("run", _) => t = t.accent("started"),
@@ -866,10 +1020,17 @@ fn attempt_start_title(ctx: &Ctx<'_>, a: &Attempt) -> String {
                 t.0,
                 esc(mode)
             ));
-            if let Some(r) = read {
-                t = t.accent(&esc(&r));
+            if let Some(r) = &read {
+                t = t.accent(r);
             }
         }
+    }
+    if !ring.is_empty() {
+        notes.push(format!(
+            "The steps marked with a ring were recorded before {} began, and it read them \
+             back from the journal instead of repeating them.",
+            esc(&a.name())
+        ));
     }
     if a.end.is_some() && a.mode == "resume" || a.end.is_some() && a.n.is_some_and(|n| n > 1) {
         if a.repeated == 0 {
@@ -880,11 +1041,13 @@ fn attempt_start_title(ctx: &Ctx<'_>, a: &Attempt) -> String {
                 "effect performed again",
                 "effects performed again",
             );
-            let html = match a.first_repeated {
-                Some(c) => format!("<a href=\"{}\">{}</a>", cursor_href(ctx, c), esc(&what)),
-                None => esc(&what),
-            };
-            t = t.accent(&html);
+            if let Some(c) = a.first_repeated {
+                notes.push(format!(
+                    "The first effect performed again is at {}.",
+                    ctx.cursor(c)
+                ));
+            }
+            t = t.accent(&esc(&what));
         }
     }
     if a.torn > 0 {
@@ -897,20 +1060,12 @@ fn attempt_start_title(ctx: &Ctx<'_>, a: &Attempt) -> String {
     t.html()
 }
 
-/// The `href` of a cursor's row.
-fn cursor_href(ctx: &Ctx<'_>, c: Cursor) -> String {
-    if (c >= ctx.from && c < ctx.end) || ctx.link.is_none() {
-        format!("#c{c}")
-    } else {
-        format!("{}{c}#c{c}", esc(ctx.link.unwrap_or("")))
-    }
-}
-
 fn attempt_end_title(
     ctx: &Ctx<'_>,
     end: &AttemptEnd,
     a: Option<&Attempt>,
     payload: &[Content],
+    notes: &mut Vec<String>,
 ) -> (String, Mark) {
     let who = a.map(|a| a.title()).unwrap_or_else(|| "Attempt".into());
     match end.outcome.as_str() {
@@ -938,7 +1093,10 @@ fn attempt_end_title(
             if !end.fault_kind.is_empty() {
                 let at = end
                     .fault_cursor
-                    .map(|c| format!(" <span class=\"s\">at</span> {}", ctx.cursor(c)))
+                    .map(|c| {
+                        notes.push(format!("The fault is at {}.", ctx.cursor(c)));
+                        format!(" <span class=\"s\">at</span> {}", ctx.plain(c))
+                    })
                     .unwrap_or_default();
                 t = Title(format!(
                     "{} <span class=\"s\">\u{b7}</span> <span class=\"m alarm\">{}</span>{at}",
@@ -971,6 +1129,7 @@ fn note_title(
     kind: &str,
     data: &str,
     payload: &[Content],
+    notes: &mut Vec<String>,
 ) -> (String, String, Mark) {
     let d = Json::parse(data).unwrap_or(Json::Null);
     let s = |k: &str| json_str(&d, k, 64);
@@ -992,21 +1151,15 @@ fn note_title(
             (t.html(), String::new(), Mark::Hollow)
         }
         "attempt.start" => {
-            let a = ctx.facts.attempts.iter().find(|a| a.start == e.cursor);
-            let title = match a {
-                Some(a) => attempt_start_title(ctx, a),
+            let title = match ctx.facts.attempt_starting(e.cursor) {
+                Some((a, _)) => attempt_start_title(ctx, a, notes),
                 None => Title::default().words("Attempt").html(),
             };
             (title, String::new(), Mark::Hollow)
         }
         "attempt.end" => {
             let n = d.get("attempt").and_then(Json::as_u64);
-            let a = ctx
-                .facts
-                .attempts
-                .iter()
-                .rev()
-                .find(|a| a.end.as_ref().is_some_and(|end| end.cursor == e.cursor));
+            let a = ctx.facts.attempt_ending(e.cursor);
             let end = a.and_then(|a| a.end.clone()).unwrap_or(AttemptEnd {
                 cursor: e.cursor,
                 outcome: s("outcome"),
@@ -1040,14 +1193,17 @@ fn note_title(
                     Some(&fallback)
                 }
             };
-            let (t, m) = attempt_end_title(ctx, &end, a, payload);
+            let (t, m) = attempt_end_title(ctx, &end, a, payload, notes);
             (t, String::new(), m)
         }
         "program.change" => {
             let at = d
                 .get("cursor")
                 .and_then(Json::as_u64)
-                .map(|c| ctx.cursor(c))
+                .map(|c| {
+                    notes.push(format!("The program changed at {}.", ctx.cursor(c)));
+                    ctx.plain(c)
+                })
                 .unwrap_or_default();
             let mut t = Title::default().words("Program changed");
             if !at.is_empty() {
@@ -1127,7 +1283,7 @@ fn note_title(
             if d.get("authenticated").and_then(Json::as_bool) != Some(true) {
                 extra.push_str(" \u{b7} unauthenticated");
             }
-            (t.html(), extra, Mark::Fill)
+            (t.html(), extra, Mark::Aside)
         }
         "custody" => {
             // Counts are numbers; anything else is left out rather than
@@ -1144,9 +1300,19 @@ fn note_title(
                 )));
             }
             if d.get("clock_skew").and_then(Json::as_bool) == Some(true) {
-                t = t.accent("clock skew flagged");
+                t = Title(format!(
+                    "{} <span class=\"s alarm\">\u{b7} clock skew flagged</span>",
+                    t.0
+                ));
+                notes.push(
+                    "The server flagged this lease's clock: the times its entries carry \
+                     disagree with the server's own clock. Times are shown as recorded and \
+                     never decide the order of entries."
+                        .to_string(),
+                );
+                return (t.html(), String::new(), Mark::Alarm);
             }
-            (t.html(), String::new(), Mark::Fill)
+            (t.html(), String::new(), Mark::Aside)
         }
         "torn_tail" => {
             let num = |k: &str| d.get(k).and_then(Json::as_u64);
@@ -1301,27 +1467,23 @@ fn crash_row(ctx: &Ctx<'_>, a: &Attempt, next_start: Cursor) -> Row {
             t = t.accent(&during);
         }
     }
-    Row {
-        cursors: Vec::new(),
-        later: Vec::new(),
-        title: t.html(),
-        kinds: format!("no note.attempt.end for {}", esc(&a.name())),
-        mark: Mark::AlarmHollow,
-        depth: 0,
-        crash: true,
-        read_back: Vec::new(),
-    }
+    Row::derived(
+        t.html(),
+        format!("no note.attempt.end for {}", esc(&a.name())),
+        Mark::AlarmHollow,
+        true,
+    )
 }
 
-/// The row at the end of a run whose last attempt has not ended.
+/// The row after the run's own entries when its last attempt has not
+/// ended.
 fn open_end_row(ctx: &Ctx<'_>, a: &Attempt) -> Row {
-    let last = ctx.j.len().saturating_sub(1);
+    let last = ctx.facts.run_end(ctx.j).saturating_sub(1);
     let (title, mark, crash) = match ctx.facts.live {
         Liveness::Running => (
             Title::default()
                 .words("Running")
                 .accent(&format!("{} holds the lease", esc(&a.name())))
-                .accent("refresh to follow")
                 .html(),
             Mark::Breathe,
             false,
@@ -1337,44 +1499,64 @@ fn open_end_row(ctx: &Ctx<'_>, a: &Attempt) -> Row {
             }
             (t.html(), Mark::AlarmHollow, true)
         }
+        // A local journal: nothing says whether a process still writes it,
+        // so the row says only what the journal holds.
         Liveness::Unknown => (
             Title::default()
-                .words("No end yet")
-                .accent("running, or crashed; refresh to see whether it continues")
+                .words(&format!("{} is open", a.title()))
+                .accent(&format!("last entry {}", ctx.cursor(last)))
                 .html(),
             Mark::Hollow,
             false,
         ),
     };
-    Row {
-        cursors: Vec::new(),
-        later: Vec::new(),
+    Row::derived(
         title,
-        kinds: format!("no note.attempt.end for {} yet", esc(&a.name())),
+        format!("no note.attempt.end for {} yet", esc(&a.name())),
         mark,
-        depth: 0,
         crash,
-        read_back: Vec::new(),
-    }
+    )
 }
+
+/// The label of the group of record keeping after the run.
+const AFTER_LABEL: &str = "After the run";
 
 /// The groups and rows of a page, from its entries (`page`, already
 /// filtered, cursors `ctx.from` to `ctx.end`).
 pub fn build(ctx: &Ctx<'_>, page: &[Entry]) -> Vec<Group> {
     let mut groups: Vec<Group> = Vec::new();
-    // A page that starts inside an attempt continues its group.
-    let first = match ctx.facts.attempt_at(ctx.from) {
-        Some(a) if a.start < ctx.from => Group {
-            label: Some(format!(
-                "{} <span class=\"nc s\">(continued)</span>",
-                group_label(a)
-            )),
-            id: format!("a{}", a.start),
+    let run_end = ctx.facts.run_end(ctx.j);
+    // A page that starts inside an attempt, or inside the record keeping
+    // after the run, continues its group.
+    let continued = |label: &str| Some(format!("{label} <span class=\"nc s\">(continued)</span>"));
+    let first = if ctx.from >= run_end && ctx.facts.after.is_some() {
+        Group {
+            label: if ctx.from > run_end {
+                continued(AFTER_LABEL)
+            } else {
+                Some(AFTER_LABEL.into())
+            },
+            id: "after".into(),
+            after: true,
             rows: Vec::new(),
-        },
-        _ => Group::default(),
+        }
+    } else {
+        match ctx.facts.attempt_at(ctx.from) {
+            Some(a) if a.start < ctx.from => Group {
+                label: continued(&group_label(a)),
+                id: format!("a{}", a.start),
+                after: false,
+                rows: Vec::new(),
+            },
+            _ => Group::default(),
+        }
     };
     groups.push(first);
+    // The row for a last attempt with no end closes the run's own
+    // entries, once, on the page where they end.
+    let mut open_row = (ctx.from < run_end && ctx.end >= run_end)
+        .then(|| ctx.facts.open_last())
+        .flatten();
     let mut done = vec![false; page.len()];
     let index = |c: Cursor| -> Option<usize> {
         (c >= ctx.from && c < ctx.from + page.len() as u64).then(|| (c - ctx.from) as usize)
@@ -1385,6 +1567,20 @@ pub fn build(ctx: &Ctx<'_>, page: &[Entry]) -> Vec<Group> {
         }
         done[i] = true;
         let e = &page[i];
+        if e.cursor == run_end && e.cursor > ctx.from {
+            if let Some(a) = open_row.take() {
+                let row = open_end_row(ctx, a);
+                if let Some(g) = groups.last_mut() {
+                    g.rows.push(row);
+                }
+            }
+            groups.push(Group {
+                label: Some(AFTER_LABEL.into()),
+                id: "after".into(),
+                after: true,
+                rows: Vec::new(),
+            });
+        }
         // A new attempt opens a group, after the crash row of the one
         // before it when that one has no end.
         let starts = match &e.event {
@@ -1398,23 +1594,17 @@ pub fn build(ctx: &Ctx<'_>, page: &[Entry]) -> Vec<Group> {
             _ => None,
         };
         if let Some(start) = starts {
-            let prev = ctx
-                .facts
-                .attempts
-                .iter()
-                .position(|a| a.start == start)
-                .and_then(|k| k.checked_sub(1))
-                .map(|k| &ctx.facts.attempts[k]);
-            if let Some(p) = prev.filter(|p| p.end.is_none()) {
+            let found = ctx.facts.attempt_starting(start);
+            if let Some(p) = found.and_then(|(_, p)| p).filter(|p| p.end.is_none()) {
                 let row = crash_row(ctx, p, start);
                 if let Some(g) = groups.last_mut() {
                     g.rows.push(row);
                 }
             }
-            let a = ctx.facts.attempts.iter().find(|a| a.start == start);
             groups.push(Group {
-                label: a.map(group_label),
+                label: found.map(|(a, _)| group_label(a)),
                 id: format!("a{start}"),
+                after: false,
                 rows: Vec::new(),
             });
         }
@@ -1423,13 +1613,10 @@ pub fn build(ctx: &Ctx<'_>, page: &[Entry]) -> Vec<Group> {
             g.rows.push(row);
         }
     }
-    // The end of the run: its last attempt has not ended.
-    if ctx.end >= ctx.j.len() {
-        if let Some(a) = ctx.facts.open_last() {
-            let row = open_end_row(ctx, a);
-            if let Some(g) = groups.last_mut() {
-                g.rows.push(row);
-            }
+    if let Some(a) = open_row {
+        let row = open_end_row(ctx, a);
+        if let Some(g) = groups.last_mut() {
+            g.rows.push(row);
         }
     }
     groups.retain(|g| g.label.is_some() || !g.rows.is_empty());
@@ -1446,18 +1633,16 @@ fn row_of(
 ) -> Row {
     let mut row = Row {
         cursors: vec![e.cursor],
-        later: Vec::new(),
-        title: String::new(),
         kinds: format!("{}{}", lane_prefix(e), kind_of(e)),
         mark: Mark::Fill,
         depth: depth(e),
-        crash: false,
-        read_back: Vec::new(),
+        ..Row::derived(String::new(), String::new(), Mark::Fill, false)
     };
     // Join a step's results on this page; note those on later pages.
     let join_results = |row: &mut Row, intent: Cursor, done: &mut [bool]| {
-        let rs = ctx.facts.results.get(&intent).cloned().unwrap_or_default();
-        for r in rs {
+        let empty = Vec::new();
+        let rs = ctx.facts.results.get(&intent).unwrap_or(&empty);
+        for &r in rs {
             if r <= row.cursors[0] {
                 continue;
             }
@@ -1470,12 +1655,10 @@ fn row_of(
                             .push_str(&format!(" \u{b7} {}", kind_of(&page[k])));
                     }
                 }
-                None => {
-                    row.later.push(r);
-                    row.kinds.push_str(&format!(" \u{b7} result #{r}"));
-                }
+                None => later(row, r),
             }
         }
+        later_more(row);
     };
     let latest = |intent: Cursor| -> Option<Cow<'_, Entry>> {
         let r = *ctx.facts.results.get(&intent)?.last()?;
@@ -1485,7 +1668,7 @@ fn row_of(
         Event::DrawIntent { .. } => {
             join_results(&mut row, e.cursor, done);
             let r = latest(e.cursor);
-            let (t, m) = draw_title(r.as_deref(), ctx.running(e.cursor));
+            let (t, m) = draw_title(r.as_deref(), ctx.open_state(e.cursor));
             row.title = t;
             row.mark = m;
             mark_read_back(ctx, &mut row, e.cursor);
@@ -1493,7 +1676,14 @@ fn row_of(
         Event::EffectIntent { name, arg } => {
             join_results(&mut row, e.cursor, done);
             let r = latest(e.cursor);
-            let (t, m) = effect_title(ctx, name, arg, r.as_deref(), ctx.running(e.cursor));
+            let (t, m) = effect_title(
+                ctx,
+                name,
+                arg,
+                r.as_deref(),
+                ctx.open_state(e.cursor),
+                &mut row.notes,
+            );
             row.title = t;
             row.mark = m;
             mark_read_back(ctx, &mut row, e.cursor);
@@ -1517,8 +1707,9 @@ fn row_of(
             }
             // Its intent is on an earlier page: the row starts here, with
             // every later result of the same step on this page.
-            let rs = ctx.facts.results.get(intent).cloned().unwrap_or_default();
-            for r in rs {
+            let empty = Vec::new();
+            let rs = ctx.facts.results.get(intent).unwrap_or(&empty);
+            for &r in rs {
                 if r <= e.cursor {
                     continue;
                 }
@@ -1530,22 +1721,24 @@ fn row_of(
                             .push_str(&format!(" \u{b7} {}", kind_of(&page[k])));
                     }
                     Some(_) => {}
-                    None => {
-                        row.later.push(r);
-                        row.kinds.push_str(&format!(" \u{b7} result #{r}"));
-                    }
+                    None => later(&mut row, r),
                 }
             }
+            later_more(&mut row);
             let r = latest(*intent);
             let (t, m) = match intent_entry.as_deref().map(|i| &i.event) {
                 Some(Event::EffectIntent { name, arg }) => {
-                    effect_title(ctx, name, arg, r.as_deref(), false)
+                    effect_title(ctx, name, arg, r.as_deref(), Open::Missing, &mut row.notes)
                 }
-                _ => draw_title(r.as_deref(), false),
+                _ => draw_title(r.as_deref(), Open::Missing),
             };
+            row.notes.push(format!(
+                "Its intent is {}, on an earlier page.",
+                ctx.cursor(*intent)
+            ));
             row.title = format!(
                 "{t} <span class=\"s\">\u{b7} its intent, {}, is on an earlier page</span>",
-                ctx.cursor(*intent)
+                ctx.plain(*intent)
             );
             row.mark = m;
             mark_read_back(ctx, &mut row, *intent);
@@ -1568,7 +1761,7 @@ fn row_of(
                     row.kinds.push_str(&format!(" \u{b7} {}", kind_of(n)));
                 }
             }
-            let (t, extra, m) = note_title(ctx, e, kind, data, payload);
+            let (t, extra, m) = note_title(ctx, e, kind, data, payload, &mut row.notes);
             row.title = t;
             row.kinds.push_str(&extra);
             row.mark = m;
@@ -1666,15 +1859,37 @@ fn row_of(
             row.title = Title::default().words(other.kind_name()).html();
         }
     }
+    row.fail = matches!(row.mark, Mark::Alarm | Mark::AlarmBig);
     row
 }
 
 fn mark_read_back(ctx: &Ctx<'_>, row: &mut Row, intent: Cursor) {
-    let by = ctx.facts.read_back_by(intent);
-    if !by.is_empty() && row.mark == Mark::Fill {
+    let (by, total) = ctx.facts.read_back_by(intent);
+    if total > 0 && row.mark == Mark::Fill {
         row.mark = Mark::Ring;
     }
     row.read_back = by;
+    row.read_back_total = total;
+}
+
+/// A result of the row's step on a later page: the first [`SHOWN`] are
+/// named, the rest counted.
+fn later(row: &mut Row, r: Cursor) {
+    if row.later.len() < SHOWN {
+        row.later.push(r);
+        row.kinds.push_str(&format!(" \u{b7} result #{r}"));
+    }
+    row.later_total += 1;
+}
+
+/// The count of later results past the ones named.
+fn later_more(row: &mut Row) {
+    if row.later_total > row.later.len() {
+        row.kinds.push_str(&format!(
+            " \u{b7} {} more on later pages",
+            text::count((row.later_total - row.later.len()) as u64)
+        ));
+    }
 }
 
 /// A format 1 entry's row; an effect intent takes its commit or write-off.
@@ -1710,10 +1925,7 @@ fn legacy_row(
                         row.kinds
                             .push_str(&format!(" \u{b7} {}", kind_of(&page[k])));
                     }
-                    None => {
-                        row.later.push(r);
-                        row.kinds.push_str(&format!(" \u{b7} result #{r}"));
-                    }
+                    None => later(row, r),
                 }
             }
             let result = result.and_then(|r| ctx.j.get(r));
@@ -1740,9 +1952,13 @@ fn legacy_row(
                 .gist(&value_gist(result));
             match ctx.facts.legacy_intent(e.cursor) {
                 Some(i) => {
+                    row.notes.push(format!(
+                        "Its intent is {}, on an earlier page.",
+                        ctx.cursor(i)
+                    ));
                     t = t.accent(&format!(
                         "its intent, {}, is on an earlier page",
-                        ctx.cursor(i)
+                        ctx.plain(i)
                     ))
                 }
                 None => t = t.accent("no matching intent"),
@@ -1790,12 +2006,13 @@ pub fn render(ctx: &Ctx<'_>, groups: &[Group], section: &dyn Fn(Cursor) -> Strin
     let mut out = String::new();
     let mut last_day = String::new();
     for g in groups {
+        let class = if g.after { "grp after" } else { "grp" };
         match &g.label {
             Some(label) => out.push_str(&format!(
-                "<section class=\"grp\" aria-labelledby=\"{id}\"><h3 class=\"grp-label caps\" id=\"{id}\">{label}</h3><ol class=\"rows\">",
+                "<section class=\"{class}\" aria-labelledby=\"{id}\"><h3 class=\"grp-label caps\" id=\"{id}\">{label}</h3><ol class=\"rows\">",
                 id = esc(&g.id)
             )),
-            None => out.push_str("<section class=\"grp\"><ol class=\"rows\">"),
+            None => out.push_str(&format!("<section class=\"{class}\"><ol class=\"rows\">")),
         }
         for row in &g.rows {
             if ctx.facts.multi_day {
@@ -1809,7 +2026,7 @@ pub fn render(ctx: &Ctx<'_>, groups: &[Group], section: &dyn Fn(Cursor) -> Strin
                     let d = text::day(at);
                     if d != last_day {
                         out.push_str(&format!(
-                            "<li class=\"grp-label caps\" aria-hidden=\"true\">{}</li>",
+                            "<li class=\"grp-label day caps\" aria-hidden=\"true\">{}</li>",
                             esc(&d)
                         ));
                         last_day = d;
@@ -1823,6 +2040,18 @@ pub fn render(ctx: &Ctx<'_>, groups: &[Group], section: &dyn Fn(Cursor) -> Strin
     out
 }
 
+/// `2 and 3`, or `2, 3, 4, 5, 6 and 14 more`.
+fn numbers(shown: &[u64], total: usize) -> String {
+    let words: Vec<String> = shown.iter().map(u64::to_string).collect();
+    let more = total.saturating_sub(shown.len());
+    match (words.split_last(), more) {
+        (None, _) => String::new(),
+        (Some((last, [])), 0) => last.clone(),
+        (Some((last, rest)), 0) => format!("{} and {last}", rest.join(", ")),
+        (Some(_), more) => format!("{} and {} more", words.join(", "), text::count(more as u64)),
+    }
+}
+
 fn row_html(ctx: &Ctx<'_>, row: &Row, section: &dyn Fn(Cursor) -> String) -> String {
     let d = row.depth.min(6);
     let mut class = format!("row {}", row.mark.class());
@@ -1831,6 +2060,8 @@ fn row_html(ctx: &Ctx<'_>, row: &Row, section: &dyn Fn(Cursor) -> String) -> Str
     }
     if row.crash {
         class.push_str(" crash");
+    } else if row.fail {
+        class.push_str(" fail");
     }
     if row.cursors.is_empty() {
         class.push_str(" derived");
@@ -1858,21 +2089,33 @@ fn row_html(ctx: &Ctx<'_>, row: &Row, section: &dyn Fn(Cursor) -> String) -> Str
     let h10 = hash.get(..10).unwrap_or("");
     let sections: String = row.cursors.iter().map(|&c| section(c)).collect();
     let mut notes = String::new();
-    if !row.read_back.is_empty() {
-        let by: Vec<String> = row.read_back.iter().map(u64::to_string).collect();
-        let who = if by.len() == 1 {
-            format!("attempt {}", by[0])
+    let mut read_words = String::new();
+    if row.read_back_total > 0 {
+        let who = if row.read_back_total == 1 {
+            "attempt"
         } else {
-            format!("attempts {}", by.join(" and "))
+            "attempts"
         };
+        let by = numbers(&row.read_back, row.read_back_total);
+        read_words = format!("read back by {who} {by}, ");
         notes.push_str(&format!(
-            "<p class=\"ent-w\">Read back by {who}: replayed from the journal, not repeated.</p>"
+            "<p class=\"ent-w\"><i class=\"dm rb\" aria-hidden=\"true\"></i>Read back by {who} {by}: \
+             replayed from the journal, not repeated.</p>"
         ));
     }
-    if !row.later.is_empty() {
+    for n in &row.notes {
+        notes.push_str(&format!("<p class=\"ent-w\">{n}</p>"));
+    }
+    if row.later_total > 0 {
         let links: Vec<String> = row.later.iter().map(|&c| ctx.cursor(c)).collect();
+        let more = row.later_total - row.later.len();
+        let more = if more > 0 {
+            format!(" and {} more", text::count(more as u64))
+        } else {
+            String::new()
+        };
         notes.push_str(&format!(
-            "<p class=\"ent-w\">Recorded on a later page: {}.</p>",
+            "<p class=\"ent-w\">Recorded on a later page: {}{more}.</p>",
             links.join(", ")
         ));
     }
@@ -1887,7 +2130,7 @@ fn row_html(ctx: &Ctx<'_>, row: &Row, section: &dyn Fn(Cursor) -> String) -> Str
          <span class=\"tm\" aria-hidden=\"true\">{tm}</span>\
          <span class=\"k\">{kinds}</span>\
          <span class=\"h\" title=\"{hash}\" aria-hidden=\"true\">{h10}</span>\
-         <span class=\"sr-only\">, {tm_words}entry hash {h10}. Show the recorded entries.</span>\
+         <span class=\"sr-only\">, {read_words}{tm_words}entry hash {h10}. Show the recorded entries.</span>\
          </summary><div class=\"detail\">{notes}{sections}</div></details></li>\n",
         title = row.title,
         kinds = row.kinds,

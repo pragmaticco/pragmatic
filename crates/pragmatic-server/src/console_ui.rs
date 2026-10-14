@@ -8,10 +8,12 @@
 //!   its timeline a page at a time, and the Anchoring, Evidence check and
 //!   Run cards), with the run's status and holds, its anchoring
 //!   (independent, or the operator's own signature only), its evidence
-//!   downloads and, for administrators, the Erase content card. A viewer
+//!   downloads and, for administrators, the erasure disclosure. A viewer
 //!   without `view_raw` sees every slot through the server's redaction.
-//! - The runs list, the access log, holds and retention, and tokens are
-//!   tables on leaves in the same frame.
+//! - The runs list speaks the run page's language: a row per run with its
+//!   state diamond, id, a sentence of its state, and its time and head.
+//! - The access log, holds and retention, and tokens are tables on leaves
+//!   in the same frame.
 //! - Every action that cannot be undone (erasure, removing a hold,
 //!   revoking a token, running retention) shows a confirmation first.
 //! - Sign-in and errors are single cards in the middle of the page.
@@ -24,8 +26,8 @@
 
 use pragmatic_console::fonts::Fonts;
 use pragmatic_console::html::{
-    diamond, document, empty, esc, masthead, mono, notice, solo_card, tag, Crumb, Frame, Page,
-    CONSOLE_POLICY, MARK,
+    command, diamond, document, empty, esc, masthead, mono, notice, solo_card, tag, Crumb, Frame,
+    Page, CONSOLE_POLICY, MARK,
 };
 use pragmatic_console::{render_run_page, text, RunView, ServerRun, SlotFilter};
 use serde_json::Value as JsonValue;
@@ -366,24 +368,28 @@ fn sign_in(error: Option<&str>, note: Option<&str>, licensee: &str, csrf: &str) 
 // Runs
 // ---------------------------------------------------------------------------
 
-fn status_words(status: &str) -> String {
-    match status {
-        "active" => "Running".to_string(),
-        "idle" => "Idle".to_string(),
-        "dangling" => "<span class=\"alarm s\">Dangling effect</span>".to_string(),
-        "regressed" => "<span class=\"alarm s\">Regressed</span>".to_string(),
-        "missing" => "<span class=\"alarm s\">Missing</span>".to_string(),
-        other => esc(&text::clip(other, 24)),
-    }
-}
-
-fn run_marker(status: &str, outcome: &str) -> &'static str {
-    match (status, outcome) {
-        ("regressed" | "missing", _) | (_, "fault" | "error") => diamond(true, true),
-        ("dangling", _) => diamond(false, true),
-        ("active", _) => "<i class=\"dm o br\" aria-hidden=\"true\"></i>",
-        (_, "ok") => diamond(true, false),
-        _ => diamond(false, false),
+/// A run's state in the words and with the diamond the run page uses: its
+/// sentence (escaped HTML) and its marker class.
+fn run_state(r: &JsonValue) -> (String, &'static str) {
+    let status = text_of(&r["status"]);
+    let outcome = text_of(&r["last_outcome"]);
+    let open = r["attempt_open"].as_bool().unwrap_or(false);
+    let alarm = |w: &str| format!("<span class=\"alarm\">{w}</span>");
+    match status.as_str() {
+        "regressed" => (alarm("Regressed: the stored journal went back"), "mk-alarm"),
+        "missing" => (alarm("Missing from storage"), "mk-alarm"),
+        "active" => ("Running".to_string(), "mk-breathe"),
+        "dangling" => (
+            alarm("No end: crashed \u{b7} an effect was left open"),
+            "mk-alarm-hollow",
+        ),
+        _ if open => (alarm("No end: crashed"), "mk-alarm-hollow"),
+        _ => match outcome.as_str() {
+            "ok" => ("Ended ok".to_string(), "mk-fill"),
+            "fault" => (alarm("Ended with a fault"), "mk-alarm-big"),
+            "" => ("No attempts".to_string(), "mk-hollow"),
+            other => (format!("Ended {}", mono(&text::clip(other, 16))), "mk-fill"),
+        },
     }
 }
 
@@ -406,8 +412,8 @@ fn runs_page(
     let statuses = [
         ("", "Any status"),
         ("active", "Running"),
-        ("idle", "Idle"),
-        ("dangling", "Dangling effect"),
+        ("idle", "Not running"),
+        ("dangling", "Effect left open"),
         ("regressed", "Regressed"),
         ("missing", "Missing"),
     ];
@@ -456,58 +462,51 @@ fn runs_page(
         .iter()
         .map(|r| {
             let id = text_of(&r["run_id"]);
-            let status = text_of(&r["status"]);
-            let outcome = text_of(&r["last_outcome"]);
+            let (state, mark) = run_state(r);
             let entries = r["entries"].as_u64().unwrap_or(0);
             let anchored = r["anchored_entries"].as_u64().unwrap_or(0);
-            let anchor = if anchored == 0 {
-                "<span class=\"s dim\">none</span>".to_string()
+            let count = |k: u64, one: &str, many: &str| {
+                format!("{} {}", text::count(k), if k == 1 { one } else { many })
+            };
+            let mut sentence = vec![state];
+            if let Some(a) = r["attempts"].as_u64().filter(|&a| a > 0) {
+                sentence.push(count(a, "attempt", "attempts"));
+            }
+            sentence.push(count(entries, "entry", "entries"));
+            sentence.push(if anchored == 0 {
+                "not yet anchored".to_string()
+            } else if anchored >= entries {
+                "anchored".to_string()
             } else {
-                esc(&format!(
-                    "{} of {}",
-                    text::count(anchored.min(entries)),
-                    text::count(entries)
-                ))
-            };
-            let outcome_html = match outcome.as_str() {
-                "" => "<span class=\"s dim\">\u{2013}</span>".to_string(),
-                "ok" => "ok".to_string(),
-                other => format!("<span class=\"alarm\">{}</span>", esc(&text::clip(other, 16))),
-            };
-            let program = match &r["program"] {
-                JsonValue::Object(p) => {
-                    let name = p.get("name").map(text_of).unwrap_or_default();
-                    let hash = p.get("hash").map(text_of).unwrap_or_default();
-                    format!("{} {}", text::clip(&name, 32), text::clip(&hash, 8))
+                format!(
+                    "anchored to #{}",
+                    text::count(anchored.min(entries).saturating_sub(1))
+                )
+            });
+            let holds = r["holds"].as_array().map_or(0, Vec::len) as u64;
+            if holds > 0 {
+                sentence.push(count(holds, "hold", "holds"));
+            }
+            if let JsonValue::Object(p) = &r["program"] {
+                let name = p.get("name").map(text_of).unwrap_or_default();
+                if !name.trim().is_empty() {
+                    sentence.push(format!("program {}", mono(&text::clip(&name, 32))));
                 }
-                other => text_of(other),
-            };
-            let program = if program.trim().is_empty() {
-                "<span class=\"s dim\">\u{2013}</span>".to_string()
-            } else {
-                esc(&program)
-            };
-            let holds = r["holds"].as_array().map_or(0, Vec::len);
-            let holds = if holds == 0 {
-                "<span class=\"s dim\">\u{2013}</span>".to_string()
-            } else {
-                holds.to_string()
-            };
+            }
+            let head = text::clip(&text_of(&r["head"]), 12)
+                .trim_end_matches('\u{2026}')
+                .to_string();
             format!(
-                "<tr><td class=\"mk\">{}</td><td class=\"head m\"><a class=\"m\" href=\"/console/runs/{}\" \
-                 title=\"{}\">{}</a></td><td data-label=\"Status\">{}</td>\
-                 <td data-label=\"Last outcome\">{outcome_html}</td>\
-                 <td class=\"m r\" data-label=\"Entries\">{}</td><td class=\"m nw\" data-label=\"Anchored\">{anchor}</td>\
-                 <td class=\"m dim clip\" data-label=\"Program\">{}</td>\
-                 <td class=\"m nw\" data-label=\"Updated\">{}</td><td class=\"m r\" data-label=\"Holds\">{holds}</td></tr>",
-                run_marker(&status, &outcome),
+                "<li class=\"rr {mark}\"><a class=\"rr-a\" href=\"/console/runs/{}\" title=\"{}\">\
+                 <span class=\"rr-t\"><span class=\"rid\">{}</span></span>\
+                 <span class=\"rr-tm\">{}</span><span class=\"rr-s\">{}</span>\
+                 <span class=\"rr-h\">{}</span></a></li>",
                 esc(&encode(&id)),
                 esc(&id),
                 esc(&text::clip(&id, 64)),
-                status_words(&status),
-                text::count(entries),
-                program,
-                esc(&text::short_time(&text_of(&r["updated_at"]), &year, false)),
+                esc(&text::short_time(&text_of(&r["updated_at"]), &year, true)),
+                sentence.join(" \u{b7} "),
+                esc(&head),
             )
         })
         .collect();
@@ -566,33 +565,30 @@ fn runs_page(
                 "<div class=\"tfoot\"><span class=\"note\">By run id</span><span class=\"pg\">{pages}</span></div>"
             )
         };
-        table(
-            "Runs",
-            &[
-                ("", false),
-                ("Run", false),
-                ("Status", false),
-                ("Last outcome", false),
-                ("Entries", true),
-                ("Anchored", false),
-                ("Program", false),
-                ("Updated (UTC)", false),
-                ("Holds", true),
-            ],
-            &rows,
-            &foot,
+        format!(
+            "<p class=\"cols caps\" aria-hidden=\"true\"><span>Run</span>\
+             <span class=\"c-time\">Updated (UTC) \u{b7} head</span>\
+             <span class=\"c-hash\">Updated (UTC)</span></p><ol class=\"rl\">{rows}</ol>{foot}"
         )
     };
-    let shown = if runs.len() == 1 {
-        "1 shown".to_string()
+    let shown = match (runs.len(), next.is_some()) {
+        (1, false) => "<span class=\"n\">1</span> run".to_string(),
+        (k, false) => format!("<span class=\"n\">{}</span> runs", text::count(k as u64)),
+        (k, true) => format!(
+            "the first <span class=\"n\">{}</span> runs",
+            text::count(k as u64)
+        ),
+    };
+    let shown = if any {
+        format!("{shown} matching these filters, by run id")
     } else {
-        format!("{} shown", runs.len())
+        format!("{shown}, by run id")
     };
     let main = format!(
-        "<div class=\"page-h\"><h1 class=\"title\">Runs</h1><p class=\"lede\">{shown}, by run id</p></div>\
-         <section class=\"tsheet\" aria-label=\"Runs\">{filter_bar}{body}</section>"
+        "<div class=\"page-h\"><h1 class=\"title\">Runs</h1><p class=\"facts\">{shown}</p></div>\
+         <section class=\"tsheet runs\" aria-label=\"Runs\">{filter_bar}{body}</section>"
     );
-    framed(viewer, "runs", "Runs", &[Crumb::word("Runs", None)], main)
+    framed(viewer, "runs", "Runs", &[], main)
 }
 
 // ---------------------------------------------------------------------------
@@ -624,34 +620,37 @@ fn evidence_foot(viewer: &ConsoleViewer, path: &str, run_id: &str) -> Option<Str
             )
         })
         .collect();
+    let file = format!("{}.evidence.json", text::clip(run_id, 80));
     Some(format!(
         "<p class=\"lbl\">Evidence bundle {}</p><ul class=\"dls\">{links}</ul>\
-         <p class=\"note\">Verify offline with <span class=\"m\">pragmatic verify-evidence \
-         {}.evidence.json</span>, against trust roots of your own choosing.</p>",
+         <p class=\"lbl\">Verify it offline</p>{}\
+         <p class=\"note\">Against trust roots of your own choosing.</p>",
         tag("Preview"),
-        esc(&text::clip(run_id, 80))
+        command(&["pragmatic verify-evidence".to_string(), file])
     ))
 }
 
-/// The Erase content card, for administrators. Its button leads to a
+/// Erasure, for administrators: a quiet disclosure at the end of the run
+/// page's side column, which opens on the form. Its button leads to a
 /// confirmation; it erases nothing itself.
 fn erase_card(viewer: &ConsoleViewer, path: &str) -> Option<String> {
     if viewer.role != "admin" {
         return None;
     }
     Some(format!(
-        "<section class=\"card erase\" aria-labelledby=\"h-erase\"><div class=\"card-h\">\
-         <h2 class=\"card-t\" id=\"h-erase\">Erase content</h2>{}</div><div class=\"card-b\">\
+        "<details class=\"erase\"><summary>Erase content\u{2026}</summary>\
+         <section class=\"card\" aria-labelledby=\"h-erase\"><div class=\"card-h\">\
+         <h2 class=\"card-t alarm\" id=\"h-erase\">Erase content</h2>{}</div><div class=\"card-b\">\
          <p>Erasure drops slot content and its salt for good. The chain still verifies, and an \
          erasure note records who, why and when.</p>\
-         <form method=\"post\" action=\"{}/erase\" class=\"fields\" style=\"margin-top:14px\">{}\
+         <form method=\"post\" action=\"{}/erase\" class=\"fields\">{}\
          <div class=\"field\"><label for=\"e-slots\">Slots</label><input class=\"m\" id=\"e-slots\" \
          name=\"slots\" aria-describedby=\"e-slots-h\"><p class=\"hint\" id=\"e-slots-h\">\
          <span class=\"m\">cursor:slot</span>, space-separated. Each slot's address is in its \
          expanded row, for example <span class=\"m\">5:0</span>.</p></div>\
-         <div class=\"field\"><label for=\"e-match\">or Every slot containing</label>\
+         <div class=\"field\"><label for=\"e-match\">Or every slot containing</label>\
          <input id=\"e-match\" name=\"match\"></div>\
-         <label class=\"cbox\"><input type=\"checkbox\" name=\"all\" value=\"on\"> or Every slot</label>\
+         <label class=\"cbox\"><input type=\"checkbox\" name=\"all\" value=\"on\"> Or every slot</label>\
          <div class=\"field\"><label for=\"e-code\">Reason code</label><input class=\"m\" id=\"e-code\" \
          name=\"reason_code\" required pattern=\"[a-z0-9_.:-]{{1,64}}\" aria-describedby=\"e-code-h\">\
          <p class=\"hint\" id=\"e-code-h\">Lowercase letters, digits and <span class=\"m\">_ . : -</span>, \
@@ -661,8 +660,8 @@ fn erase_card(viewer: &ConsoleViewer, path: &str) -> Option<String> {
          <label class=\"cbox\"><input type=\"checkbox\" name=\"force\" value=\"on\"> Revoke a live lease</label>\
          <label class=\"cbox\"><input type=\"checkbox\" name=\"allow_unfinished\" value=\"on\"> The run did \
          not finish; it can no longer resume</label>\
-         <div class=\"actions\" style=\"margin-top:4px\"><button class=\"btn danger\" type=\"submit\">\
-         Review erasure</button></div></form></div></section>",
+         <div class=\"actions\"><button class=\"btn danger\" type=\"submit\">\
+         Review erasure</button></div></form></div></section></details>",
         tag("Admin"),
         esc(path),
         csrf_field(&viewer.csrf)
@@ -707,23 +706,35 @@ fn access_page(viewer: &ConsoleViewer, records: &[JsonValue], next: Option<u64>)
                 _ => String::new(),
             };
             let raw = if r["raw"] == JsonValue::Bool(true) {
-                tag("Raw")
+                format!(" {}", tag("Raw"))
             } else {
                 String::new()
             };
+            // Who: the principal, then the role in words.
+            let role = role_words(&text_of(&r["role"]));
+            let who = match (personal(&r["principal"]), role.is_empty()) {
+                (p, true) => p,
+                (p, false) if p.is_empty() => format!("<span class=\"s dim\">{}</span>", esc(&role)),
+                (p, false) => format!(
+                    "<span class=\"m\">{p}</span> <span class=\"s dim\">\u{b7} {}</span>",
+                    esc(&role)
+                ),
+            };
             format!(
                 "<tr><td class=\"m r head\">{}</td><td class=\"m nw\" data-label=\"At (UTC)\">{}</td>\
-                 <td class=\"m\" data-label=\"Kind\">{}</td><td class=\"m\" data-label=\"Request\">{}</td>\
-                 <td class=\"m r\" data-label=\"Status\">{status_html}</td><td class=\"m\" data-label=\"Token\">{}</td>\
-                 <td data-label=\"Role\">{}</td><td data-label=\"Run\">{run}</td><td data-label=\"Raw\">{raw}</td>\
-                 <td class=\"m\" data-label=\"Principal\">{}</td><td class=\"m\" data-label=\"Source\">{}</td></tr>",
+                 <td class=\"m nw\" data-label=\"Kind\">{}</td><td class=\"nw\" data-label=\"Request\">{}{raw}</td>\
+                 <td class=\"m r\" data-label=\"Status\">{status_html}</td><td class=\"nw\" data-label=\"Run\">{run}</td>\
+                 <td class=\"nw\" data-label=\"Who\">{who}</td><td class=\"m nw\" data-label=\"Token\">{}</td>\
+                 <td class=\"m nw\" data-label=\"Source\">{}</td></tr>",
                 cell(&r["cursor"], 24),
                 esc(&text::short_time(&text_of(&r["at"]), &year, true)),
                 cell(&r["kind"], 24),
-                esc(&text::clip(&request, 64)),
+                if request.trim().is_empty() {
+                    String::new()
+                } else {
+                    mono(&text::clip(&request, 64))
+                },
                 cell(&r["token_id"], 32),
-                esc(&role_words(&text_of(&r["role"]))),
-                personal(&r["principal"]),
                 personal(&r["source_ip"]),
             )
         })
@@ -742,11 +753,9 @@ fn access_page(viewer: &ConsoleViewer, records: &[JsonValue], next: Option<u64>)
                 ("Kind", false),
                 ("Request", false),
                 ("Status", true),
-                ("Token", false),
-                ("Role", false),
                 ("Run", false),
-                ("Raw", false),
-                ("Principal", false),
+                ("Who", false),
+                ("Token", false),
                 ("Source", false),
             ],
             &rows,
@@ -761,13 +770,7 @@ fn access_page(viewer: &ConsoleViewer, records: &[JsonValue], next: Option<u64>)
          including refused ones, with who made it and what it touched. Query values are never \
          recorded.</p><section class=\"tsheet\" aria-label=\"Access log\">{body}</section>"
     );
-    framed(
-        viewer,
-        "access",
-        "Access log",
-        &[Crumb::word("Access log", None)],
-        main,
-    )
+    framed(viewer, "access", "Access log", &[], main)
 }
 
 // ---------------------------------------------------------------------------
@@ -862,7 +865,7 @@ fn holds_page(
          <form method=\"post\" action=\"/console/holds\">{csrf}<div class=\"grid3\">\
          <div class=\"field\"><label for=\"h-matter\">Matter</label><input id=\"h-matter\" name=\"matter\" required></div>\
          <div class=\"field\"><label for=\"h-prefix\">Run id prefix</label><input class=\"m\" id=\"h-prefix\" name=\"prefix\"></div>\
-         <div class=\"field\"><label for=\"h-ids\">or Run ids (space-separated)</label><input class=\"m\" id=\"h-ids\" name=\"run_ids\"></div>\
+         <div class=\"field\"><label for=\"h-ids\">Or run ids, space-separated</label><input class=\"m\" id=\"h-ids\" name=\"run_ids\"></div>\
          </div><div class=\"actions\"><button class=\"btn\" type=\"submit\">Place hold</button></div></form>\
          </div></section></section>"
     ));
@@ -907,13 +910,7 @@ fn holds_page(
          <form method=\"post\" action=\"/console/retention/run\">{csrf}\
          <button class=\"btn sm danger\" type=\"submit\">Run retention now</button></form></div></div></section>"
     ));
-    framed(
-        viewer,
-        "holds",
-        "Holds and retention",
-        &[Crumb::word("Holds and retention", None)],
-        main,
-    )
+    framed(viewer, "holds", "Holds and retention", &[], main)
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,13 +1034,7 @@ fn tokens_page(
          <div class=\"actions\"><button class=\"btn\" type=\"submit\">Issue token</button></div></form>\
          </div></section>"
     ));
-    framed(
-        viewer,
-        "tokens",
-        "Tokens",
-        &[Crumb::word("Tokens", None)],
-        main,
-    )
+    framed(viewer, "tokens", "Tokens", &[], main)
 }
 
 // ---------------------------------------------------------------------------
@@ -1343,7 +1334,7 @@ fn error_page(
         None => (String::new(), licensee_text(licensee)),
     };
     let frame = frame(&nav, &footer);
-    let crumbs = [Crumb::word("Error", None)];
+    let crumbs: [Crumb<'_>; 0] = [];
     document(
         &frame,
         &Page {
@@ -1420,6 +1411,21 @@ mod tests {
         assert!(html.contains("&lt;b&gt;pat&lt;/b&gt;"));
         assert!(html.contains("after=a+b"));
         assert!(html.contains("<details open><summary>More filters"));
+        // Each run is a row in the run page's language, and a top-level
+        // page has no breadcrumb to repeat its navigation.
+        assert!(html.contains("<li class=\"rr mk-fill\"><a class=\"rr-a\" href=\"/console/runs/%3Cscript%3Ex%3C%2Fscript%3E\""));
+        assert!(html.contains("<span class=\"rr-s\">Ended ok \u{b7} 2 entries \u{b7} anchored"));
+        assert!(!html.contains("class=\"crumbs\""));
+        let crashed = json!({"run_id": "r", "status": "idle", "attempt_open": true, "entries": 3,
+                             "anchored_entries": 0, "holds": ["h"], "last_outcome": "ok"});
+        let html = render(ConsolePage::Runs {
+            viewer: &v,
+            runs: &[crashed],
+            next: None,
+            filters: &json!({}),
+        });
+        assert!(html.contains("<li class=\"rr mk-alarm-hollow\">"));
+        assert!(html.contains("<span class=\"alarm\">No end: crashed</span> \u{b7} 3 entries \u{b7} not yet anchored \u{b7} 1 hold"));
         let html = render(ConsolePage::Tokens {
             viewer: &v,
             tokens: &[
@@ -1564,6 +1570,12 @@ mod tests {
         );
         assert!(erase_card(&viewer("auditor"), path).is_none());
         let admin = erase_card(&viewer("admin"), path).unwrap();
+        // A quiet disclosure, closed until it is opened.
+        assert!(
+            admin.starts_with("<details class=\"erase\"><summary>Erase content\u{2026}</summary>")
+        );
+        assert!(admin.contains(">Or every slot containing</label>"));
+        assert!(admin.contains("> Or every slot</label>"));
         assert!(admin.contains("/console/runs/r/erase"));
         assert!(admin.contains("name=\"csrf\" value=\"c5rf\""));
         assert!(admin.contains("Review erasure"));

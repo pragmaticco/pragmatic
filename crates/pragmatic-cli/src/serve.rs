@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use pragmatic::Backend;
 use pragmatic_console::fonts::{self, Fonts};
 use pragmatic_console::html::{
-    document, esc, masthead, solo_card, source_note, Crumb, Frame, Page, SERVE_POLICY,
+    dir_name, document, esc, masthead, solo_card, Crumb, Frame, Page, SERVE_POLICY,
 };
 use pragmatic_console::{render_index_of, render_run, RunRow, RunView};
 
@@ -31,15 +31,14 @@ use crate::journals::{backend, discover, open};
 /// Where this console serves its fonts.
 const ASSETS: &str = "/assets/";
 
-/// The frame of every page: fonts from this console, links home to the
-/// index, and the directory on the masthead.
-fn with_frame<T>(dir: &Path, f: impl FnOnce(&Frame<'_>) -> T) -> T {
-    let nav = source_note(&dir.display().to_string(), true);
+/// The frame of every page: fonts from this console, and links home to
+/// the index. The directory is the breadcrumb's first step.
+fn with_frame<T>(f: impl FnOnce(&Frame<'_>) -> T) -> T {
     f(&Frame {
         csp: SERVE_POLICY,
         fonts: Fonts::Served(ASSETS),
         home: Some("/"),
-        nav: &nav,
+        nav: "",
         footer: "",
     })
 }
@@ -54,9 +53,7 @@ fn index_page(dir: &Path, key: Option<&[u8]>) -> String {
         })
         .collect();
     let source = dir.display().to_string();
-    with_frame(dir, |frame| {
-        render_index_of(&rows, Some(&source), Some(frame))
-    })
+    with_frame(|frame| render_index_of(&rows, Some(&source), Some(frame)))
 }
 
 fn run_page(dir: &Path, run: &str, from: u64, key: Option<&[u8]>) -> Result<String, String> {
@@ -68,7 +65,7 @@ fn run_page(dir: &Path, run: &str, from: u64, key: Option<&[u8]>) -> Result<Stri
         .unwrap_or_else(|_| journal.audit());
     let source = dir.display().to_string();
     let link = format!("/run/{run}?from=");
-    Ok(with_frame(dir, |frame| {
+    Ok(with_frame(|frame| {
         let view = RunView {
             source: Some(&source),
             from: from.min(journal.len()),
@@ -80,33 +77,64 @@ fn run_page(dir: &Path, run: &str, from: u64, key: Option<&[u8]>) -> Result<Stri
     }))
 }
 
-/// The page for a run this directory does not hold.
-fn missing_page(dir: &Path, run: &str) -> String {
-    with_frame(dir, |frame| {
-        let body = format!(
-            "<p class=\"lede\">There is no readable run with this id in <span class=\"m\">{}</span>. \
-             The id may be mistyped, or the run may have been moved.</p>\
-             <p class=\"actions\"><a class=\"go\" href=\"/\">Back to runs</a></p>",
-            esc(&dir.display().to_string())
-        );
+/// The page for a run this directory does not hold, or holds and cannot
+/// open (a wrong key, a damaged file): it says which, and why.
+fn missing_page(dir: &Path, run: &str, why: &str) -> (&'static str, String) {
+    let source = dir.display().to_string();
+    let held = discover(dir).is_ok_and(|runs| runs.iter().any(|r| r == run));
+    let status = if held {
+        "500 Internal Server Error"
+    } else {
+        "404 Not Found"
+    };
+    let html = with_frame(|frame| {
+        let (label, title, lede) = if held {
+            (
+                "Error 500",
+                format!(
+                    "Run <span class=\"m\">{}</span> could not be opened",
+                    esc(run)
+                ),
+                format!(
+                    "<p class=\"lede\">It is in <span class=\"m\">{}</span>, but reading it \
+                     failed: <span class=\"q\">\u{201c}{}\u{201d}</span></p>",
+                    esc(&source),
+                    esc(&pragmatic_console::gist::excerpt(why, 240))
+                ),
+            )
+        } else {
+            (
+                "Error 404",
+                format!("No run named <span class=\"m\">{}</span>", esc(run)),
+                format!(
+                    "<p class=\"lede\">There is no run with this id in <span class=\"m\">{}</span>. \
+                     The id may be mistyped, or the run may have been moved.</p>",
+                    esc(&source)
+                ),
+            )
+        };
+        let body =
+            format!("{lede}<p class=\"actions\"><a class=\"go\" href=\"/\">Back to runs</a></p>");
+        let mut crumbs: Vec<Crumb<'_>> = dir_name(&source)
+            .map(|d| Crumb::word(d, frame.home))
+            .into_iter()
+            .collect();
+        crumbs.push(Crumb::id(run, None));
         document(
             frame,
             &Page {
-                title: "No such run",
-                masthead: masthead(
-                    frame.home,
-                    &[Crumb::word("Runs", frame.home), Crumb::id(run, None)],
-                    frame.nav,
-                ),
-                main: solo_card(
-                    "Error 404",
-                    &format!("No run named <span class=\"m\">{}</span>", esc(run)),
-                    &body,
-                ),
+                title: if held {
+                    "Run not opened"
+                } else {
+                    "No such run"
+                },
+                masthead: masthead(frame.home, &crumbs, frame.nav),
+                main: solo_card(label, &title, &body),
                 ..Page::default()
             },
         )
-    })
+    });
+    (status, html)
 }
 
 /// The value of header `name` (case-insensitive) in a request head.
@@ -223,12 +251,10 @@ fn handle(mut stream: TcpStream, dir: &Path, key: Option<&[u8]>, port: u16) {
                 .unwrap_or(0);
             match run_page(dir, &run, from, key) {
                 Ok(html) => respond(&mut stream, "200 OK", "text/html", &html),
-                Err(_) => respond(
-                    &mut stream,
-                    "404 Not Found",
-                    "text/html",
-                    &missing_page(dir, &run),
-                ),
+                Err(why) => {
+                    let (status, page) = missing_page(dir, &run, &why);
+                    respond(&mut stream, status, "text/html", &page)
+                }
             }
         }
         _ => respond(&mut stream, "404 Not Found", "text/plain", "not found"),
