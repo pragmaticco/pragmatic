@@ -1,20 +1,23 @@
 # Quickstart
 
-Five minutes from an empty project to a crash-proof, replayable agent. For
-the whole product story in one command (Pragmatic Server, anchoring,
-erasure and an auditor's evidence check), run `examples/demo/run.sh` from a
-clone of this repository instead.
+Five minutes from an empty project to a crash-recoverable, replayable
+agent. For the whole product story in one command (Pragmatic Server,
+anchoring, erasure and an auditor's evidence check), run
+`examples/demo/run.sh` from a clone of this repository's
+`system-of-record` branch instead.
 
 ## 1. Install
 
-Pragmatic 0.6.0 is not on crates.io yet, so depend on the repository:
+Pragmatic 0.6.0 is not on crates.io yet, so depend on the repository. It
+is on the `system-of-record` branch until it is merged to `main` (which
+still holds 0.4.0), so pin the branch:
 
 ```toml
 # Cargo.toml
 [dependencies]
-pragmatic = { git = "https://github.com/pragmaticco/pragmatic" }
+pragmatic = { git = "https://github.com/pragmaticco/pragmatic", branch = "system-of-record" }
 # or implement Oracle for your own model client
-pragmatic-anthropic = { git = "https://github.com/pragmaticco/pragmatic" }
+pragmatic-anthropic = { git = "https://github.com/pragmaticco/pragmatic", branch = "system-of-record" }
 ```
 
 ## 2. Write the agent
@@ -36,8 +39,8 @@ fn research(ctx: &mut Ctx) -> Result<Value, Fault> {
     }
 
     // A durable effect: journaled *before* it runs (write-ahead), its
-    // result journaled after. Replay reuses the result; the world is
-    // touched exactly once.
+    // result journaled after. Once the result is on record, resume and
+    // replay reuse it instead of running the effect again.
     ctx.effect("publish", format!("{} findings", findings.len()), |arg| {
         // your real side effect here: S3 write, webhook, DB insert...
         Ok(Value::from(format!("s3://reports/{arg}")))
@@ -73,8 +76,12 @@ Kill the process anywhere - step nine of a thousand. Then:
 let report = rt.resume("research-42", research)?;
 ```
 
-The nine recorded steps are **read back from the journal** (zero model
-calls, zero duplicate effects); recording continues at step nine. The agent
+The nine recorded steps are **read back from the journal** (no model
+calls and no repeated effects for them); recording continues at step nine.
+A step the crash cut off midway, with no result on record, is decided by
+the recovery policy: a model call is sent again, and an effect is
+performed again by default on local runs (see the
+[usage guide](usage.md#5-side-effects-recorded-write-ahead)). The agent
 function cannot tell the difference - that is Theorem T1's content.
 
 ## 5. Replay, exactly
@@ -90,7 +97,7 @@ behavior included - for time-travel debugging and audit.
 ## 6. Inspect from the terminal - or the console
 
 ```sh
-cargo install --path crates/pragmatic-cli    # from a clone, until it is on crates.io
+cargo install --path crates/pragmatic-cli    # from a clone (system-of-record branch), until it is on crates.io
 
 pragmatic runs   --dir ./journals            # every run, chain status
 pragmatic show   research-42 --dir ./journals
@@ -126,7 +133,8 @@ calls; every sync `Oracle` also works as-is.
 
 ## Python
 
-From a clone of the repository, until the package is on PyPI:
+From a clone of the repository's `system-of-record` branch, until the
+package is on PyPI:
 
 ```sh
 pip install "./crates/pragmatic-python[anthropic]"   # or [openai]

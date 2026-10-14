@@ -46,10 +46,10 @@ the journaled interfaces.
 | **Agent code**, including tools hijacked by prompt injection | Act outside the journaled interfaces, unrecorded. Hold an agent token scoped to its run-id prefixes. Append to a run while it holds that run's lease. In local mode, read, edit and delete the journal files its process can reach | Write erased or withheld slots, or server-only notes. Touch runs outside its scopes. Rewrite or delete anything already on Pragmatic Server |
 | **Host operator without the HMAC key** (local mode) | Read and edit local journal files. Delete them | Edit a keyed journal without detection |
 | **Host operator** (local mode, unkeyed journal) | Read, edit, delete or truncate the files, and recompute the chain after an edit | Hide an edit from someone who holds an earlier copy, such as one pushed to Pragmatic Server or exported as an evidence bundle |
-| **Server administrator with root** | Read all content. Delete data. Rewrite the unanchored end of a run (normally at most one anchoring interval old). Stop anchoring | Rewrite an anchored prefix. Hide an anchored run from an auditor who audits the full anchor log against a pinned independent witness |
+| **Server administrator with root** | Read all content. Delete data. Rewrite the unanchored end of a run (normally at most one anchoring interval old). Stop anchoring. With `anchor_run_ids = "hmac"`, rewrite an anchored run and anchor it again under a new per-run key, which no audit detects (see [`anchor_run_ids`](server.md#anchoring)) | For runs anchored with plain ids (`anchor_run_ids = "plain"`, the default): rewrite an anchored prefix, or hide an anchored run from an auditor who audits the full anchor log against a pinned independent witness |
 | **Auditor** | Read what their token's scopes and `view_raw` allow | Recover redacted content: salts are never served with redacted content, and a withheld slot carries only its commitment |
 | **Holder of a stolen token** | Whatever that token's role and scopes allow, until it is revoked or expires | Act outside those scopes, or act unlogged: every request, refused ones included, is in the access log |
-| **One timestamp authority** (compromised, or simply wrong) | Issue a false time-stamp | Make an anchor count as independent on its own: an anchor needs at least two distinct trusted operators |
+| **One timestamp authority** (compromised, or simply wrong) | Issue a false time-stamp | Make an anchor count as independent on its own: by default an anchor needs at least two distinct trusted operators (the verifiers' `--min-operators`, the server's `min_independent_operators`) |
 | **Pragmatic Witness** (hosted, planned) | Refuse service. See a log name, sequence number, tree size and root hash | Learn any content or run id |
 | **Network attacker** between the SDK and the server | Without TLS: read content and tokens, and change traffic | With TLS ending at your proxy or ingress: read or change traffic. The server refuses to listen on a non-loopback address unless you confirm that TLS ends in front of it (`allow_plain_http`) |
 
@@ -96,7 +96,11 @@ It does **not** prove:
 - who ran the agent, beyond what the server recorded about tokens, which
   is the operator's statement;
 - that the server's own signature is independent: it is controlled by the
-  operator and is reported as such.
+  operator and is reported as such;
+- for a server set to `anchor_run_ids = "hmac"`, that no other version of
+  the run was anchored under another key: such bundles report
+  `anchor_id_unbound`, and the full-log audit fails with
+  `log_unauditable`.
 
 A timestamp authority stamps whatever digest it is sent. Anyone can build
 a Merkle log of their own and have it stamped. That is why an auditor
@@ -218,6 +222,6 @@ bundles carry. The journal itself keeps the raw content.
   impossible.
 - Side channels, and denial of service against the server.
 - The security of the timestamp authorities and witnesses themselves,
-  beyond requiring two independent operators.
+  beyond requiring, by default, two independent operators.
 
 To report a vulnerability, see [SECURITY.md](../SECURITY.md).

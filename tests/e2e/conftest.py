@@ -21,7 +21,14 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from story import Narrator, Story  # noqa: E402
+import harness  # noqa: E402
+
+try:
+    from story import Narrator, Story  # noqa: E402
+except ImportError as e:
+    # The SDK this Python cannot import is something the machine lacks: say
+    # what to do about it rather than show an import traceback.
+    raise harness.SetupError(harness.import_problem(e)) from e
 
 _failed: Dict[str, str] = {}
 

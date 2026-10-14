@@ -35,9 +35,10 @@ for AI-agent startups selling to regulated enterprises.
 
 > **Status.** No release is on PyPI or crates.io yet; build from source.
 > Release **0.5** (drop-in Python, Apache 2.0) is on the `release/0.5.0`
-> branch. This repository builds **0.6.0**, the system-of-record release:
+> branch. The `system-of-record` branch builds **0.6.0**, the
+> system-of-record release (`main` holds 0.4.0 until 0.6 is merged):
 > everything marked **0.6** below (journal format 2, erasure, anchoring,
-> evidence bundles and Pragmatic Server) is implemented and tested here.
+> evidence bundles and Pragmatic Server) is implemented and tested there.
 > Pragmatic Server is in **design-partner preview** and is not generally
 > available.
 
@@ -46,6 +47,8 @@ for AI-agent startups selling to regulated enterprises.
 One command runs the product end to end on your own machine:
 
 ```sh
+git clone -b system-of-record https://github.com/pragmaticco/pragmatic
+cd pragmatic
 examples/demo/run.sh            # add --open to open the auditor's report at the end
 ```
 
@@ -78,8 +81,11 @@ to a journal **before** its result reaches the agent. The journal is:
   entry where the chain breaks. A secret key, or anchoring, also catches
   someone who recomputes the whole chain after an edit.
 - **Anchored** (0.6, Pragmatic Server). The state of every run is
-  time-stamped by independent timestamp authorities, so even the person
-  who runs the server cannot quietly rewrite anchored history.
+  time-stamped by independent timestamp authorities. With plain run ids
+  (the default), even the person who runs the server cannot quietly
+  rewrite anchored history: an auditor who checks the full anchor log
+  against a pinned witness would see it. See the
+  [threat model](docs/threat-model.md).
 - **Replayable exactly.** Replay runs your agent code against the journal
   and serves every recorded answer. The model is never called and no tool
   runs again.
@@ -118,23 +124,25 @@ between hosts; use Pragmatic Server instead.
 
 ## How it differs
 
-- **Observability tools** (Langfuse, LangSmith, Datadog) record traces in
-  databases that can be edited, and keep them for a limited time set by
-  the plan.
+- **Observability tools** (such as Langfuse, LangSmith and Datadog)
+  record traces in databases that can be edited. Hosted tracing services
+  typically set retention by plan, and self-hosted stacks by your own
+  configuration.
 - **Durable-execution engines** (Temporal, DBOS) recover workflows after a
   crash, but their history is engine state, not an audit record that an
   outsider can check.
 - **A model or cloud provider's own logs** cover one vendor, and only that
   vendor vouches for them.
-- **Pragmatic** captures completely by construction (a result reaches the
-  agent only after it is recorded), replays without calling the model, and
-  produces evidence anyone can verify without trusting the operator.
+- **Pragmatic** captures every call made through its journaled
+  interfaces (a result reaches the agent only after it is recorded),
+  replays without calling the model, and produces evidence anyone can
+  verify without trusting the operator.
 
 | | Tracing tools | Durable-execution engines | Pragmatic |
 |---|---|---|---|
 | When a call is recorded | After the fact, by an exporter; recording prompt content is often optional | When the engine checkpoints a step | Before the result reaches the agent |
 | Tamper evidence | None: an ordinary database | None: the history is not signed or anchored | A hash chain, plus anchoring with independent timestamp authorities (0.6) |
-| How long it is kept | Set by the vendor's plan | Set by the engine's history retention | Your retention policy, with legal holds (0.6) |
+| How long it is kept | Set by the hosted plan, or by your own configuration when self-hosted | Set by the engine's history retention | Your retention policy, with legal holds (0.6) |
 | Replay a run without the model | No | Inside the engine, against its history | Anywhere, from the journal; the model is never called |
 | Crash recovery | No | Yes | Yes, without repeating recorded model answers or committed tool calls |
 | Erase one person's data and still prove the rest | No | No | Yes (0.6) |
@@ -147,17 +155,19 @@ of someone who does not trust you.
 
 ## Your agent, journaled
 
-Until the SDK is on PyPI, install it from a clone of this repository
-(this needs a Rust toolchain):
+Until the SDK is on PyPI, install it from a clone of this repository's
+`system-of-record` branch (this needs a Rust toolchain):
 
 ```sh
+git clone -b system-of-record https://github.com/pragmaticco/pragmatic
+cd pragmatic
 pip install "./crates/pragmatic-python[anthropic]"   # or [openai]
 ```
 
-That builds 0.6.0. Once it is published, it becomes
-`pip install "pragmatic-runtime[anthropic]"`. The 0.5 release is on the
-`release/0.5.0` branch; it records only `create` calls, and its journals
-(format 1) are read-only under 0.6.
+That builds 0.6.0 (a clone of `main` would build 0.4.0). Once it is
+published, it becomes `pip install "pragmatic-runtime[anthropic]"`. The
+0.5 release is on the `release/0.5.0` branch; it records only `create`
+calls, and its journals (format 1) are read-only under 0.6.
 
 Keep your agent as it is. Wrap the SDK client with `ctx.wrap` and hand
 tool calls to `ctx.run_tools`. Every model call and tool call is now
@@ -235,9 +245,9 @@ pragmatic verify-evidence support-ticket-4127.evidence.json \
 ```
 
 The verdict is `VERIFIED` (exit 0) when the whole journal is anchored by
-at least two independent operators the auditor trusts, `VERIFIED
-(PARTIAL)` (exit 2) when only the start of it is, `UNANCHORED` (exit 3),
-or `FAILED` (exit 1). A second verifier written in plain Python, sharing
+at least `--min-operators` (by default two) independent operators the
+auditor trusts, `VERIFIED (PARTIAL)` (exit 2) when only the start of it
+is, `UNANCHORED` (exit 3), or `FAILED` (exit 1). A second verifier written in plain Python, sharing
 no code with the first (`tools/verify_evidence.py`), runs the same checks.
 `pragmatic render-evidence` writes the report as HTML, or the records as
 CSV. The auditor's walkthrough is [docs/evidence.md](docs/evidence.md),

@@ -196,6 +196,82 @@ def test_async_create(tmp_path, api, provider):
     assert [m["outcome"] for m in draws(rt, "r")] == ["ok"]
 
 
+class _KeepAliveAPI:
+    """The fake API's JSON answers over a real loopback socket, with HTTP/1.1
+    keep-alive, so a client's pool holds its connections between calls.
+    Counts the connections it accepted."""
+
+    def __init__(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        from model_api import anthropic_json, chat_completion
+
+        outer = self
+        self.connections = 0
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def setup(self) -> None:
+                super().setup()
+                outer.connections += 1
+
+            def do_POST(self) -> None:
+                body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))))
+                if self.path.endswith("/v1/messages"):
+                    doc = anthropic_json(body, TEXT)
+                else:
+                    doc = chat_completion(body, TEXT)
+                data = json.dumps(doc).encode()
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *_: Any) -> None:
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def client(self, provider: str) -> Any:
+        port = self.server.server_address[1]
+        if provider == "anthropic":
+            return anthropic.AsyncAnthropic(
+                api_key="sk-test", base_url=f"http://127.0.0.1:{port}", max_retries=0
+            )
+        return openai.AsyncOpenAI(
+            api_key="sk-test", base_url=f"http://127.0.0.1:{port}/v1", max_retries=0
+        )
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_an_async_client_built_once_serves_many_synchronous_runs(tmp_path, provider):
+    """``pragmatic.wrap`` at module level and ``rt.run`` of an async agent,
+    run after run: the client's pooled connection belongs to the loop that
+    opened it, which must still be open for the next run."""
+    api = _KeepAliveAPI()
+    try:
+        client = pragmatic.wrap(api.client(provider))
+
+        async def agent(ctx):
+            return text_of(await create(client, provider), provider)
+
+        rt = pragmatic.Runtime(tmp_path)
+        for ticket in ("ticket-4411", "ticket-4412", "ticket-4413"):
+            assert rt.run(ticket, agent).output == TEXT
+        assert api.connections == 1
+        assert rt.replay("ticket-4412", agent).output == TEXT
+    finally:
+        api.close()
+
+
 def test_requests_are_split_into_parts_without_transport_headers(tmp_path, api):
     base = api.client(
         "anthropic", False, default_headers={"X-Secret": "s3cr3t"},

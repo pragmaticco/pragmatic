@@ -3,30 +3,36 @@
 A hands-on guide for someone who just found this repo and wants to actually
 run it. If you want the theory, read [Concepts](concepts.md); if you want the
 five-minute tour, read the [Quickstart](quickstart.md). This page is the
-middle path: everything you need to go from zero to a crash-proof, replayable
-agent, in the order you'll actually hit it.
+middle path: everything you need to go from zero to a crash-recoverable,
+replayable agent, in the order you'll actually hit it.
 
 **What Pragmatic gives you:** you write an agent as an ordinary function. Every
 model call and every side effect it makes is journaled to an append-only log
 as it happens. Kill the process at any point and resume - the steps already
-taken are read back from the log instead of re-run, so you never pay for a
-model call twice or fire a side effect twice. Replay the whole run later,
-bit-for-bit, without calling the model at all - for debugging or audit.
+on record are read back from the log instead of re-run, so a recorded model
+answer is never paid for again and a committed side effect never runs
+again. (A call the crash cut off midway, with no result on record, is
+decided by the recovery policy; see [section 5](#5-side-effects-recorded-write-ahead).)
+Replay the whole run later, bit-for-bit, without calling the model at all -
+for debugging or audit.
 
 **When you want it:** long or expensive agent runs you can't afford to restart
 from scratch, anything that touches the outside world (writes, charges,
-webhooks) and must do so exactly once, and anything you need to be able to
-prove later (what the model was asked, what it answered, what the agent did).
+webhooks) and must not repeat what it already did, and anything you need to
+be able to prove later (what the model was asked, what it answered, what the
+agent did).
 
 ---
 
 ## 1. Try it now - no API key, nothing to install but Rust
 
 Clone the repo and run the landing-page example. It uses a seeded stand-in
-for the model, so it needs no API key and no network:
+for the model, so it needs no API key and no network. 0.6 is on the
+`system-of-record` branch until it is merged to `main`, so clone that
+branch:
 
 ```sh
-git clone https://github.com/pragmaticco/pragmatic
+git clone -b system-of-record https://github.com/pragmaticco/pragmatic
 cd pragmatic
 cargo run --example research_agent
 ```
@@ -55,17 +61,18 @@ OpenSSL 3; see [examples/demo](../examples/demo/README.md).
 ## 2. Install it in your own project
 
 Pragmatic is not on crates.io or PyPI yet, so for now every install comes
-from this repository. This page describes 0.6.0, which is what `main`
-builds.
+from this repository. This page describes 0.6.0, which is on the
+`system-of-record` branch; `main` still builds 0.4.0 until 0.6 is merged,
+so pin the branch.
 
 ### Rust
 
 ```toml
 # Cargo.toml
 [dependencies]
-pragmatic = { git = "https://github.com/pragmaticco/pragmatic" }
+pragmatic = { git = "https://github.com/pragmaticco/pragmatic", branch = "system-of-record" }
 # optional: Claude as an Oracle. Skip it to bring your own model.
-pragmatic-anthropic = { git = "https://github.com/pragmaticco/pragmatic" }
+pragmatic-anthropic = { git = "https://github.com/pragmaticco/pragmatic", branch = "system-of-record" }
 ```
 
 Once they are published, these become `pragmatic = "0.6"` and
@@ -73,7 +80,8 @@ Once they are published, these become `pragmatic = "0.6"` and
 
 ### Python
 
-From a clone of the repository (this needs a Rust toolchain):
+From a clone of the `system-of-record` branch (step 1; this needs a Rust
+toolchain):
 
 ```sh
 pip install "./crates/pragmatic-python[anthropic]"   # or [openai]
@@ -88,7 +96,7 @@ import pragmatic   # the import name is `pragmatic`, the package is `pragmatic-r
 ### The CLI (optional, for inspecting journals)
 
 ```sh
-cargo install --path crates/pragmatic-cli    # installs the `pragmatic` command
+cargo install --path crates/pragmatic-cli    # from the same clone; installs the `pragmatic` command
 ```
 
 ---
@@ -99,7 +107,8 @@ An agent is a plain function over a `Ctx`. Two rules:
 
 1. Route **model calls** through `ctx.oracle(...)` - so they get journaled.
 2. Route **side effects** (anything touching the outside world) through
-   `ctx.effect(...)` - so they run exactly once.
+   `ctx.effect(...)` - so they are recorded write-ahead and a committed
+   effect never runs again.
 
 Mark it `#[pragmatic::durable]` and you're done. Here's a complete program you
 can run today with **no API key** - it uses `SeededOracle`, a deterministic
@@ -117,8 +126,8 @@ fn research(ctx: &mut Ctx) -> Result<Value, Fault> {
         findings.push(ctx.oracle(format!("probe {step}: {plan}"))?);
     }
 
-    // A side effect, done exactly once. Replay reuses the recorded result
-    // instead of re-running the closure.
+    // A side effect, recorded write-ahead. Once its result is on record,
+    // resume and replay reuse it instead of re-running the closure.
     ctx.effect("publish", format!("{} findings", findings.len()), |arg| {
         // your real side effect here: S3 write, webhook, DB insert...
         Ok(Value::from(format!("s3://reports/{arg}")))
@@ -199,9 +208,11 @@ let audit   = rt.replay("research-42", research)?;  // reproduce, model never ca
 
 - **`run`** starts fresh under a run id and records every step.
 - **`resume`** picks up a run whose process died. The steps already in the
-  journal are read back (zero model calls, zero duplicate effects); recording
-  continues from exactly where the journal ends. Call it after any crash - if
-  the run already finished, it just returns the finished result.
+  journal are read back (no model calls for recorded answers, no repeat of
+  committed effects); recording continues from exactly where the journal
+  ends, and an effect the crash cut off midway goes to the recovery policy
+  ([section 5](#5-side-effects-recorded-write-ahead)). Call it after any
+  crash - if the run already finished, it just returns the finished result.
 - **`replay`** reproduces a completed run bit-for-bit for debugging or audit.
   The model is *never* called - the oracle is replaced by one that refuses, so
   "no model calls on replay" is enforced, not hoped for. `audit.trace` equals
@@ -213,7 +224,7 @@ id) - that's how you find and resume the run later.
 
 ---
 
-## 5. Side effects, done exactly once
+## 5. Side effects, recorded write-ahead
 
 Anything that changes the outside world goes through `ctx.effect(name, arg,
 closure)`. Pragmatic journals the *intent* before your closure runs and the
@@ -234,6 +245,9 @@ performs it again (`Recover::Compensate`). Every decision is written to the
 journal as a `recovery` note. An effect made with `ctx.effect_keyed`
 receives an idempotency key, `<run_id>/<branch>/<intent cursor>`, that is
 the same on every retry, so the service it calls can recognize the repeat.
+A model call cut off the same way is sent again when the resumed run
+reaches it, so one the provider answered but the journal did not record is
+paid for twice.
 See [Concepts → Durable effects](concepts.md#durable-effects-and-the-crash-window).
 
 Rule of thumb: **reads** (fetching a web page, a DB query you don't mind
@@ -312,7 +326,7 @@ def research(ctx):
     plan = ctx.oracle("plan the task")                       # journaled
     findings = [ctx.oracle(f"probe {i}: {plan}") for i in range(10)]
     return ctx.effect("publish", f"{len(findings)} findings",
-                      lambda arg: f"s3://reports/{arg}")      # done once
+                      lambda arg: f"s3://reports/{arg}")      # write-ahead
 
 report = rt.run("research-42", research)     # record
 report = rt.resume("research-42", research)  # crash-recover, no re-sampling

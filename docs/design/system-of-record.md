@@ -2393,8 +2393,11 @@ Runtime(store=None, oracle=None, *, token=None, key=None, timeout=30.0,
 - **Cancellation.** Checkin is shielded from cancellation and waits for
   any in-flight persist.
 - **Sync wrappers.** `run`, `resume` and `replay` on an async agent with no
-  running loop use a private loop. With a running loop they raise,
-  pointing to `arun`.
+  running loop use a private loop: one per thread, kept between calls so
+  that an async client built once keeps its pooled connections, and never
+  the thread's current loop. Each call cancels the tasks the agent left
+  running, as `asyncio.run` does; a crash closes the loop. With a running
+  loop they raise, pointing to `arun`.
 - **Synchronous steps in async attempts.** `ctx.now()`, `ctx.uuid4()`,
   `ctx.recv()`, `ctx.patched()` and the other synchronous steps release
   their values only once durable in async attempts too: they wait for the

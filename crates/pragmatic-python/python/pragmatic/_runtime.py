@@ -33,15 +33,19 @@ cancelled again, so the agent's own timeout takes the path it took.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import concurrent.futures
+import contextvars
 import datetime as _dt
 import functools
 import hashlib
 import inspect
 import json
 import os
+import threading
 import uuid as _uuid
 import warnings
+import weakref
 from typing import (
     Any,
     Awaitable,
@@ -896,6 +900,108 @@ def _running_loop() -> Optional[asyncio.AbstractEventLoop]:
         return None
 
 
+class _PrivateLoop:
+    """The event loop that ``run``, ``resume`` and ``replay`` drive an async
+    agent on when no loop is running (spec 6.2): one per thread, kept from
+    one call to the next and never made the thread's current loop.
+
+    Async clients pool their connections on the loop that first used them,
+    so a client built once (``pragmatic.wrap`` at module level, or a
+    framework's default client) would find its pooled connections bound to
+    a closed loop if every call ran on a loop of its own, as
+    ``asyncio.run`` does. Each call otherwise ends the way ``asyncio.run``
+    ends it: Ctrl-C cancels the agent's task (Python 3.11 and later), and
+    tasks the agent left running are cancelled and awaited. A call that
+    ends in a crash (``KeyboardInterrupt``, ``SystemExit``, cancellation)
+    closes the loop as ``asyncio.run`` would, so the attempt is checked
+    in, and the thread's next call starts a fresh loop."""
+
+    _local = threading.local()
+    _all: "weakref.WeakSet[_PrivateLoop]" = weakref.WeakSet()
+
+    def __init__(self) -> None:
+        runner = getattr(asyncio, "Runner", None)  # Python 3.11 and later
+        self.runner = runner(loop_factory=asyncio.new_event_loop) if runner else None
+        self.loop = self.runner.get_loop() if self.runner else asyncio.new_event_loop()
+
+    @classmethod
+    def run(cls, coro: Any) -> Any:
+        """Run the coroutine ``coro`` to completion on this thread's private
+        loop."""
+        private = getattr(cls._local, "private", None)
+        if private is None or private.loop.is_closed():
+            private = cls()
+            cls._local.private = private
+            cls._all.add(private)
+        try:
+            if private.runner is not None:
+                # A fresh copy of the caller's context each call, as
+                # asyncio.run takes, so context variables set between calls
+                # reach the agent and none leak from one call to the next.
+                result = private.runner.run(coro, context=contextvars.copy_context())
+            else:
+                result = private.loop.run_until_complete(private.loop.create_task(coro))
+        except BaseException as exc:
+            if isinstance(exc, Exception):
+                private._cancel_leftovers()
+            else:
+                cls._local.private = None
+                private.close()
+            raise
+        private._cancel_leftovers()
+        return result
+
+    def _cancel_leftovers(self) -> None:
+        """Cancel and await what the call left running, as ``asyncio.run``
+        does before it closes its loop."""
+        loop = self.loop
+        tasks = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        if not tasks:
+            return
+        for t in tasks:
+            t.cancel()
+        loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+        for t in tasks:
+            if t.cancelled() or t.exception() is None:
+                continue
+            loop.call_exception_handler(
+                {
+                    "message": "unhandled exception in a task the agent left running",
+                    "exception": t.exception(),
+                    "task": t,
+                }
+            )
+
+    def close(self) -> None:
+        """Cancel what is left, finish async generators and the default
+        executor, and close the loop, as ``asyncio.run`` does."""
+        if self.loop.is_closed() or self.loop.is_running():
+            return
+        if self.runner is not None:
+            self.runner.close()
+            return
+        loop = self.loop
+        try:
+            self._cancel_leftovers()
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            shutdown_executor = getattr(loop, "shutdown_default_executor", None)
+            if shutdown_executor is not None:
+                loop.run_until_complete(shutdown_executor())
+        finally:
+            loop.close()
+
+    @classmethod
+    def close_all(cls) -> None:
+        for private in list(cls._all):
+            try:
+                private.close()
+            except Exception:  # noqa: BLE001 - interpreter exit: best effort
+                pass
+
+
+atexit.register(_PrivateLoop.close_all)
+
+
 def _agent_name(agent: Any) -> str:
     return getattr(_unwrap(agent), "__qualname__", None) or type(agent).__name__
 
@@ -1121,7 +1227,7 @@ class Runtime:
                     f"{_agent_name(agent)} is async and an event loop is running here; use "
                     f"`await rt.a{mode}(...)` instead of rt.{mode}(...)"
                 )
-            return asyncio.run(self._async(mode, run_id, agent, recover, opts))
+            return _PrivateLoop.run(self._async(mode, run_id, agent, recover, opts))
         att = self._native.begin(
             run_id, mode, recover=_normalize_policy(recover, None), owner="thread", **opts
         )
@@ -1164,7 +1270,7 @@ class Runtime:
             att.own_current_task(root=True)
             return await awaitable
 
-        return asyncio.run(root())
+        return _PrivateLoop.run(root())
 
     async def _async(
         self, mode: str, run_id: str, agent: Agent, recover: Optional[Callable], opts: dict
@@ -1247,7 +1353,9 @@ class Runtime:
         32, non-personal) and ``subjects`` (data subjects, erasable) are
         recorded when the run is created; ``on_code_change`` is
         ``"continue"`` (the default here) or ``"refuse"``. An async agent
-        runs on a private event loop; inside a running loop use ``arun``."""
+        runs on this thread's private event loop, which is kept between
+        calls so async clients built once keep their connections; inside a
+        running loop use ``arun``."""
         opts = self._options(agent, budget, caps, labels, subjects, on_code_change)
         return self._sync("run", run_id, agent, None, opts)
 

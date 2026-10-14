@@ -9,7 +9,8 @@ processes, using only local resources:
 | `test_story.py` | one pytest test per step, in order; a failed step skips the rest |
 | `support_agent.py` | the agent (Anthropic and OpenAI SDKs over scripted `httpx2.MockTransport` APIs, journaled with `ctx.wrap`, a refund tool through `ctx.run_tools`), run as separate processes |
 | `local_tsa.py` | two throwaway OpenSSL TSAs (a root plus a TSA certificate with critical `extendedKeyUsage = timeStamping`) served over HTTP by a responder that calls `openssl ts -reply` |
-| `harness.py` | builds and starts `pragmatic-server`, issues tokens, calls the API, runs `pragmatic` and `tools/verify_evidence.py` |
+| `harness.py` | builds and starts `pragmatic-server`, issues tokens, calls the API, runs `pragmatic` and `tools/verify_evidence.py`, and checks that the agent's Python imports the SDKs |
+| `test_harness.py` | that check: a Python that cannot import the SDK is reported as a setup problem with its fix, including an editable install whose `.pth` file is hidden |
 | `test_sdk_against_server.py` | the SDK's server store against the real binary rather than the SDK suite's mock: calls longer than the lease with a competing resume, a lost response resent through a dropping proxy, `run_deleted`, `payload_too_large`, and how `verify`, `replay` and `push` report missing, damaged and erased runs |
 
 The steps:
@@ -48,8 +49,13 @@ The steps:
 python -m pytest tests/e2e -v      # -s prints the story as it runs
 ```
 
-The Python running pytest needs the SDK built into it (`maturin develop` in
-`crates/pragmatic-python`) and `pytest`, `anthropic`, `openai` and `httpx2`.
+The Python running pytest needs the SDK built into it (`pip install
+./crates/pragmatic-python`) and `pytest`, `anthropic`, `openai` and
+`httpx2`. An editable install (`maturin develop`) is a `.pth` file, which
+Python 3.13 and later skip when it is marked hidden; on a Mac, iCloud Drive
+marks the files of a virtual environment in Desktop or Documents hidden. The
+suite then stops with a message naming the hidden file rather than failing
+a step.
 `openssl` must be OpenSSL 3 (on a Mac, Homebrew's `openssl@3` is found
 without being on `PATH`). The suite runs `cargo build -p pragmatic-server
 -p pragmatic-cli` first; set `PRAGMATIC_E2E_SKIP_BUILD=1` to use the

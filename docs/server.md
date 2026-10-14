@@ -112,14 +112,15 @@ RFC 3161 token, each `tlog-witness` cosigner for a cosignature.
   `{"leaves": [...]}` with each leaf's `leaf` hex, in order from index 0,
   from an administrator's `GET /v1/anchors/log` pages.
 
-**Evidence bundles.** `GET /v1/runs/{id}/evidence?redact=&anchor=now`
-(auditors and administrators) answers a bundle (design section 5): the
-durable journal, its decoded records, its whole leaf chain with inclusion
-proofs, checkpoints, consistency proofs to the latest checkpoint and every
-stored witness result, signed with the log key. `redact` is `none`,
-`binary` (attachments withheld, text in clear), `detectors` (the default
-without `view_raw`) or `all`; `none` and `binary` carry text unredacted, so
-they need `view_raw` and are logged as raw reads. A redacted slot is
+**Evidence bundles.** `GET /v1/runs/{id}/evidence?redact=<mode>&anchor=now`
+(auditors and administrators; both parameters are optional) answers a
+bundle (design section 5): the durable journal, its decoded records, its
+whole leaf chain with inclusion proofs, checkpoints, consistency proofs to
+the latest checkpoint and every stored witness result, signed with the log
+key. `redact` is `none`, `binary` (attachments withheld, text in clear),
+`detectors` (the default without `view_raw`) or `all`; `none` and `binary`
+carry text unredacted, so they need `view_raw` and are logged as raw
+reads. A redacted slot is
 withheld whole, so the chain still verifies. The anchors run through the
 checkpoint that was the latest when the journal was read, which is the
 bundle's latest checkpoint; `independent` is true only when one of them is
@@ -140,7 +141,10 @@ an auditor should not need the operator's server to check its bundles.
 
 ## Install
 
-Pick one:
+Every option builds from a clone of the repository's `system-of-record`
+branch (`git clone -b system-of-record
+https://github.com/pragmaticco/pragmatic`), where 0.6 is until it is
+merged to `main`. Pick one:
 
 - **Container image.** Build it from the repository root with
   `docker build -t pragmatic-server:0.6.0 .`. The image runs as user 10001,
@@ -259,7 +263,7 @@ setting cannot silently fall back to its default.
 | `tsa` | `[]` | RFC 3161 time-stamping authorities: `{ url, operator, roots_pem }`. `roots_pem` holds that operator's pinned trust anchors (a root, or better the CA that issues its time-stamping certificates); `operator` names who runs it and is required. Operators must not share an anchor. |
 | `witness` | `[]` | C2SP tlog-witness cosigners: `{ url, vkey, operator, token_file }`. Requests go to `<url>/add-checkpoint`; `vkey` is the witness's `cosignature/v1` verifier key; `operator` defaults to the key name. |
 | `allow_self_anchoring` | `false` | Start without an independent witness. |
-| `anchor_run_ids` | `"plain"` | `"plain"` puts run ids in anchor leaves; `"hmac"` puts a keyed hash, so the anchor log reveals no run ids. |
+| `anchor_run_ids` | `"plain"` | `"plain"` puts run ids in anchor leaves; `"hmac"` puts a keyed hash, so the anchor log reveals no run ids. `"hmac"` trades auditability for that privacy: nothing binds a run's anchor key to the run, so an administrator can rewrite an anchored run and anchor it again under a new key without any audit detecting it. Bundles from an `"hmac"` server report `anchor_id_unbound`, and `--log` audits fail with `log_unauditable`. Keep `"plain"` where the omission audit matters; a fix (run ids bound to the log key) is planned for 0.7. |
 | `min_independent_operators` | `2` | Distinct witness operators a checkpoint needs before runs count as independently anchored. |
 
 The example configuration uses DigiCert and Sectigo, whose pinned anchors
@@ -268,7 +272,8 @@ time-stamping certificates, Sectigo by its root), with their fingerprints
 and how to obtain each independently in `deploy/tsa-roots/README.md`.
 Obtain written permission from each TSA operator before automated use; the
 server spaces its requests to one TSA at least 15 seconds apart. Qualified
-(eIDAS) time-stamping providers are available as a paid option.
+(eIDAS) time-stamping providers, which are paid services, can be configured
+like any RFC 3161 TSA.
 
 ### `[[retention]]`
 
@@ -471,12 +476,19 @@ in an erasable slot). Erasing a repeated message once erases every copy.
 - A journal download in progress when an erasure (or a deletion) commits
   is aborted: it never serves bytes read after the erasure.
 
-**Holds** (`POST /v1/holds`, admin) name a matter and either explicit
-`run_ids` or a `prefix`. A held run cannot be erased, shredded or deleted.
-A prefix hold also covers runs created after it. Placing and removing a
-hold are erasure-ledger records too (with the hold), so a restore places
-and removes them again, and each is announced by the `hold` webhook
-(without the matter).
+**Holds** (`POST /v1/holds`, admin) name a matter and a scope of either
+explicit `run_ids` or a `prefix`:
+
+```json
+{"matter": "Case 12", "scope": {"run_ids": ["research-p1", "research-p2"]}}
+{"matter": "Case 12", "scope": {"prefix": "research-p"}}
+```
+
+`GET /v1/holds` lists them and `DELETE /v1/holds/{id}` removes one. A held
+run cannot be erased, shredded or deleted. A prefix hold also covers runs
+created after it. Placing and removing a hold are erasure-ledger records
+too (with the hold), so a restore places and removes them again, and each
+is announced by the `hold` webhook (without the matter).
 
 **Retention** runs hourly and on demand (`POST /v1/retention/run`). Ages
 count from the run's last append. Runs with a live lease are skipped and
@@ -593,7 +605,8 @@ Alert on `pragmatic_chain_broken_total`, `pragmatic_anchor_failures_total`,
 `pragmatic_access_log_failed` and a growing
 `pragmatic_anchor_lag_seconds`: the anchoring lag is the window in which
 someone with access to the disk could rewrite history without detection.
-In a build without anchoring it grows from the first append.
+On a server with no independent witness (`allow_self_anchoring`), it grows
+from the first append.
 
 A journal is reported damaged (`chain_broken`) when its chain or a
 commitment fails, when it holds fewer entries than were acknowledged or a
@@ -621,12 +634,14 @@ checkpoint it cosigned, refusing forks.
 Every cosigned checkpoint is recorded, before the cosignature is returned,
 in the server-written run `pragmatic:witness:<name>`, which is anchored
 like any other run; a fork attempt is recorded there too, as a
-`witness.reject` note. `GET /v1/witness/log/{name}?after=` (administrators,
-and auditors whose scopes cover that run) answers `{origin, origin_line,
-witness, cosigned, next}`, where each `cosigned[].checkpoint` is the signed
-note with this witness's cosignature line. An auditor's `--witness-log`
-file is `{"witness": witness, "origin": origin_line, "checkpoints": [every
-cosigned[].checkpoint, page by page, in order]}`.
+`witness.reject` note. `GET /v1/witness/log/{name}?after=<cursor>`
+(administrators, and auditors whose scopes cover that run; leave `after`
+out for the first page, then pass each page's `next` until it is null)
+answers `{origin, origin_line, witness, cosigned, next}`, where each
+`cosigned[].checkpoint` is the signed note with this witness's cosignature
+line. An auditor's `--witness-log` file is `{"witness": witness, "origin":
+origin_line, "checkpoints": [every cosigned[].checkpoint, page by page, in
+order]}`.
 
 The witness never cosigns from a record that may have forgotten what it
 cosigned, since it could then cosign a fork of a tree it already vouched
@@ -673,11 +688,16 @@ the record still holds. It is recorded as a `witness.resume` note
   bodies being received share a budget of 1 GiB (or `max_request_bytes`,
   if larger), and a body must arrive at 256 KiB per second after a
   30-second grace period.
-- **Targets** (release build, 4 vCPU, SSD): one-frame appends of up to
-  64 KiB with a p50 of 5 ms and a p99 of 25 ms server-side, at least 1,000
-  appends per second across 200 concurrent runs, startup within 30 seconds
-  with a million runs, journals up to 1 GiB. The load test is
-  `cargo test -p pragmatic-server --release --test perf -- --ignored`.
+- **Targets** (release build on Linux, 4 vCPU, SSD): one-frame appends of
+  up to 64 KiB with a p50 of 5 ms and a p99 of 25 ms server-side, at least
+  1,000 appends per second across 200 concurrent runs, startup within 30
+  seconds with a million runs, journals up to 1 GiB. The load test is
+  `cargo test -p pragmatic-server --release --test perf -- --ignored`, and
+  it checks those targets, so run it on comparable hardware. On macOS,
+  where every append waits for a full flush to the disk (`F_FULLFSYNC`),
+  the append targets are expected to fail: on an Apple silicon laptop the
+  test measured about 880 appends per second, with only a few percent of
+  appends inside 25 ms.
 - **Open files.** Each run being written keeps its journal open; set the
   file limit well above your number of concurrent runs.
 

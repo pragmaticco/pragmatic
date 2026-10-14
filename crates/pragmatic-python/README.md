@@ -12,7 +12,8 @@ or repeating tool calls whose results are on record, and any run replays
 exactly, for debugging or for an auditor, without touching the network.
 
 > **Status.** This is 0.6.0, the system-of-record release. It is not on
-> PyPI yet: install it from a clone of the repository (see
+> PyPI yet: install it from a clone of the repository's `system-of-record`
+> branch, where 0.6 is until it is merged to `main` (see
 > [Build from source](#build-from-source)). Release 0.5, the earlier
 > drop-in release, is on the `release/0.5.0` branch and is not on PyPI
 > either. Pragmatic Server, the optional store for runs on a server, is in
@@ -125,6 +126,13 @@ async def triage(ctx):
 rt.run("ticket-4411", triage)       # or await rt.arun(...) inside your event loop
 ```
 
+An async client keeps its pooled connections on the event loop that opened
+them. `rt.run` drives async agents on a private loop that its thread keeps
+from one call to the next, so the client above serves run after run; with
+`await rt.arun(...)`, use it from one long-lived loop. Where calls would
+run on different loops (repeated `asyncio.run`, or `rt.run` from several
+threads), build the client inside the agent with `ctx.wrap`.
+
 | Framework | How |
 |---|---|
 | OpenAI Agents SDK | `set_default_openai_client(pragmatic.wrap(AsyncOpenAI()))`, `run` and `run_streamed` |
@@ -132,7 +140,10 @@ rt.run("ticket-4411", triage)       # or await rt.arun(...) inside your event lo
 | LangChain | `pragmatic.integrations.langchain.journal(ChatAnthropic(...))`, or `ChatOpenAI` |
 | LangGraph | build the agent on a journaled LangChain model |
 
-Outside a run, a journaled client raises `NotInRun`;
+Outside a run, a journaled client raises `pragmatic.JournalFault` carrying
+`NotInRun` (read its `.error`). The carrier derives from `BaseException`
+only, so the SDK's retries and frameworks' `except Exception` do not
+swallow it, and `except pragmatic.NotInRun` does not catch it either.
 `pragmatic.wrap(client, outside="passthrough")` lets those calls through
 unrecorded. Request fields that change on every run, such as the Agents
 SDK's per-run prompt cache key, are ignored when replay matches requests;
@@ -228,13 +239,21 @@ frameworks, normalization and the rest.
 ## Build from source
 
 ```sh
-pip install maturin
-cd crates/pragmatic-python
-maturin develop --release
+git clone -b system-of-record https://github.com/pragmaticco/pragmatic
+cd pragmatic/crates/pragmatic-python
+pip install .                  # or, for an editable install: pip install maturin && maturin develop --release
 pip install pytest "anthropic>=1.0" "openai>=3.0" && pytest tests
 # optional, for the framework tests:
 pip install openai-agents "pydantic-ai-slim[anthropic,openai]" langchain-anthropic langchain-openai langgraph
 ```
+
+`maturin develop` installs the package as an editable `.pth` file, and
+Python 3.13 and later skip a `.pth` file that is marked hidden. On a Mac,
+iCloud Drive marks every file of a virtual environment hidden when it
+syncs the folder it is in (Desktop or Documents), and `import pragmatic`
+then fails with `ModuleNotFoundError`. There, use `pip install .` (and run
+it again after each change), or keep the virtual environment outside the
+synced folders.
 
 The journal files are the same format the Rust runtime and the `pragmatic`
 CLI read.
