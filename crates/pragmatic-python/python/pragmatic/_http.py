@@ -46,7 +46,7 @@ import datetime
 import json
 import time
 import weakref
-from typing import Any, Callable, List, Optional, Set, Tuple
+from typing import Any, AsyncIterator, Callable, Iterator, List, Optional, Set, Tuple
 
 import httpx2
 
@@ -333,10 +333,18 @@ async def _adurable(http: AttemptHttp, upto: Optional[int]) -> None:
 
 
 class _TeeStream(httpx2.SyncByteStream):
-    """The caller's view of a recorded response body."""
+    """The caller's view of a recorded response body.
+
+    Every pass over it reads on from one iterator over the upstream body,
+    so a client that stops at the part it wanted and then reads the rest
+    in a second pass (as openai drains an HTTP/1.1 stream after its
+    ``[DONE]`` event) continues where the first pass stopped. Asking the
+    upstream for its bytes again would raise ``StreamConsumed`` and record
+    a stream the caller read whole as an error."""
 
     def __init__(self, rec: _Recording):
         self._rec = rec
+        self._chunks: Optional[Iterator[bytes]] = None
 
     @property
     def elapsed(self) -> datetime.timedelta:
@@ -347,8 +355,10 @@ class _TeeStream(httpx2.SyncByteStream):
         rec.touched = True
         if rec.state != _OPEN:
             return  # written off before the caller read anything: nothing to read
+        if self._chunks is None:
+            self._chunks = rec.upstream.iter_bytes()
         try:
-            for chunk in rec.upstream.iter_bytes():
+            for chunk in self._chunks:
                 if not rec.add(chunk):
                     return  # the result is written: the stream ends here, as on replay
                 yield chunk
@@ -366,10 +376,12 @@ class _TeeStream(httpx2.SyncByteStream):
 
 
 class _AsyncTeeStream(httpx2.AsyncByteStream):
-    """``_TeeStream`` for an async response."""
+    """``_TeeStream`` for an async response, with the same single upstream
+    iterator across passes."""
 
     def __init__(self, rec: _Recording):
         self._rec = rec
+        self._chunks: Optional[AsyncIterator[bytes]] = None
 
     @property
     def elapsed(self) -> datetime.timedelta:
@@ -380,8 +392,10 @@ class _AsyncTeeStream(httpx2.AsyncByteStream):
         rec.touched = True
         if rec.state != _OPEN:
             return
+        if self._chunks is None:
+            self._chunks = rec.upstream.aiter_bytes()
         try:
-            async for chunk in rec.upstream.aiter_bytes():
+            async for chunk in self._chunks:
                 if not rec.add(chunk):
                     return
                 yield chunk
@@ -462,12 +476,18 @@ class _Replayed:
 
 
 class _ReplayStream(httpx2.SyncByteStream):
+    """A recorded body, read as it was recorded: like ``_TeeStream``, a
+    second pass reads on from where the first stopped rather than from the
+    start."""
+
     def __init__(self, replayed: _Replayed):
         self._r = replayed
+        self._sent = False
         self.elapsed = replayed.elapsed
 
     def __iter__(self):  # type: ignore[override]
-        if self._r.body:
+        if self._r.body and not self._sent:
+            self._sent = True
             yield self._r.body
         if self._r.failure is not None:
             raise self._r.failure()
@@ -476,10 +496,12 @@ class _ReplayStream(httpx2.SyncByteStream):
 class _AsyncReplayStream(httpx2.AsyncByteStream):
     def __init__(self, replayed: _Replayed):
         self._r = replayed
+        self._sent = False
         self.elapsed = replayed.elapsed
 
     async def __aiter__(self):  # type: ignore[override]
-        if self._r.body:
+        if self._r.body and not self._sent:
+            self._sent = True
             yield self._r.body
         if self._r.cancelled:
             await wait_for_cancellation()

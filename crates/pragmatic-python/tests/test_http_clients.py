@@ -334,6 +334,45 @@ def test_async_stream_true(tmp_path, api, provider):
     rt = pragmatic.Runtime(tmp_path)
     record_then_replay(rt, api, "r", agent)
     assert all(u.closed for u in api.upstreams)
+    # openai 3.30 and later drain an async HTTP/1.1 stream after [DONE] in
+    # a second pass over the body; the stream is still recorded as read.
+    [meta] = draws(rt, "r")
+    assert meta["outcome"] == "ok" and meta["stop_reason"] in ("end_turn", "stop"), meta
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+@pytest.mark.parametrize("is_async", [False, True])
+def test_a_second_pass_over_a_body_reads_on(tmp_path, api, provider, is_async):
+    """A client that stops reading a body and later reads the rest in a
+    second pass (as openai drains a stream after [DONE]) gets the bytes
+    after the ones it had, live and on replay (where the recorded body
+    comes as one chunk), and the result is the whole body, ok."""
+    base = api.client(provider, is_async)
+
+    if is_async:
+
+        async def agent(ctx):
+            s = await create(ctx.wrap(base), provider, stream=True)
+            body = s.response.stream
+            first = await body.__aiter__().__anext__()
+            rest = b"".join([chunk async for chunk in body])
+            return (first + rest).decode()
+
+    else:
+
+        def agent(ctx):
+            s = create(ctx.wrap(base), provider, stream=True)
+            body = s.response.stream
+            first = next(iter(body))
+            rest = b"".join(body)
+            return (first + rest).decode()
+
+    rt = pragmatic.Runtime(tmp_path)
+    rec = record_then_replay(rt, api, "r", agent)
+    assert rec.output.rstrip().endswith("[DONE]" if provider == "openai" else "}"), rec.output
+    assert "message_stop" in rec.output or provider == "openai"
+    [meta] = draws(rt, "r")
+    assert meta["outcome"] == "ok" and meta["stop_reason"] in ("end_turn", "stop"), meta
 
 
 def test_anthropic_stream_helper(tmp_path, api):
