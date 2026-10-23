@@ -1,14 +1,14 @@
 # Quickstart
 
 Five minutes from an empty project to a crash-recoverable, replayable
-agent. For the whole product story in one command (Pragmatic Server,
+agent. For the whole product story in one command (Stet Server,
 anchoring, erasure and an auditor's evidence check), run
 `examples/demo/run.sh` from a clone of this repository's
 `system-of-record` branch instead.
 
 ## 1. Install
 
-Pragmatic 0.6.0 is not on crates.io yet, so depend on the repository. It
+Stet 0.6.0 is not on crates.io yet, so depend on the repository. It
 is on the `system-of-record` branch until it is merged to `main` (which
 still holds 0.4.0), so pin the branch:
 

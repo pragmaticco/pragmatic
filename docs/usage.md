@@ -1,4 +1,4 @@
-# Using Pragmatic
+# Using Stet
 
 A hands-on guide for someone who just found this repo and wants to actually
 run it. If you want the theory, read [Concepts](concepts.md); if you want the
@@ -6,7 +6,7 @@ five-minute tour, read the [Quickstart](quickstart.md). This page is the
 middle path: everything you need to go from zero to a crash-recoverable,
 replayable agent, in the order you'll actually hit it.
 
-**What Pragmatic gives you:** you write an agent as an ordinary function. Every
+**What Stet gives you:** you write an agent as an ordinary function. Every
 model call and every side effect it makes is journaled to an append-only log
 as it happens. Kill the process at any point and resume - the steps already
 on record are read back from the log instead of re-run, so a recorded model
@@ -51,7 +51,7 @@ cargo run --example tool_use_retries    # flaky tools under a Supervisor
 cargo run --example map_reduce          # many runs, per-agent recovery
 ```
 
-To see the whole product instead (Pragmatic Server, anchoring, erasure and
+To see the whole product instead (Stet Server, anchoring, erasure and
 an evidence bundle checked by an auditor's tools), run the one-command
 demo, `examples/demo/run.sh`. It needs Rust, Python 3.10 or later and
 OpenSSL 3; see [examples/demo](../examples/demo/README.md).
@@ -60,7 +60,7 @@ OpenSSL 3; see [examples/demo](../examples/demo/README.md).
 
 ## 2. Install it in your own project
 
-Pragmatic is not on crates.io or PyPI yet, so for now every install comes
+Stet is not on crates.io or PyPI yet, so for now every install comes
 from this repository. This page describes 0.6.0, which is on the
 `system-of-record` branch; `main` still builds 0.4.0 until 0.6 is merged,
 so pin the branch.
@@ -227,7 +227,7 @@ id) - that's how you find and resume the run later.
 ## 5. Side effects, recorded write-ahead
 
 Anything that changes the outside world goes through `ctx.effect(name, arg,
-closure)`. Pragmatic journals the *intent* before your closure runs and the
+closure)`. Stet journals the *intent* before your closure runs and the
 *result* after, so:
 
 - On **resume**, if the crash happened after the effect committed, the
@@ -238,7 +238,7 @@ closure)`. Pragmatic journals the *intent* before your closure runs and the
 If a crash lands in the narrow window *between* intent and result (the effect
 may or may not have happened), resume has to decide what happened.
 `rt.resume` writes the effect off and performs it again; a runtime backed by
-Pragmatic Server refuses with `DanglingEffect` instead, until you decide.
+Stet Server refuses with `DanglingEffect` instead, until you decide.
 `rt.resume_with` takes a recovery policy: commit the known result if the
 effect did happen (`Recover::Commit`), or write it off so the resumed run
 performs it again (`Recover::Compensate`). Every decision is written to the
@@ -296,7 +296,7 @@ pragmatic verify-evidence research-42.evidence.json
 and records an `erasure` note; every chain hash still verifies. `evidence`
 packages a run as an evidence bundle (a local bundle is unanchored: it
 proves integrity, not time), and `verify-evidence` checks a bundle against
-the trust roots you pin. Bundles exported from Pragmatic Server carry
+the trust roots you pin. Bundles exported from Stet Server carry
 anchors from independent timestamp authorities. See
 [evidence.md](evidence.md).
 
@@ -363,7 +363,7 @@ from; it only cares that it gets journaled.
 
 **Do I need a server or a cloud account?** No. The runtime is a library that
 links into the process you already run, and journals are files on local disk.
-There is nothing to provision. Pragmatic Server is an optional, self-hosted
+There is nothing to provision. Stet Server is an optional, self-hosted
 commercial store (in design-partner preview) that adds a single writer per
 run across machines, anchoring, retention, access control and evidence
 export; it changes operations, not the semantics on this page. See
@@ -407,7 +407,7 @@ like you'd treat your logs, and read [SECURITY.md](../SECURITY.md).
 - [`examples/demo`](../examples/demo/README.md) - the whole product story in
   one command, and [`tests/e2e`](../tests/e2e/README.md), the same steps as
   assertions.
-- [Python](python.md), [Pragmatic Server](server.md) and
+- [Python](python.md), [Stet Server](server.md) and
   [evidence for auditors](evidence.md).
 - [`crates/pragmatic-anthropic/examples/tool_loop.rs`](../crates/pragmatic-anthropic/examples/tool_loop.rs)
   - a real Messages-API tool-use agent, durable end to end: `Conversation`

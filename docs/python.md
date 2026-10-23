@@ -1,4 +1,4 @@
-# Pragmatic for Python
+# Stet for Python
 
 This guide covers the Python SDK (`pragmatic-runtime`, 0.6.0): how to
 journal an agent's model calls and tool calls, what ends up in the journal,
@@ -60,7 +60,7 @@ back without writing anything and without calling anything, raising
 `JournalDesync` at the first step where the program and the journal
 disagree.
 
-The store is a directory (`DirStore`), memory (`MemoryStore`), a Pragmatic
+The store is a directory (`DirStore`), memory (`MemoryStore`), a Stet
 Server (`pragmatic.Runtime("https://...", token=...)`, or
 `PRAGMATIC_URL` and `PRAGMATIC_TOKEN`), or a store of your own implementing
 `pragmatic.Store`.
@@ -527,7 +527,7 @@ damaged (`report.missing`, `report.damaged`), whether the journal was
 checked here or the server's own report was returned.
 
 `python -m pragmatic push DIR RUN` uploads a local run to a server
-([Pragmatic Server](server.md), in design-partner preview). It
+([Stet Server](server.md), in design-partner preview). It
 refuses, before anything is created on the server, a journal the server
 would refuse from a client: format 1, keyed, and one erased locally with
 `pragmatic erase` (the server records erasures only through its own erase

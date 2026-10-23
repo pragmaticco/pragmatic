@@ -4,7 +4,7 @@
 
 | Version | Supported |
 |---|---|
-| 0.6 (built from source; Pragmatic Server in design-partner preview) | ✅ |
+| 0.6 (built from source; Stet Server in design-partner preview) | ✅ |
 | 0.5.x | ✅ |
 | < 0.5 | ❌ |
 
@@ -37,7 +37,7 @@ meant to withstand. A way to break any of the following is in scope.
 - **Capability bypass**: performing an effect outside a run's granted
   capability set, or exceeding a budget without `BudgetExhausted`.
 
-**Pragmatic Server (0.6)**
+**Stet Server (0.6)**
 
 - **Authentication and scope bypass**: acting without a valid token,
   beyond a token's role, or on runs outside its scopes, including learning

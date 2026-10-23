@@ -1,4 +1,4 @@
-# Pragmatic 0.6: the system of record for AI agents
+# Stet 0.6: the system of record for AI agents
 
 Status: design, revision 3 (2026-10-13), after an adversarial review across
 cryptography, replay correctness, storage and failure handling, compliance,
@@ -23,7 +23,7 @@ between the components built for 0.6. Everything marked MUST is
 normative; where code and this document disagree, one of them is a bug.
 
 Contents: 1 Product, claims and threat model. 2 Journal format v2.
-3 Core runtime. 4 Pragmatic Server. 5 Evidence bundles. 6 Python SDK.
+3 Core runtime. 4 Stet Server. 5 Evidence bundles. 6 Python SDK.
 7 CLI. 8 Documentation deliverables. 9 Verification plan. 10 Deferred.
 11 Integration decisions.
 
@@ -33,12 +33,12 @@ Contents: 1 Product, claims and threat model. 2 Journal format v2.
 
 ### 1.1 Product
 
-Pragmatic records what an AI agent does so that the record can be checked
+Stet records what an AI agent does so that the record can be checked
 by a party that does not trust the operator, and so that a crashed run can
 continue without repeating work. Two pillars, in this order:
 
 1. **System of record.** Every model call, tool call, channel receive,
-   random draw and clock read made through Pragmatic's journaled
+   random draw and clock read made through Stet's journaled
    interfaces is recorded before its result reaches the agent. The record
    is tamper-evident, anchored with independent witnesses, replayable with
    the model never called, erasable for privacy law while the integrity
@@ -54,7 +54,7 @@ continue without repeating work. Two pillars, in this order:
 Permitted verbs: "helps meet", "supports", "provides evidence for".
 Forbidden: "compliant", "certified", "WORM", "guarantees compliance",
 "tamper-proof". The mapping of regulations to features lives in
-`docs/compliance.md` with three columns: requirement, what Pragmatic
+`docs/compliance.md` with three columns: requirement, what Stet
 provides, what the customer is responsible for.
 
 What a verified anchor proves: a journal prefix of `entries` entries with
@@ -71,7 +71,7 @@ anchor.
 | Host operator without the HMAC key (local mode) | read and edit local files | edit a keyed journal undetected |
 | Server administrator with root | rewrite unanchored suffixes (at most `interval_secs` old); delete data; with `anchor_run_ids = "hmac"`, re-anchor a rewritten run under a new per-run key, which no audit detects (4.7) | rewrite an anchored prefix, or hide an anchored run from an auditor who audits the anchor log against a pinned independent witness, for runs anchored with plain ids |
 | Auditor | read what their token's scopes and `view_raw` allow | recover redacted content (salts are never served with redacted content) |
-| Pragmatic Witness (hosted) | refuse service; see `(origin, seq, root)` | learn any content or run id |
+| Hosted witness (run by Pragmatic Research) | refuse service; see `(origin, seq, root)` | learn any content or run id |
 
 ### 1.4 Network behavior and telemetry
 
@@ -102,7 +102,7 @@ the server.
     binaries.
   - The anchoring library the server calls, `crates/pragmatic-anchor`
     (sections 4.7 and 4.8), is part of the same commercial layer under the
-    same terms: its own `LICENSE` (BUSL 1.1, Licensed Work "Pragmatic
+    same terms: its own `LICENSE` (BUSL 1.1, Licensed Work "Stet
     Server and anchoring"), `license = "BUSL-1.1"` and `publish = false`.
     The formats it writes come from the Apache-2.0 core, so verifying
     anchors never needs it.
@@ -974,7 +974,7 @@ Strict JSON is RFC 8259 with these additional rules:
 
 ---
 
-## 4. Pragmatic Server (`crates/pragmatic-server`, axum on tokio)
+## 4. Stet Server (`crates/pragmatic-server`, axum on tokio)
 
 ### 4.1 Process and configuration
 
@@ -1367,7 +1367,7 @@ leaf_data = "pragmatic/v2/leaf" ‖ u8 type (0 run, 1 access log) ‖ u32 len(id
     SHA-256 of the log's first public key. Witnesses keep their state per
     origin line (4.8), and server names are chosen locally (many will be
     `prod`), so the name alone would collide at a shared witness such as
-    the hosted Pragmatic Witness: one log's tree would block the other's,
+    the hosted witness Pragmatic Research runs: one log's tree would block the other's,
     and its honest checkpoints would be recorded as fork attempts. The
     origin is fixed when `keygen` makes the first key (it is that key's
     name) and never changes, rotation included.
@@ -1468,7 +1468,7 @@ Witnesses:
 - **`server-ed25519`:** the checkpoint signature itself. It is always on,
   operator-controlled, and never counted as independent.
 - **`witness`:** a C2SP `tlog-witness` cosigner (4.8), such as the hosted
-  Pragmatic Witness. Each is configured with its `url` (requests go to
+  witness Pragmatic Research runs. Each is configured with its `url` (requests go to
   `<url>/add-checkpoint`), its `cosignature/v1` vkey, an `operator`
   (default, also for an empty value: the key name) and a bearer token.
   The server submits from the size the witness last cosigned for it,
@@ -1565,7 +1565,7 @@ can cosign checkpoints for other logs and join the public witness network.
   `tlog-witness`, so no two entries may share an origin line or a name:
   the witness refuses such a configuration at startup, and the hosted
   witness's onboarding refuses a log whose origin line is taken (4.7
-  makes Pragmatic origins unique).
+  makes Stet origins unique).
 - **Checks**, in the protocol's order:
   - the log's signature on the checkpoint (403);
   - an old size no larger than the checkpoint's (400);
@@ -1876,8 +1876,8 @@ cut at 64 KiB.
   website it is always paper: it has no dark scheme and declares
   `color-scheme: light`, so it looks the same on a machine set to dark.
   The masthead is the website's, on the paper with no rule: the mark and
-  wordmark, then a breadcrumb (`Pragmatic / journals / refund-20417`
-  locally, `Pragmatic / Runs / refund-20417` on the server; a top-level
+  wordmark, then a breadcrumb (`Stet / journals / refund-20417`
+  locally, `Stet / Runs / refund-20417` on the server; a top-level
   page has none, its navigation says where it is). It is a working tool,
   so its type is larger than the website's miniature of it: data at least
   12.5px, labels 11px, every text at least 4.5:1. Numbers in a line of
@@ -1903,7 +1903,7 @@ cut at 64 KiB.
   card narrower than 380px the check's labels sit above their values. A
   local journal has no anchors, and its page says nothing about anchoring
   rather than something negative. The Run card lists the run's attempts
-  (each with its start, the Pragmatic Server token that recorded it when
+  (each with its start, the Stet Server token that recorded it when
   the server's custody notes name one, its process id, and its outcome),
   its failures and the record keeping after it, each a link to its place
   in the timeline. The user and machine the SDK ran as are personal data
@@ -2337,8 +2337,8 @@ The verifier takes trust only from its own inputs:
 - `--witness-key OPERATOR=VKEY` (repeatable; `OPERATOR=HEX` is accepted
   for a 32-byte cosignature key whose cosigner name is `OPERATOR`)
 - `--log-key VKEY`: the log's checkpoint key, which also signs bundles
-- the hosted Pragmatic Witness keys built into the CLI, with validity
-  windows (an empty list until the witness launches)
+- the keys of the hosted witness that Pragmatic Research runs, built
+  into the CLI, with validity windows (an empty list until the witness launches)
 
 Nothing in a bundle is ever a trust anchor. `certs_pem` is passed only as
 untrusted intermediates. A TSA certificate must carry EKU

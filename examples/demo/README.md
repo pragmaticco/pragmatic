@@ -1,13 +1,13 @@
-# The Pragmatic demo
+# The Stet demo
 
 One command shows the whole product working, step by step, on your own
 computer. Nothing is mocked except the AI models themselves: it starts a
-real Pragmatic Server, runs a real agent against it, and checks every claim
+real Stet Server, runs a real agent against it, and checks every claim
 it makes with the same tools an auditor would use.
 
 ## Run it
 
-Open the Terminal app, go to the folder you downloaded Pragmatic into, and
+Open the Terminal app, go to the folder you downloaded Stet into, and
 run:
 
 ```sh
@@ -22,7 +22,7 @@ git clone -b system-of-record https://github.com/pragmaticco/pragmatic
 cd pragmatic
 ```
 
-The first run builds Pragmatic from source, which takes a few minutes.
+The first run builds Stet from source, which takes a few minutes.
 Later runs take about a minute. Add `--open` to open the auditor's report
 in your browser at the end:
 
@@ -33,7 +33,7 @@ examples/demo/run.sh --open
 If something the demo needs is missing, it stops and prints the one command
 that installs it (on a Mac, a `brew install ...` line), then you run
 `examples/demo/run.sh` again. What it needs, all free: Rust (to build
-Pragmatic), Python 3.10 or later, and OpenSSL 3 (macOS comes with a
+Stet), Python 3.10 or later, and OpenSSL 3 (macOS comes with a
 different library that cannot check timestamps). If you do not have
 Homebrew, the installer for it is at https://brew.sh.
 
@@ -46,7 +46,7 @@ companies build agents today.
 1. **Two timestamp authorities start.** These are the independent outside
    parties that countersign the record, like a notary. Two of them run on
    your computer, standing in for two separate companies.
-2. **Pragmatic Server starts.** It is the system of record: it stores every
+2. **Stet Server starts.** It is the system of record: it stores every
    step every agent takes, in order, in a way that shows any later change.
    It hands out separate keys (tokens) to the agents, to an outside auditor,
    and to another team, each allowed to see only what it should.
@@ -85,14 +85,14 @@ held. If any check fails, the demo stops and says which.
 
 ## What it does to your computer
 
-- It builds Pragmatic inside this folder (`target/`) and keeps a private
+- It builds Stet inside this folder (`target/`) and keeps a private
   Python environment in `examples/demo/.venv`.
 - Everything else (the server's data, the evidence files, the report) goes
   into a new folder under your temporary files, which the demo names at the
   end. Delete it whenever you like.
 - The server and the timestamp authorities listen only on your own
   computer (`127.0.0.1`) and are stopped when the demo ends.
-- The first run downloads the building blocks Pragmatic is built from.
+- The first run downloads the building blocks Stet is built from.
   After that the demo makes no internet connections: the AI models are
   scripted stand-ins, so no API key or account is used and nothing is
   billed.

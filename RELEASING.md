@@ -3,7 +3,7 @@
 Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes
 the Rust crates to crates.io and the `pragmatic-runtime` wheels (Linux
 x86_64/aarch64, macOS universal2, Windows x86_64, plus sdist) to PyPI, and
-builds the Pragmatic Server container image. Nothing is published until
+builds the Stet Server container image. Nothing is published until
 the whole CI workflow (the test suites, the end-to-end story, the load
 test) and the fuzz targets have passed on the tag.
 
@@ -13,7 +13,7 @@ the drop-in Python release, is on the `release/0.5.0` branch and has not
 been tagged. The workspace is at 0.6.0, the system-of-record release. The
 one-time setup below is needed before the first tag.
 
-Pragmatic Server (`crates/pragmatic-server`) and its anchoring library
+Stet Server (`crates/pragmatic-server`) and its anchoring library
 (`crates/pragmatic-anchor`) are commercial software under the Business
 Source License 1.1 and are never published to crates.io: both have
 `publish = false` and `license = "BUSL-1.1"`, the release job checks both
@@ -63,7 +63,7 @@ is pushed from a branch or a pull request.
 1. Bump `version` in the root `Cargo.toml` (`[workspace.package]`) and
    every pin on a workspace crate (`version = "X.Y.Z", path = "../..."` in
    `crates/*/Cargo.toml`). The Python package takes its version from Cargo.
-   Pragmatic Server announces the oldest SDK it accepts as `min_sdk` in
+   Stet Server announces the oldest SDK it accepts as `min_sdk` in
    `/v1/info` (`crates/pragmatic-server/src/server.rs`); raise it when the
    server's API changes in a way older SDKs cannot follow.
 2. In `CHANGELOG.md`, replace `Unreleased` in the version's heading with

@@ -1,6 +1,6 @@
-# Contributing to Pragmatic
+# Contributing to Stet
 
-Thanks for your interest. Pragmatic is in **public beta**; the core replay
+Thanks for your interest. Stet is in **public beta**; the core replay
 semantics are stable (they are the theorems), the API surface is not yet.
 
 ## Ground rules

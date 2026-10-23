@@ -1,6 +1,6 @@
 # Pinned TSA trust anchors
 
-Pragmatic Server verifies every RFC 3161 time-stamp token it stores with
+Stet Server verifies every RFC 3161 time-stamp token it stores with
 
 ```sh
 openssl ts -verify -token_in -in <token> -digest <anchor digest> \

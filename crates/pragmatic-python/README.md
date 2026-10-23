@@ -1,6 +1,8 @@
-# pragmatic (Python)
+# Stet for Python
 
-**The black-box recorder for LLM agents.**
+**The black-box recorder for LLM agents.** The package is
+`pragmatic-runtime` and its import name is `pragmatic`: Stet was called
+Pragmatic until October 2026, and the names in code did not change.
 
 Wrap your existing Anthropic or OpenAI client and every model call and tool
 call your agent makes is journaled to an append-only, hash-chained log,
@@ -16,7 +18,7 @@ exactly, for debugging or for an auditor, without touching the network.
 > branch, where 0.6 is until it is merged to `main` (see
 > [Build from source](#build-from-source)). Release 0.5, the earlier
 > drop-in release, is on the `release/0.5.0` branch and is not on PyPI
-> either. Pragmatic Server, the optional store for runs on a server, is in
+> either. Stet Server, the optional store for runs on a server, is in
 > design-partner preview.
 
 ```sh
@@ -194,7 +196,7 @@ it writes (renewed in the background, through slow model calls and tools),
 resends appends the server did not acknowledge, and verifies every journal
 it downloads. A resume on a server needs a `recover` policy for tools that
 crashed mid-call. `python -m pragmatic push DIR RUN` uploads journals
-recorded locally. See [Pragmatic Server](../../docs/server.md); the
+recorded locally. See [Stet Server](../../docs/server.md); the
 one-command demo, `examples/demo/run.sh`, runs an agent against one end to
 end.
 

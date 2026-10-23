@@ -1,11 +1,11 @@
-Pragmatic
+Stet
 Copyright 2026 Pragmatic Research, Inc.
 
 This product includes software developed by Pragmatic Research, Inc.
 
 The pragmatic-console crate bundles two typefaces, as unmodified Latin
 subsets, and embeds them in the pages it renders (and so do the pragmatic
-CLI and Pragmatic Server, which serve them):
+CLI and Stet Server, which serve them):
 
 - EB Garamond, roman and italic, as Google Fonts distributes them
   (crates/pragmatic-console/assets/fonts/eb-garamond-latin.woff2,

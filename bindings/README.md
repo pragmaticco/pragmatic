@@ -1,4 +1,4 @@
-# Pragmatic language bindings
+# Stet language bindings
 
 The same runtime - journal every step, recover from any crash, replay
 faithfully - from C++, Java, Go, and Node.js. Every binding sits on the one

@@ -10,9 +10,15 @@ All notable changes to this project are documented here. The format follows
 record of what an agent did that a party outside engineering can rely on,
 while keeping crash recovery as the second pillar. The design it
 implements is [docs/design/system-of-record.md](docs/design/system-of-record.md).
-Pragmatic Server is in design-partner preview and is not generally
+Stet Server is in design-partner preview and is not generally
 available. Like 0.5, this release has not been published to PyPI or
 crates.io.
+
+The product formerly called Pragmatic is now **Stet**, and Pragmatic
+Server is now **Stet Server** (renamed on 2026-10-23); the company is
+still Pragmatic Research, Inc. Names in code are unchanged: `import
+pragmatic`, `@pragmatic.durable`, the `pragmatic` CLI, the
+`pragmatic-*` crates and the `pragmatic-runtime` package.
 
 ### Added
 
@@ -73,7 +79,7 @@ crates.io.
   needs only Python and OpenSSL. The format is specified in
   `docs/evidence-format.md`, with an auditor's walkthrough in
   `docs/evidence.md`.
-- **Anchoring** (Pragmatic Server). One append-only Merkle log of every
+- **Anchoring** (Stet Server). One append-only Merkle log of every
   run's state, with checkpoints in the C2SP format, time-stamped by RFC
   3161 timestamp authorities and cosigned by witnesses. A checkpoint
   counts as independently anchored once witnesses of
@@ -81,7 +87,7 @@ crates.io.
   verified it; the server's own signature never counts. Anchoring never
   blocks journaling, and its lag is a metric and an alert. The anchoring
   library, `crates/pragmatic-anchor`, is part of the commercial layer.
-- **Pragmatic Server** (`crates/pragmatic-server`, commercial; design
+- **Stet Server** (`crates/pragmatic-server`, commercial; design
   partners only). A shared journal store with one writer per run (leases),
   validation of every appended frame, tokens with roles (`agent`,
   `auditor`, `admin`) and run-id scopes, redacted views for auditors, an
@@ -106,7 +112,7 @@ crates.io.
     call to the next, so an async client built once (`pragmatic.wrap` at
     module level, or a framework's default client) keeps its pooled
     connections from run to run.
-  - Pragmatic Server as a store: `Runtime("https://...", token=...)` or
+  - Stet Server as a store: `Runtime("https://...", token=...)` or
     `PRAGMATIC_URL` and `PRAGMATIC_TOKEN`, with leases renewed in the
     background. `python -m pragmatic push` uploads local format 2
     journals.
@@ -122,11 +128,11 @@ crates.io.
   - Optional OpenTelemetry spans with `PRAGMATIC_OTEL=1`. Spans never
     carry content.
 - **The `pragmatic-console` crate:** the HTML and CSV views of runs and
-  evidence bundles, shared by the CLI and Pragmatic Server, in the
+  evidence bundles, shared by the CLI and Stet Server, in the
   website's design (EB Garamond and IBM Plex Mono on warm paper, both
   bundled so a page looks the same everywhere, the brand's diamond as the
   only icon, terracotta only for trouble). A run's page is a run sheet
-  beside Evidence check and Run cards (and Anchoring on Pragmatic
+  beside Evidence check and Run cards (and Anchoring on Stet
   Server); each timeline row says in words what happened, from a step's
   intent and its results together, with the recorded content as a quoted
   excerpt or a gist of data, and opens to the entries. Record keeping
@@ -135,12 +141,12 @@ crates.io.
   the SDK ran as) and failures to jump to. The Anchoring card names each
   timestamp service as configured (`[anchoring] tsa` `name`) with the root
   its pinned anchors chain to, and the time they vouch for to the second.
-  The runs list speaks the same language. Pragmatic Server's console asks
+  The runs list speaks the same language. Stet Server's console asks
   for confirmation before erasing, removing a hold, revoking a token or
   running retention, and answers failed requests with pages instead of
   JSON.
 - **A one-command demo and an end-to-end suite.** `examples/demo/run.sh`
-  tells the whole story on one machine against a real Pragmatic Server and
+  tells the whole story on one machine against a real Stet Server and
   two local timestamp authorities: a support agent crashes mid-refund and
   resumes in another process while a third is refused by the lease; the
   run is anchored, one message is erased, and the exported bundle verifies
@@ -152,7 +158,7 @@ crates.io.
   marks it hidden, and both report a Python that cannot import the SDK as
   a setup problem with its fix.
 - **Documentation:** `docs/threat-model.md`, `docs/compliance.md` (a
-  mapping of record-keeping rules to what Pragmatic provides and what the
+  mapping of record-keeping rules to what Stet provides and what the
   customer is responsible for), `docs/privacy.md`, `docs/server.md`,
   `docs/evidence.md`, `docs/evidence-format.md` and `docs/python.md`, with
   `docs/usage.md`, `docs/quickstart.md` and `docs/concepts.md` brought up
@@ -201,7 +207,7 @@ crates.io.
     and `resume` continue by default and record the change as a
     `program.change` note, while `replay` still refuses unless you pass
     `on_code_change="continue"`.
-- **Recovery with Pragmatic Server** needs an explicit `recover` policy
+- **Recovery with Stet Server** needs an explicit `recover` policy
   for tool calls left unfinished by a crash; without one, resume raises
   `DanglingEffect` instead of compensating.
 - **CLI.** `--key` is deprecated in favor of `--key-file` or

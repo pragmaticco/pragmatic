@@ -1,13 +1,13 @@
 # Product strategy
 
 *Last revised: 2026-10-13. This document is the durable record of what
-Pragmatic is betting on, so that roadmap decisions stay consistent across
+Stet is betting on, so that roadmap decisions stay consistent across
 releases. Change it deliberately, in a pull request, with reasoning.*
 
 ## The one-sentence position
 
-Pragmatic is the **system of record for AI agents**: every model call,
-tool call, input and clock read an agent makes through Pragmatic's
+Stet is the **system of record for AI agents**: every model call,
+tool call, input and clock read an agent makes through Stet's
 journaled interfaces is recorded before its result reaches the agent, in
 a tamper-evident journal that can be anchored with independent timestamp
 authorities, replayed exactly with the model never called, erased for
@@ -87,7 +87,7 @@ moving money, deciding identity or anti-money-laundering cases, handling
 claims or underwriting, clinical steps such as prior authorization, legal
 filings.
 
-**Three questions that show whether Pragmatic fits:**
+**Three questions that show whether Stet fits:**
 
 1. Does the agent take actions, or does it only answer questions?
 2. Does someone outside engineering review what it does?
@@ -120,7 +120,7 @@ open-source runtime serves them).
   reject source-available licenses, and the closest free alternatives are
   permissively licensed. Our promise is "verify without trusting us", so
   auditors and their clients must be able to run the verifier freely.
-- **Commercial: Pragmatic Server.** The shared journal store, independent
+- **Commercial: Stet Server.** The shared journal store, independent
   anchoring, retention, erasure, roles, the access log, evidence bundles
   and the console. Its source is public under the Business Source License
   1.1 so auditors can read it; production use needs a commercial license,
@@ -131,7 +131,7 @@ open-source runtime serves them).
   with the same server binary in witness mode. It cosigns anchors and sees
   only hashes.
 - **Auditors never pay to verify.** Viewing and verifying are free.
-- **Design partners** get a preview of Pragmatic Server now, with
+- **Design partners** get a preview of Stet Server now, with
   anchoring, evidence export and the console integrated in 0.6. It is not
   generally available. We do not publish prices; design partners contact
   us.
@@ -148,7 +148,7 @@ earlier terms.
 `ctx.run_tools` journals tool calls. Apache 2.0. Release publishing is
 wired to PyPI and crates.io; the release has not reached them yet.
 
-### 0.6: the system of record (built; Pragmatic Server in design-partner preview)
+### 0.6: the system of record (built; Stet Server in design-partner preview)
 
 The contract is [design/system-of-record.md](design/system-of-record.md).
 Everything below is implemented in this repository and exercised end to
@@ -167,7 +167,7 @@ end by the one-command demo (`examples/demo`) and the end-to-end suite
   independent operators (two by default).
 - **Evidence bundles** and an offline verifier with pinned trust roots,
   plus a second, independent reference verifier.
-- **Pragmatic Server:** leases, scoped tokens and roles, the access log,
+- **Stet Server:** leases, scoped tokens and roles, the access log,
   holds, retention, redaction, webhooks, backups, witness mode and the
   console.
 - **Python SDK:** journaling at the HTTP layer (streaming, `.parse()`,
@@ -192,9 +192,9 @@ hosted product has paying users or a customer requires it.
 
 ## What we are deliberately not doing
 
-- **No compliance claims.** We say Pragmatic "helps meet", "supports" or
+- **No compliance claims.** We say Stet "helps meet", "supports" or
   "provides evidence for" a requirement. We never say that using
-  Pragmatic meets a regulation or a standard for the customer, and we
+  Stet meets a regulation or a standard for the customer, and we
   never say a law requires anchored logs.
 - **No hosted multi-tenant journal service in year one.** Self-hosted
   first. It keeps customer data out of our hands and is the main reason we
@@ -205,7 +205,7 @@ hosted product has paying users or a customer requires it.
 - **No new language bindings.** The C++, Java, Go and Node.js bindings are
   stable and maintenance-only. The next new language is the TypeScript
   SDK in 0.7.
-- **No agent framework.** Pragmatic is the runtime under whatever
+- **No agent framework.** Stet is the runtime under whatever
   framework the customer already uses.
 - **No telemetry,** update checks or crash reporting, in any component.
 - **No multi-replica server until a customer needs it.** One server per
@@ -216,7 +216,7 @@ hosted product has paying users or a customer requires it.
 ## Positioning FAQ
 
 **Why not Temporal?** If you run Temporal for general workflows, keep it.
-Pragmatic is for when the agent itself must be recoverable and its record
+Stet is for when the agent itself must be recoverable and its record
 must convince an outsider: the model call is modeled rather than an
 opaque cached activity, a changed agent fails loudly instead of diverging
 silently, and the journal is an anchored, exportable audit record rather
@@ -224,7 +224,7 @@ than engine-internal history.
 
 **Why not our observability tool?** Keep it for debugging and dashboards.
 Its traces sit in an editable database, kept for as long as its retention
-settings say. Pragmatic is the record you hand to someone who does not
+settings say. Stet is the record you hand to someone who does not
 trust you.
 
 **Why self-hosted?** Regulated buyers do not want agent prompts and
@@ -241,7 +241,7 @@ no. Adapters carry only what they need to speak HTTPS and JSON.
   not the retry story.
 - A customer's auditor, or their customer, verifies an evidence bundle
   offline.
-- A real security questionnaire's AI section is answered with Pragmatic.
+- A real security questionnaire's AI section is answered with Stet.
 
 ## Signals to revisit
 

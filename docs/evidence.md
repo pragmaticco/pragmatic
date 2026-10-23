@@ -3,7 +3,8 @@
 You have been given a file such as `support-ticket-4127.evidence.json` and
 asked whether it can be relied on. This guide walks through checking it
 yourself, offline, with trust roots you choose. You do not need to trust
-the company that ran the agent, its servers, or Pragmatic.
+the company that ran the agent, its servers, or Pragmatic Research, which
+makes Stet.
 
 The exact format and every check are specified in
 [evidence-format.md](evidence-format.md). This page explains how to use
@@ -12,7 +13,7 @@ them.
 ## What a bundle can and cannot tell you
 
 A bundle holds the record of one agent run: every model call, tool call,
-message received, random draw and clock read made through Pragmatic,
+message received, random draw and clock read made through Stet,
 chained together so that changing any entry breaks every link after it.
 It also holds **anchors**: proof that the record, up to some length,
 existed at a certain time, vouched for by independent parties.
@@ -47,7 +48,7 @@ system-of-record https://github.com/pragmaticco/pragmatic`; `main` holds
 0.4.0 until 0.6 is merged), install the first with `cargo install --path
 crates/pragmatic-cli`, and run the second as
 `python3 tools/verify_evidence.py`. To watch a bundle being produced by
-Pragmatic Server and checked both ways, including with the wrong roots and
+Stet Server and checked both ways, including with the wrong roots and
 with one byte changed, run the demo (`examples/demo/run.sh`, step 6).
 
 Both need OpenSSL (version 3 or later) to check RFC 3161 time-stamps, and
@@ -73,7 +74,7 @@ independently. Gather:
 - **Time-stamp authority roots.** For each time-stamp authority (TSA) you
   are willing to rely on, its root certificate, from the authority's own
   website or your operating system's trust store, with the fingerprint
-  checked. Pragmatic Server's example configuration uses DigiCert (root
+  checked. Stet Server's example configuration uses DigiCert (root
   "DigiCert Trusted Root G4") and Sectigo (root "USERTrust RSA
   Certification Authority"). Give each file the name of the company that runs it
   (`--tsa-roots OPERATOR=FILE`; the name is required). Every certificate
@@ -113,7 +114,7 @@ pragmatic verify-evidence support-ticket-4127.evidence.json \
   --log-key "pragmatic/acme/0123456789abcdef+5e6f7a8b+AQ..."
 ```
 
-(`deploy/tsa-roots/README.md` lists the anchors Pragmatic Server's example
+(`deploy/tsa-roots/README.md` lists the anchors Stet Server's example
 configuration pins, with their fingerprints and where to obtain each
 yourself. The log key is the vkey `pragmatic-server keygen` printed; get
 it from the operator out of band.)
@@ -207,7 +208,7 @@ fails with `log_unauditable` rather than pass.
 The full log is checked against the bundle's latest checkpoint, a tree
 head the server chose. To rule out a server that forked its log (one
 history for you, another for everyone else), check it against a witness
-that cosigns the log: pass its cosigned history and its key. A Pragmatic
+that cosigns the log: pass its cosigned history and its key. A Stet
 Server in witness mode serves the history at
 `GET /v1/witness/log/{name}?after=<cursor>` (leave `after` out for the
 first page, then pass each page's `next` until it is null); the file is

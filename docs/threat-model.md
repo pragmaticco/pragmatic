@@ -6,8 +6,8 @@ expands section 1.3 of the [0.6 design](design/system-of-record.md),
 which is normative where the two differ.
 
 > **Status.** Journal format 2, erasure, anchoring, evidence bundles and
-> Pragmatic Server are 0.6 features. 0.6.0 is built from source and not
-> yet published, and Pragmatic Server, which anchoring needs, is in
+> Stet Server are 0.6 features. 0.6.0 is built from source and not
+> yet published, and Stet Server, which anchoring needs, is in
 > design-partner preview. Release 0.5 has the hash chain, keyed journals
 > and local journals only.
 
@@ -43,14 +43,14 @@ the journaled interfaces.
 
 | Adversary | Can | Cannot (when the stated controls are on) |
 |---|---|---|
-| **Agent code**, including tools hijacked by prompt injection | Act outside the journaled interfaces, unrecorded. Hold an agent token scoped to its run-id prefixes. Append to a run while it holds that run's lease. In local mode, read, edit and delete the journal files its process can reach | Write erased or withheld slots, or server-only notes. Touch runs outside its scopes. Rewrite or delete anything already on Pragmatic Server |
+| **Agent code**, including tools hijacked by prompt injection | Act outside the journaled interfaces, unrecorded. Hold an agent token scoped to its run-id prefixes. Append to a run while it holds that run's lease. In local mode, read, edit and delete the journal files its process can reach | Write erased or withheld slots, or server-only notes. Touch runs outside its scopes. Rewrite or delete anything already on Stet Server |
 | **Host operator without the HMAC key** (local mode) | Read and edit local journal files. Delete them | Edit a keyed journal without detection |
-| **Host operator** (local mode, unkeyed journal) | Read, edit, delete or truncate the files, and recompute the chain after an edit | Hide an edit from someone who holds an earlier copy, such as one pushed to Pragmatic Server or exported as an evidence bundle |
+| **Host operator** (local mode, unkeyed journal) | Read, edit, delete or truncate the files, and recompute the chain after an edit | Hide an edit from someone who holds an earlier copy, such as one pushed to Stet Server or exported as an evidence bundle |
 | **Server administrator with root** | Read all content. Delete data. Rewrite the unanchored end of a run (normally at most one anchoring interval old). Stop anchoring. With `anchor_run_ids = "hmac"`, rewrite an anchored run and anchor it again under a new per-run key, which no audit detects (see [`anchor_run_ids`](server.md#anchoring)) | For runs anchored with plain ids (`anchor_run_ids = "plain"`, the default): rewrite an anchored prefix, or hide an anchored run from an auditor who audits the full anchor log against a pinned independent witness |
 | **Auditor** | Read what their token's scopes and `view_raw` allow | Recover redacted content: salts are never served with redacted content, and a withheld slot carries only its commitment |
 | **Holder of a stolen token** | Whatever that token's role and scopes allow, until it is revoked or expires | Act outside those scopes, or act unlogged: every request, refused ones included, is in the access log |
 | **One timestamp authority** (compromised, or simply wrong) | Issue a false time-stamp | Make an anchor count as independent on its own: by default an anchor needs at least two distinct trusted operators (the verifiers' `--min-operators`, the server's `min_independent_operators`) |
-| **Pragmatic Witness** (hosted, planned) | Refuse service. See a log name, sequence number, tree size and root hash | Learn any content or run id |
+| **Hosted witness** (run by Pragmatic Research, planned) | Refuse service. See a log name, sequence number, tree size and root hash | Learn any content or run id |
 | **Network attacker** between the SDK and the server | Without TLS: read content and tokens, and change traffic | With TLS ending at your proxy or ingress: read or change traffic. The server refuses to listen on a non-loopback address unless you confirm that TLS ends in front of it (`allow_plain_http`) |
 
 ## Controls, and what each defends against
@@ -62,7 +62,7 @@ the journaled interfaces.
 | **Canonical decoding** (decode, re-encode and compare bytes) | Two encodings of one record, and parser confusion | Applied to the server's append path, file parsing and evidence verification |
 | **Torn-tail versus corruption rules** | Truncating acknowledged entries after damage | A crash can only tear unacknowledged frames at the end. Damage that could have hit acknowledged entries is reported as corruption, never silently cut off |
 | **Write-ahead intents** | Missing a call in the record, and repeating a recorded model answer or a committed tool call after a crash | An intent is durable before the call or tool runs; its result is durable before the agent sees it. A call cut off by a crash (intent recorded, result not) can be repeated, and the journal shows it: a model call is sent again, so one paid for but not recorded is paid for twice; a tool call goes to the `recover` policy, with an idempotency key, and local runs perform it again by default (server-backed runs need an explicit policy) |
-| **Single writer** (a file lock locally, a lease on the server) | Two copies of an agent continuing one run | Local file locks do not work across machines on network file systems; use Pragmatic Server for that |
+| **Single writer** (a file lock locally, a lease on the server) | Two copies of an agent continuing one run | Local file locks do not work across machines on network file systems; use Stet Server for that |
 | **Server-side validation of every append** | An agent writing records that would not verify, writing erased or withheld slots, or writing server-only notes | The server stores nothing that would fail verification. The client compares the head it computed with the head the server returns |
 | **Anchoring** (a Merkle log of every run's state, time-stamped by RFC 3161 authorities and cosigned by witnesses) | A server administrator rewriting or hiding anchored history | See the next two sections for exactly what it proves and the window it leaves |
 | **Operator independence** (at least two distinct trusted operators, by default) | One compromised or careless timestamp authority | Entrust is counted as Sectigo and QuoVadis EU as DigiCert, because they share an operator. The server's own signature never counts as independent |
@@ -178,7 +178,7 @@ outside that journal file:
   ids. They must not hold personal data. See [privacy.md](privacy.md).
 - **Downstream systems.** The model provider's own logs, your
   observability tools and anything a tool sent elsewhere are outside
-  Pragmatic.
+  Stet.
 - **The fact of erasure** is visible by design: the slot shows as erased
   and the note says who erased it.
 - **Replay after erasure.** A run with erased content can still be
@@ -218,7 +218,7 @@ bundles carry. The journal itself keeps the raw content.
   faithfully recorded.
 - Model providers' handling of the prompts they receive.
 - Availability: a server administrator can always refuse service or
-  delete data. Pragmatic makes deletion of anchored data detectable, not
+  delete data. Stet makes deletion of anchored data detectable, not
   impossible.
 - Side channels, and denial of service against the server.
 - The security of the timestamp authorities and witnesses themselves,

@@ -1,6 +1,6 @@
 # Concepts
 
-Pragmatic implements the **Agentical** calculus: a probabilistic process
+Stet implements the **Agentical** calculus: a probabilistic process
 calculus for durable multi-agent LLM systems. This page maps the theory onto
 the API you actually use.
 
@@ -14,7 +14,7 @@ the engine has no model of the call: no probabilistic reasoning, no
 information-flow guarantees, and replay stays sound only while you keep all
 surrounding code deterministic by hand.
 
-Pragmatic starts from the nondeterminism instead:
+Stet starts from the nondeterminism instead:
 
 - an LLM call is a **draw from a probability distribution** (the Oracle);
 - every realized draw is **journaled in the same atomic step it is
@@ -118,7 +118,7 @@ every chain hash still verifies, and an `erasure` note records which slots,
 who erased them and why. A replay that reaches erased content raises
 `Erased`.
 
-**Anchoring** (Pragmatic Server) adds each run's length and chain head to an
+**Anchoring** (Stet Server) adds each run's length and chain head to an
 append-only Merkle log whose checkpoints are time-stamped and cosigned by
 independent operators. An evidence bundle carries those anchors, so an
 auditor can check offline that a journal prefix existed no later than a
@@ -159,8 +159,8 @@ byte-compatible across all three surfaces and the CLI.
 ## What's deliberately out of scope (0.6)
 
 - **More than one writer per run**: a file lock stops a second writer on
-  one machine, and Pragmatic Server's lease stops one on any machine. A
-  network file system gives no exclusion across hosts, and Pragmatic Server
+  one machine, and Stet Server's lease stops one on any machine. A
+  network file system gives no exclusion across hosts, and Stet Server
   runs as one replica per deployment.
 - **What happens outside the journaled interfaces**: anything the agent
   does without going through `ctx` or a journaled client is not recorded.

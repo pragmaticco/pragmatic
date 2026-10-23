@@ -7,12 +7,12 @@ request to see or erase their data, how to set retention, where redaction
 stops, and how to start a data protection impact assessment (DPIA).
 
 > **Status.** Journal format 2, erasure, labels and subjects, retention,
-> holds and Pragmatic Server are 0.6 features. 0.6.0 is built from source
-> and not yet published, and Pragmatic Server (retention, holds and
+> holds and Stet Server are 0.6 features. 0.6.0 is built from source
+> and not yet published, and Stet Server (retention, holds and
 > erasure on the server) is in design-partner preview. Release 0.5
 > journals (format 1) cannot erase content; in 0.6 they are read-only.
 
-> **This is not legal advice.** It describes how Pragmatic behaves. How
+> **This is not legal advice.** It describes how Stet behaves. How
 > privacy law applies to your processing is for you and your counsel to
 > decide.
 
@@ -149,7 +149,7 @@ A procedure for a person's request to see (GDPR Article 15) or erase
 
 ### 1. Find the person's runs
 
-- **With Pragmatic Server:** an admin calls `POST /v1/subjects/search`
+- **With Stet Server:** an admin calls `POST /v1/subjects/search`
   with `{"subject": "customer:48213"}`. The identifier is sent in the
   body and is never logged. This finds runs whose subjects named the
   person.
@@ -212,7 +212,7 @@ inside an image or document is not found. Review the run with
 server) must show no unaccounted erasures and no incomplete ones. If an
 erasure was interrupted, running it again completes it.
 
-### 6. Erase the copies Pragmatic cannot reach
+### 6. Erase the copies Stet cannot reach
 
 - **Backups:** keep the erasure ledger off the host so a restore
   re-applies the erasure, and let old backups expire on schedule.
@@ -305,7 +305,7 @@ withhold slots. Redaction has limits:
 
 ## What leaves your network
 
-Pragmatic sends no telemetry. With Pragmatic Server self-hosted, prompts,
+Stet sends no telemetry. With Stet Server self-hosted, prompts,
 outputs and other content never reach Pragmatic Research.
 
 - Timestamp authorities receive a 32-byte digest of the anchor log's
@@ -314,9 +314,9 @@ outputs and other content never reach Pragmatic Research.
   the root hash.
 - Webhooks receive an event type, a run id and counts.
 - Model providers receive whatever your agent sends them. That is your
-  agent's processing, not Pragmatic's.
+  agent's processing, not Stet's.
 
-Erasure in Pragmatic follows the approach that the European Data
+Erasure in Stet follows the approach that the European Data
 Protection Board's guidelines 02/2025 on blockchain (version 2.0, adopted
 7 July 2026) describe: keep personal data out of the chain, commit to it
 with salted hashes, and delete the data and the salt to erase it. Those
@@ -326,7 +326,7 @@ analogy, not a ruling.
 ## DPIA template outline
 
 An outline for a data protection impact assessment (GDPR Article 35) of
-journaling an AI agent with Pragmatic. Assess the agent's own processing
+journaling an AI agent with Stet. Assess the agent's own processing
 separately; this covers the record of it.
 
 1. **Description of the processing**
@@ -363,7 +363,7 @@ separately; this covers the record of it.
    - Transfers outside your region (model providers; timestamp
      authorities and witnesses receive only hashes).
 5. **Measures**
-   - From Pragmatic: scoped tokens and roles, the access log, redacted
+   - From Stet: scoped tokens and roles, the access log, redacted
      views, erasure that keeps the proof, retention policies and holds,
      no telemetry, only hashes sent to timestamp authorities and witnesses.
    - From you: volume and backup encryption, TLS, your identity provider

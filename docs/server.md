@@ -1,19 +1,19 @@
-# Pragmatic Server
+# Stet Server
 
-Pragmatic Server stores the journals your agents write, so that every run
+Stet Server stores the journals your agents write, so that every run
 has one durable, access-controlled record that you can audit, export as
 evidence, erase for privacy law and keep or delete by policy. This guide
 covers installing it, configuring it, issuing tokens, sizing, backups and
 upgrades.
 
-> **Status.** Pragmatic Server 0.6.0 is in design-partner preview and is
+> **Status.** Stet Server 0.6.0 is in design-partner preview and is
 > not generally available. Everything on this page, anchoring, evidence
 > bundles and the console included, is implemented in this repository;
 > `examples/demo/run.sh` runs it end to end on one machine, and
 > `tests/e2e` asserts the same story against the real binary. To join as
 > a design partner, contact me@aniketh.net.
 
-Pragmatic Server is licensed under the Business Source License 1.1. You may
+Stet Server is licensed under the Business Source License 1.1. You may
 use it for development, testing and evaluation. Production use needs a
 commercial license from Pragmatic Research, Inc. Each version becomes
 Apache-2.0 four years after its release. Its anchoring library,
@@ -664,7 +664,7 @@ gone while the anchor log holds a leaf for it. For such an origin
 `add-checkpoint` answers `503`, and the record is never begun afresh. To
 resume, take the latest checkpoint this witness cosigned for the origin
 from outside the host (the witnessed log keeps its cosignatures; a
-Pragmatic Server keeps them under `anchors/witness/`), as the signed note
+Stet Server keeps them under `anchors/witness/`), as the signed note
 with this witness's cosignature line, and run:
 
 ```sh

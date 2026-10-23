@@ -2,7 +2,7 @@
 
 Format `pragmatic-evidence/1`. This document is normative: a bundle that
 does not follow it is invalid, and a verifier that does not perform every
-check below is not a Pragmatic evidence verifier. MUST, MUST NOT and
+check below is not a Stet evidence verifier. MUST, MUST NOT and
 SHOULD are used as in RFC 2119.
 
 Two independent implementations follow it: `pragmatic verify-evidence`
@@ -13,7 +13,7 @@ For a walkthrough written for auditors, see [evidence.md](evidence.md).
 ## 1. What a bundle is, and what it proves
 
 A bundle packages one run's journal so a party that trusts neither the
-agent's operator nor Pragmatic can check it offline. It carries the
+agent's operator nor Pragmatic Research can check it offline. It carries the
 journal (with some slots possibly withheld), the same journal decoded as
 readable records, and the run's anchors: leaves of an append-only Merkle
 log that commit to the journal's chain head at successive lengths, each
@@ -179,7 +179,7 @@ they never say anything the chain does not vouch for.
 
 ## 5. The journal
 
-The journal is a Pragmatic journal file, format 2 (design section 2), and
+The journal is a Stet journal file, format 2 (design section 2), and
 always unkeyed. Summary, all integers little-endian:
 
 ```text
@@ -319,8 +319,8 @@ A verifier takes trust only from its own inputs:
   usage `id-kp-timeStamping`.
 - **Witness keys** (`--witness-key OPERATOR=VKEY`, repeatable; or
   `OPERATOR=HEX` for a 32-byte cosignature key whose cosigner name is
-  `OPERATOR`), plus the hosted Pragmatic Witness keys built into the CLI
-  with their validity windows (none until it launches).
+  `OPERATOR`), plus the keys of the hosted witness that Pragmatic Research runs, built
+  into the CLI with their validity windows (none until it launches).
 - **Log keys** (`--log-key VKEY`, repeatable): the log's Ed25519 checkpoint
   key, which also signs bundles.
 - **Minimum operators** (`--min-operators N`, default 2).

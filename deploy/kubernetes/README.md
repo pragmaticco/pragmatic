@@ -1,6 +1,6 @@
-# Pragmatic Server on Kubernetes
+# Stet Server on Kubernetes
 
-These manifests run one Pragmatic Server per data volume:
+These manifests run one Stet Server per data volume:
 
 - `statefulset.yaml`: a StatefulSet with `replicas: 1` and update strategy
   `OnDelete`. The server takes an exclusive lock on its data directory, so
