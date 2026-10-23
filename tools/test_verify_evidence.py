@@ -213,6 +213,23 @@ class Adversarial(Fixtures):
         self.assertIn("tsa_untrusted", codes(r))
 
     @needs_openssl
+    def test_relabeled_tsa_operator(self):
+        """A token counts for the operator whose pinned roots verify it,
+        whatever operator the bundle names: relabeling cannot make one
+        operator look like two, or hide one."""
+        for label in ("Fixture TSA A", "DigiCert"):
+            b = unsigned("bundle.json")
+            for a in b["anchors"]:
+                for w in a["witnesses"]:
+                    if w["type"] == "rfc3161":
+                        w["operator"] = label
+            r = verify(b)
+            self.assertEqual(r["verdict"], "VERIFIED", (label, r["findings"]))
+            self.assertIn("operator_mismatch", codes(r))
+            for a in r["anchors"]:
+                self.assertEqual(a["trusted_operators"], ["fixture-tsa-a", "fixture-tsa-b"], label)
+
+    @needs_openssl
     def test_omitted_anchor_caught_with_log(self):
         b = unsigned("bundle.json")
         b["anchors"].pop()

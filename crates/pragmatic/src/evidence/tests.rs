@@ -370,6 +370,38 @@ fn aliased_operators_count_once() {
 }
 
 #[test]
+fn a_relabeled_tsa_token_counts_for_the_operator_whose_anchors_verify_it() {
+    // Design section 9: TSA tokens relabeled with another `operator`. The
+    // label is informational, so each token counts for the operator whose
+    // pinned anchors verify it, and the report says the bundle names
+    // someone else. Without the witness only the two TSAs can make an
+    // anchor independent: a verifier that went by the labels would count
+    // one operator (or none) and report UNANCHORED.
+    let mut policy = open_log();
+    policy.witness_keys.clear();
+    for label in ["Fixture TSA A", "DigiCert"] {
+        let mut b = unsigned(bundle());
+        for a in &mut b.anchors {
+            for w in &mut a.witnesses {
+                if let Witness::Rfc3161 { operator, .. } = w {
+                    *operator = label.into();
+                }
+            }
+        }
+        let r = check(&b, &policy);
+        assert_eq!(r.verdict, Verdict::Verified, "{label}: {:#?}", r.findings);
+        assert!(r.has(Code::OperatorMismatch), "{label}: {:?}", codes(&r));
+        for a in &r.anchors {
+            assert_eq!(
+                a.trusted_operators,
+                ["fixture-tsa-a", "fixture-tsa-b"],
+                "{label}"
+            );
+        }
+    }
+}
+
+#[test]
 fn an_unwitnessed_suffix_is_partial() {
     let mut b = unsigned(bundle());
     b.anchors[2].witnesses.clear();
