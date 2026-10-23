@@ -980,6 +980,10 @@ mod anchor_log {
         let alarm = alarm.expect("a fork alarm webhook");
         assert_eq!(alarm["event"], "anchor_failed", "{alarm}");
         assert!(pragmatic_server::anchoring::hold_path(&restored.data_dir).exists());
+        // The batch that raised the alarm may have taken every run and the
+        // whole access log, and a batch with nothing to anchor stops before
+        // the hold is asked; give the next one a run of its own.
+        finished(&ts2, &agent, "d", &["four"]).await;
         let err = ts2.app().anchor_batch(BatchReason::Interval).unwrap_err();
         assert!(err.contains("held"), "{err}");
         let record = witness
