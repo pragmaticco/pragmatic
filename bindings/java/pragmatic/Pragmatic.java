@@ -1,4 +1,4 @@
-// Pragmatic.java - Java binding for the Pragmatic durable-execution runtime.
+// Pragmatic.java - Java binding for the Stet durable-execution runtime.
 //
 // Pure Java over the C ABI (crates/pragmatic-ffi) via java.lang.foreign
 // (JDK 22+); no JNI glue to compile. Point it at the built library with
@@ -451,7 +451,7 @@ public final class Pragmatic {
     // ------------------------------------------------------------------
 
     /**
-     * The Pragmatic runtime: journals every step an agent takes under a
+     * The Stet runtime: journals every step an agent takes under a
      * stable run id, so it survives any crash and replays exactly.
      */
     public static final class Runtime implements AutoCloseable {

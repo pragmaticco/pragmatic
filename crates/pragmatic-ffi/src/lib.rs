@@ -1,4 +1,4 @@
-//! C ABI for Pragmatic - durable execution for agents that don't run
+//! C ABI for Stet - durable execution for agents that don't run
 //! deterministically.
 //!
 //! One flat `extern "C"` surface over [`pragmatic::Runtime`] and
@@ -541,7 +541,7 @@ pub unsafe extern "C" fn prag_report_trace_summary(r: *const PragReport, i: u64)
 // Runtime
 // ---------------------------------------------------------------------------
 
-/// The Pragmatic runtime: journals every step an agent takes under a stable
+/// The Stet runtime: journals every step an agent takes under a stable
 /// run id, so it survives any crash and replays exactly.
 pub struct PragRuntime {
     inner: pragmatic::Runtime<CallbackOracle>,

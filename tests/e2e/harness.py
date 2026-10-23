@@ -183,7 +183,7 @@ def build_binaries() -> Path:
         cargo = shutil.which("cargo")
         if cargo is None:
             raise SetupError(
-                "Rust is needed to build Pragmatic Server: install it from https://rustup.rs "
+                "Rust is needed to build Stet Server: install it from https://rustup.rs "
                 "(or, on a Mac, brew install rust)."
             )
         cmd = [cargo, "build", "--quiet", "-p", "pragmatic-server", "-p", "pragmatic-cli"]

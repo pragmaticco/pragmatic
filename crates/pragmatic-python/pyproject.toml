@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pragmatic-runtime"
-description = "The black-box recorder for LLM agents: journal every model and tool call of your Anthropic or OpenAI SDK agent, resume crashed runs without re-paying for tokens, and replay any run exactly for audit."
+description = "Stet, the black-box recorder for LLM agents: journal every model and tool call of your Anthropic or OpenAI SDK agent, resume crashed runs without re-paying for tokens, and replay any run exactly for audit."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
@@ -20,7 +20,7 @@ classifiers = [
 dynamic = ["version"]
 
 [project.urls]
-Homepage = "https://aniketh.net/pragmatic/"
+Homepage = "https://aniketh.net/pragmatic/stet/"
 Repository = "https://github.com/pragmaticco/pragmatic"
 
 [project.optional-dependencies]

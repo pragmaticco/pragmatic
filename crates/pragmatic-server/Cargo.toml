@@ -1,6 +1,6 @@
 [package]
 name = "pragmatic-server"
-description = "Pragmatic Server: the system of record for AI agent runs. Stores journals with leases, access control, erasure, retention, redaction, an access log and anchoring."
+description = "Stet Server: the system of record for AI agent runs. Stores journals with leases, access control, erasure, retention, redaction, an access log and anchoring."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

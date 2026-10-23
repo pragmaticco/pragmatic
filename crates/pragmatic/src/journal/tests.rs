@@ -2074,7 +2074,7 @@ fn audit_reports_erasure_without_a_note() {
         )
         .unwrap();
     // Drop the note frame: an erased slot nobody accounts for (a tool that
-    // bypassed Pragmatic, or bit rot).
+    // bypassed Stet, or bit rot).
     let note_start = frames(&e.file)[e.note_cursor as usize].0;
     let silent = Journal::parse(&e.file[..note_start], None).unwrap().journal;
     assert!(silent.verify().is_ok(), "the chain still verifies");

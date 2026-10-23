@@ -1,6 +1,6 @@
 [package]
 name = "pragmatic-cli"
-description = "Tooling for Pragmatic journals and evidence bundles: inspect, verify, erase and export runs, and verify evidence bundles offline against pinned trust roots."
+description = "Tooling for Stet journals and evidence bundles: inspect, verify, erase and export runs, and verify evidence bundles offline against pinned trust roots."
 keywords = ["agents", "llm", "durable-execution", "cli"]
 categories = ["command-line-utilities"]
 version.workspace = true

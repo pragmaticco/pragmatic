@@ -49,9 +49,9 @@ fn spec() -> VerificationSpec {
     }
 }
 
-/// The hosted Pragmatic Witness keys, with validity windows (Unix
-/// seconds): `(operator, vkey, not_before, not_after)`. Empty until the
-/// witness launches (design 5.2).
+/// The keys of the hosted witness that Pragmatic Research runs, with
+/// validity windows (Unix seconds): `(operator, vkey, not_before,
+/// not_after)`. Empty until the witness launches (design 5.2).
 const HOSTED_WITNESS_KEYS: &[(&str, &str, u64, u64)] = &[];
 
 // ---------------------------------------------------------------------------
@@ -136,7 +136,7 @@ pub fn build(args: &Args) -> Result<(), Failure> {
         return Err(Failure::Error(
             "this journal is keyed: an evidence bundle carries an unkeyed journal, because a \
              verifier never holds the key. Evidence needs a journal written without a key (or \
-             by Pragmatic Server)"
+             by Stet Server)"
                 .into(),
         ));
     }

@@ -309,7 +309,7 @@ fn anchors(r: &EvidenceReport) -> String {
             "<section class=\"sect\"><h2 class=\"rhead\">Anchors</h2><div class=\"tsheet\">{}</div></section>",
             empty(
                 "This bundle carries no anchors, so nothing ties its journal to a time. Bundles \
-                 made from a local journal carry none in 0.6; Pragmatic Server anchors the runs \
+                 made from a local journal carry none in 0.6; Stet Server anchors the runs \
                  it stores."
             )
         );

@@ -1,6 +1,6 @@
 //! Ed25519 signature verification (RFC 8032 section 5.1.7), verify only.
 //!
-//! Pragmatic Server signs every checkpoint with an Ed25519 key, witnesses
+//! Stet Server signs every checkpoint with an Ed25519 key, witnesses
 //! cosign checkpoints with theirs, and an evidence bundle may be signed by
 //! the server. The CLI, the Python native module and the server itself must
 //! check those signatures against pinned public keys, and the core crate is

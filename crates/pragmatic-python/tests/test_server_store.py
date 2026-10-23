@@ -1,4 +1,4 @@
-"""ServerStore against an in-process mock of Pragmatic Server (spec 4.4 to
+"""ServerStore against an in-process mock of Stet Server (spec 4.4 to
 4.6, 6.1, 6.3): construction checks, the create order, crash in one
 process and resume in another, leases held through calls longer than
 their TTL, resending with duplicate reconciliation, and the mapping of

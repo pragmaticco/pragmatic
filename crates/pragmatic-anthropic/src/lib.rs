@@ -1,5 +1,5 @@
 //! Claude as a journaled **Oracle** - the Anthropic Messages API adapter for
-//! the Pragmatic durable-execution runtime.
+//! the Stet durable-execution runtime.
 //!
 //! ```no_run
 //! use pragmatic::Runtime;

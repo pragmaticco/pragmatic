@@ -516,7 +516,7 @@ async fn a_run_rolled_back_after_it_was_anchored_is_marked_regressed() {
     assert_ne!(s["status"], "regressed", "{s}");
 }
 
-/// A log witnessed by another Pragmatic Server in witness mode: the
+/// A log witnessed by another Stet Server in witness mode: the
 /// anchoring library's witness client against the server's witness
 /// service, and a bundle that verifies with the witness key pinned and
 /// against the witness's own cosigned history.

@@ -220,7 +220,7 @@ fn index_row(r: &RunRow, this_year: &str) -> String {
     }
     let failed = matches!(r.last_outcome.as_deref(), Some(o) if o != "ok");
     let (state, mark) = if r.format == 1 {
-        ("Format 1, from Pragmatic 0.4 or 0.5".to_string(), "mk-fill")
+        ("Format 1, from Stet 0.4 or 0.5".to_string(), "mk-fill")
     } else if r.open_attempt {
         ("Open".to_string(), "mk-hollow")
     } else {

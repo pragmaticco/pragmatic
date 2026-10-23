@@ -1,4 +1,4 @@
-//! Pragmatic Server: the system of record for AI agent runs (design
+//! Stet Server: the system of record for AI agent runs (design
 //! section 4).
 //!
 //! The server stores run journals for SDKs that append to them under

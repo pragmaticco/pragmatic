@@ -1,4 +1,4 @@
-# Pragmatic Server container image (design 4.15).
+# Stet Server container image (design 4.15).
 #
 #   docker build -t pragmatic-server:0.6.0 .
 #
@@ -10,7 +10,7 @@
 # data volume. The pinned TSA anchors are in /etc/pragmatic/tsa-roots. See
 # deploy/docker-compose.yml and deploy/kubernetes/.
 #
-# Pragmatic Server is licensed under the Business Source License 1.1:
+# Stet Server is licensed under the Business Source License 1.1:
 # non-production use is free; production use needs a commercial license
 # from Pragmatic Research, Inc. (crates/pragmatic-server/LICENSE).
 

@@ -1,14 +1,14 @@
 //! C2SP signed notes, transparency-log checkpoints and `cosignature/v1`
 //! witness cosignatures: parsing, encoding and Ed25519 verification.
 //!
-//! Pragmatic Server anchors journals in one append-only Merkle log, and each
+//! Stet Server anchors journals in one append-only Merkle log, and each
 //! anchoring batch ends in a *checkpoint*: the log's origin, tree size and
 //! root hash, signed by the server's Ed25519 key. Witnesses cosign
 //! checkpoints after checking consistency with the last one they saw, and
-//! evidence bundles carry both. Rather than inventing a format, Pragmatic
+//! evidence bundles carry both. Rather than inventing a format, Stet
 //! uses the C2SP formats that Go's checksum database, Sigstore and the
 //! public witness network already speak, so existing tooling can read,
-//! verify and witness a Pragmatic log:
+//! verify and witness a Stet log:
 //!
 //! - [`Note`]: a [signed note] (`c2sp.org/signed-note`), a text followed by
 //!   a blank line and one or more lines of the form
@@ -632,7 +632,7 @@ pub fn verify_note(note: &Note, keys: &[VerifierKey]) -> Result<Vec<VerifiedSign
 /// The note text of a tlog-checkpoint: a signed tree head.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Checkpoint {
-    /// The log's origin line. For Pragmatic Server, `pragmatic/<server
+    /// The log's origin line. For Stet Server, `pragmatic/<server
     /// name>`.
     pub origin: String,
     /// Number of leaves in the tree.

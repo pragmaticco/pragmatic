@@ -393,7 +393,7 @@ fn refund_20417_reads_as_designed() {
     assert!(html.contains("Read back by attempt 2: replayed from the journal, not repeated."));
     assert!(html.contains("<i class=\"dm rb\" aria-hidden=\"true\"></i>4 steps read back"));
     // The masthead of a file: its directory and the run, and its policy.
-    assert!(html.contains("<title>refund-20417 \u{b7} Pragmatic</title>"));
+    assert!(html.contains("<title>refund-20417 \u{b7} Stet</title>"));
     assert!(html.contains(
         "<span class=\"c up\"><span class=\"sep\" aria-hidden=\"true\">/</span><span>journals</span></span>"
     ));
@@ -1143,7 +1143,7 @@ fn format_1_runs_render_read_only() {
     assert_eq!(j.format(), 1);
     let html = run_page(&j);
     assert_only_own_markup(&html);
-    assert!(html.contains("A format 1 journal from Pragmatic 0.4 or 0.5"));
+    assert!(html.contains("A format 1 journal from Stet 0.4 or 0.5"));
     assert!(html.contains("<span class=\"tag\">Read-only</span>"));
     assert!(html.contains("oracle.draw"));
     assert!(html.contains("plan &lt;b&gt;"));
@@ -1276,7 +1276,7 @@ fn a_filtered_framed_page_shows_no_raw_content() {
     assert!(html.contains("<dt>tokens</dt><dd>1,830 in, 42 out</dd>"));
 }
 
-/// A run's page on Pragmatic Server says what is known of a run whose
+/// A run's page on Stet Server says what is known of a run whose
 /// last attempt has not ended: running (the lease is live) or crashed.
 #[test]
 fn the_end_of_a_run_says_what_is_known() {
@@ -1335,14 +1335,14 @@ fn the_end_of_a_run_says_what_is_known() {
     ));
 }
 
-/// A custody note as Pragmatic Server writes one when a lease ends.
+/// A custody note as Stet Server writes one when a lease ends.
 fn custody(from: u64, to: u64, requests: u64, end: &str) -> String {
     format!(
         r#"{{"clock_skew":false,"end":"{end}","first_received":0,"from_entries":{from},"last_received":0,"lease":"00","principal":"tok_agent","requests":{requests},"to_entries":{to},"token":"tok_agent"}}"#
     )
 }
 
-/// `src` as Pragmatic Server holds it: before each later attempt starts,
+/// `src` as Stet Server holds it: before each later attempt starts,
 /// the server ends the lease the attempt before it held (a custody note),
 /// and it releases the last lease after the run.
 fn on_server(src: &Journal) -> Journal {
@@ -1384,7 +1384,7 @@ fn on_server_without(src: &Journal, skip: Option<u64>) -> Journal {
     j
 }
 
-/// On Pragmatic Server, the custody note the server writes when the next
+/// On Stet Server, the custody note the server writes when the next
 /// attempt takes the run is not attempt 1's: the crash row names the last
 /// entry attempt 1 wrote itself, and comes before the server's note.
 #[test]

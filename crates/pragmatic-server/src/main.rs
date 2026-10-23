@@ -1,4 +1,4 @@
-//! `pragmatic-server`: the Pragmatic Server binary (design 4.1).
+//! `pragmatic-server`: the Stet Server binary (design 4.1).
 //!
 //! ```text
 //! pragmatic-server serve [--config FILE]
@@ -34,7 +34,7 @@ use serde_json::{json, Value as JsonValue};
 #[command(
     name = "pragmatic-server",
     version,
-    about = "Pragmatic Server: the system of record for AI agent runs"
+    about = "Stet Server: the system of record for AI agent runs"
 )]
 struct Cli {
     /// The configuration file.
@@ -284,7 +284,7 @@ fn run(cli: Cli) -> Result<String, String> {
             call(&config, &conn, "POST", "/v1/verify-data", None)
         }
         Command::VerifyEvidence { file } => Err(format!(
-            "verify {} with `pragmatic verify-evidence` from the Pragmatic CLI (Apache-2.0), \
+            "verify {} with `pragmatic verify-evidence` from the Stet CLI (Apache-2.0), \
              pinning trust roots of your own choosing: an auditor should not have to trust the \
              operator's server to check its bundles",
             file.display()

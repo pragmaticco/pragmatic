@@ -43,14 +43,14 @@ pub const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; img-src data:; \
 pub const SERVE_POLICY: &str = "default-src 'none'; img-src data:; \
      font-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'";
 
-/// The policy of a live console's pages (Pragmatic Server): fonts from its
+/// The policy of a live console's pages (Stet Server): fonts from its
 /// own origin, and forms that submit only to the console itself. It still
 /// runs no script and loads nothing from anywhere else.
 pub const CONSOLE_POLICY: &str = "default-src 'none'; img-src data:; \
      font-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; \
      frame-ancestors 'none'";
 
-/// The Pragmatic mark: a square with a diamond, as on the website.
+/// The Stet mark: a square with a diamond, as on the website.
 pub const MARK: &str = "<svg class=\"mark\" viewBox=\"0 0 100 100\" aria-hidden=\"true\">\
      <rect class=\"ms\" width=\"100\" height=\"100\"/>\
      <rect class=\"md\" x=\"30\" y=\"30\" width=\"40\" height=\"40\" transform=\"rotate(45 50 50)\"/>\
@@ -865,7 +865,7 @@ pub fn document(frame: &Frame<'_>, page: &Page<'_>) -> String {
          <meta http-equiv=\"Content-Security-Policy\" content=\"{csp}\">\n\
          <meta name=\"referrer\" content=\"same-origin\">\n\
          <meta name=\"color-scheme\" content=\"light\">\n{refresh}\
-         <title>{title} \u{b7} Pragmatic</title>\n\
+         <title>{title} \u{b7} Stet</title>\n\
          <link rel=\"icon\" type=\"image/svg+xml\" href=\"{FAVICON}\">\n\
          <style>{css}</style>\n</head>\n<body class=\"{class}\">\n{skip}{mast}\n\
          <main id=\"main\" tabindex=\"-1\">\n{main}\n</main>\n\
@@ -914,17 +914,17 @@ impl<'a> Crumb<'a> {
 }
 
 /// The masthead, as on the website: the mark and wordmark (linked to
-/// `home` when given), the breadcrumb after it (`Pragmatic / journals /
+/// `home` when given), the breadcrumb after it (`Stet / journals /
 /// refund-20417`), and `right` (escaped HTML) at the far end. The last
 /// crumb is the current page; the ones before it drop away on a narrow
 /// screen. A top-level page has no crumbs: its navigation says where it is.
 pub fn masthead(home: Option<&str>, crumbs: &[Crumb<'_>], right: &str) -> String {
     let brand = match home {
         Some(h) => format!(
-            "<a class=\"brand\" href=\"{}\">{MARK}<span>Pragmatic</span></a>",
+            "<a class=\"brand\" href=\"{}\">{MARK}<span>Stet</span></a>",
             esc(h)
         ),
-        None => format!("<span class=\"brand\">{MARK}<span>Pragmatic</span></span>"),
+        None => format!("<span class=\"brand\">{MARK}<span>Stet</span></span>"),
     };
     let mut trail = String::new();
     for (i, c) in crumbs.iter().enumerate() {

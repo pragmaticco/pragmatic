@@ -55,7 +55,7 @@ const ROW_BYTES: usize = 2048;
 const JUMPS: usize = 8;
 
 /// Content shown in place of each present slot's content, for a viewer
-/// who may not see it raw (Pragmatic Server's redaction for tokens without
+/// who may not see it raw (Stet Server's redaction for tokens without
 /// `view_raw`). It sees every slot's bytes and returns what to show; refs
 /// resolve to their target's content first, so a repeated message is
 /// filtered the same way wherever it appears.
@@ -68,7 +68,7 @@ impl std::fmt::Debug for SlotFilter<'_> {
     }
 }
 
-/// What Pragmatic Server adds to a run's page.
+/// What Stet Server adds to a run's page.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ServerRun<'a> {
     /// The run's status: `active`, `idle`, `dangling`, `regressed` or
@@ -101,7 +101,7 @@ pub struct RunView<'a> {
     /// backend's `verify`, which reads past corruption).
     pub report: &'a VerifyReport,
     /// Anchoring status, when the page is served by something that knows
-    /// it (Pragmatic Server).
+    /// it (Stet Server).
     pub anchor: Option<&'a AnchorStatus>,
     /// Where the run lives (a directory, a server), for the Run card and
     /// the commands that check it.
@@ -118,7 +118,7 @@ pub struct RunView<'a> {
     /// What to show in place of slot content, when the viewer may not see
     /// it raw.
     pub filter: Option<SlotFilter<'a>>,
-    /// Pragmatic Server's additions.
+    /// Stet Server's additions.
     pub server: Option<ServerRun<'a>>,
     /// When a file was exported (RFC 3339), for its footer.
     pub exported: Option<&'a str>,
@@ -228,7 +228,7 @@ pub fn render_run_page(view: &RunView<'_>) -> RunPage {
         chain_foot(view.report, j)
     ));
     main.push_str("<aside class=\"side\" aria-label=\"About this run\">");
-    // Anchoring is Pragmatic Server's: a local journal has none, and its
+    // Anchoring is Stet Server's: a local journal has none, and its
     // page says nothing about it rather than something negative.
     if view.server.is_some() || view.anchor.is_some() {
         main.push_str(&anchor_card(view.anchor, j.len()));
@@ -250,7 +250,7 @@ pub fn render_run_page(view: &RunView<'_>) -> RunPage {
         ..Frame::FILE
     };
     let frame = view.frame.unwrap_or(&file_frame);
-    // Pragmatic Server: Runs / refund-20417. A directory of journals:
+    // Stet Server: Runs / refund-20417. A directory of journals:
     // journals / refund-20417.
     let up = if view.server.is_some() {
         Some(Crumb::word("Runs", frame.home))
@@ -633,7 +633,7 @@ fn span(t: &Totals) -> String {
 fn state_line(view: &RunView<'_>, facts: &Facts, t: &Totals) -> String {
     let j = view.journal;
     if j.format() == 1 {
-        return "A format 1 journal from Pragmatic 0.4 or 0.5: it can be verified and \
+        return "A format 1 journal from Stet 0.4 or 0.5: it can be verified and \
                 exported, not run, resumed or replayed."
             .to_string();
     }
@@ -1063,7 +1063,7 @@ fn entry_section(ctx: &Ctx<'_>, e: &Entry) -> String {
 }
 
 /// What a viewer without `view_raw` sees in place of a personal field, as
-/// Pragmatic Server's access log shows it.
+/// Stet Server's access log shows it.
 const WITHHELD: &str = "[withheld]";
 
 /// An attempt note's data with its `principal` and `host` withheld, or
@@ -1172,7 +1172,7 @@ fn chain_foot(report: &VerifyReport, j: &Journal) -> String {
     )
 }
 
-/// The Anchoring card, on Pragmatic Server.
+/// The Anchoring card, on Stet Server.
 pub(crate) fn anchor_card(anchor: Option<&AnchorStatus>, entries: u64) -> String {
     let caveat = "<p class=\"note\">An anchor proves these entries existed by then, not that \
                   they were true.</p>";

@@ -301,7 +301,7 @@ impl<F: Future> Future for JoinAll<F> {
     }
 }
 
-/// The async Pragmatic runtime. Same storage, journals, and guarantees as
+/// The async Stet runtime. Same storage, journals, and guarantees as
 /// [`Runtime`](crate::Runtime); agents are `async` functions over
 /// [`AsyncCtx`].
 pub struct AsyncRuntime<O> {

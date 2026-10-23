@@ -1,6 +1,6 @@
 [package]
 name = "pragmatic-openai"
-description = "OpenAI-compatible Chat Completions adapter for the Pragmatic durable-execution runtime: any /v1/chat/completions server as a journaled Oracle."
+description = "OpenAI-compatible Chat Completions adapter for the Stet durable-execution runtime: any /v1/chat/completions server as a journaled Oracle."
 keywords = ["openai", "llm", "agents", "durable-execution", "ollama"]
 categories = ["api-bindings"]
 version.workspace = true

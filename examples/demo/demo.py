@@ -1,8 +1,8 @@
-"""The Pragmatic demo: the whole product story, told step by step.
+"""The Stet demo: the whole product story, told step by step.
 
 Start it with ``examples/demo/run.sh``, which builds what it needs first.
 It runs the same steps as the end-to-end suite (``tests/e2e``), against a
-real Pragmatic Server on this machine, and keeps what it made (the
+real Stet Server on this machine, and keeps what it made (the
 server's data, the evidence and the auditor's report) in a folder it names
 at the end.
 
@@ -35,8 +35,8 @@ except ImportError as e:
     sys.exit(2)
 
 INTRO = """\
-Pragmatic: the system of record for AI agents
-=============================================
+Stet: the system of record for AI agents
+========================================
 
 You are about to watch a customer support agent, built on Claude and GPT,
 refund a damaged order while we crash it, erase a customer's data, audit
@@ -48,7 +48,7 @@ authorities are started here too. Every check you see is a real one."""
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="The Pragmatic demo.")
+    p = argparse.ArgumentParser(description="The Stet demo.")
     p.add_argument("--open", action="store_true", help="open the auditor's report at the end")
     p.add_argument("--keep-running", action="store_true", help="leave the server running until Ctrl-C")
     args = p.parse_args()

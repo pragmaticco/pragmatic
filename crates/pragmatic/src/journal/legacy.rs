@@ -1,4 +1,4 @@
-//! Read-only support for format 1 journals (Pragmatic 0.4 and 0.5, spec
+//! Read-only support for format 1 journals (Stet 0.4 and 0.5, spec
 //! 2.16).
 //!
 //! Format 1 is a 12-byte header (`PRAGJRNL`, version 1) and frames of

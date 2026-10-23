@@ -1,8 +1,8 @@
-//! The **Journal**: Pragmatic's append-only, hash-chained record of what an
+//! The **Journal**: Stet's append-only, hash-chained record of what an
 //! agent did (journal format 2, spec section 2).
 //!
 //! Every model call, tool call, channel receive, random draw and clock read
-//! made through Pragmatic is appended as an [`Entry`] before its result
+//! made through Stet is appended as an [`Entry`] before its result
 //! reaches the agent. The journal is the system of record: it is replayed to
 //! recover a crashed run without repeating work, and it is verified by
 //! parties who do not trust whoever stored it.
@@ -121,7 +121,7 @@ pub const DEDUP_MIN_BYTES: usize = 256;
 
 /// The longest run id (spec 2.15).
 pub const MAX_RUN_ID_LEN: usize = 200;
-/// Run ids starting with this prefix are reserved for Pragmatic itself.
+/// Run ids starting with this prefix are reserved for Stet itself.
 pub const RESERVED_RUN_ID_PREFIX: &str = "pragmatic:";
 
 /// The message of the fault raised when a format 1 journal is opened for
@@ -440,7 +440,7 @@ pub struct VerifyReport {
     /// The first cursor whose chain link, commitment or ref fails.
     pub first_bad: Option<Cursor>,
     /// Erased slots that no later `erasure` note lists: erasure by a tool
-    /// that bypassed Pragmatic, or bit rot.
+    /// that bypassed Stet, or bit rot.
     pub unaccounted_erasures: Vec<(Cursor, u8)>,
     /// Slots an `erasure` note lists that still hold content. Erasing them
     /// again repairs this.

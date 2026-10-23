@@ -98,7 +98,7 @@ impl ConsoleRenderer for ConsoleUi {
                 };
                 let view = RunView {
                     anchor: *anchor,
-                    source: Some("Pragmatic Server"),
+                    source: Some("Stet Server"),
                     from: *from,
                     page_link: Some(&link),
                     frame: Some(&frame),
@@ -345,10 +345,10 @@ fn sign_in(error: Option<&str>, note: Option<&str>, licensee: &str, csrf: &str) 
     };
     main.push_str(&format!(
         "<section class=\"solo w420\" aria-labelledby=\"sign-in\">\
-         <div class=\"lockup\">{MARK}<span>Pragmatic</span></div>\
+         <div class=\"lockup\">{MARK}<span>Stet</span></div>\
          <p class=\"lockup-sub\">Server console</p>\
          <h1 class=\"title\" id=\"sign-in\">Sign in</h1>\
-         <p class=\"lede\">Sign in with a Pragmatic Server token. It is exchanged for a session \
+         <p class=\"lede\">Sign in with a Stet Server token. It is exchanged for a session \
          that ends after 15 minutes without a request, or 12 hours after sign-in. The browser \
          does not keep the token. Every sign-in and sign-out is in the access log.</p>\
          <form method=\"post\" action=\"/console/sign-in\" class=\"fields\">{}{err}\

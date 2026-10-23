@@ -280,7 +280,7 @@ pub fn journal_info<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let bytes = data.as_bytes();
     if bytes.len() < 12 || &bytes[..8] != pragmatic_rt::journal::MAGIC {
-        return Err(PyValueError::new_err("not a Pragmatic journal (bad magic)"));
+        return Err(PyValueError::new_err("not a Stet journal (bad magic)"));
     }
     let format = u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes"));
     let flags = bytes

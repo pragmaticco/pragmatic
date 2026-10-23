@@ -1,8 +1,8 @@
 //! # pragmatic-console
 //!
-//! The views of Pragmatic's system of record: HTML pages of runs and
+//! The views of Stet's system of record: HTML pages of runs and
 //! evidence bundles, and CSV of a bundle's records. The CLI uses them for
-//! `export`, `serve` and `render-evidence`, and Pragmatic Server's console
+//! `export`, `serve` and `render-evidence`, and Stet Server's console
 //! renders the same pages, so a run looks the same wherever it is read.
 //!
 //! - [`render_run`]: one run's page. The run sheet holds the run's title,
@@ -17,7 +17,7 @@
 //! - [`render_csv`]: a bundle's records for spreadsheets.
 //! - [`text`]: the one-line labels and summaries the CLI prints.
 //! - [`html`]: the frame, stylesheet and parts every page shares, which
-//!   Pragmatic Server's other console pages use too.
+//!   Stet Server's other console pages use too.
 //!
 //! The pages share the website's design: warm paper and ink, EB Garamond
 //! for words and IBM Plex Mono for data, the brand's diamond as the only

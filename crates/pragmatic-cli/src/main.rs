@@ -1,4 +1,4 @@
-//! `pragmatic`: tooling for Pragmatic journals and evidence bundles.
+//! `pragmatic`: tooling for Stet journals and evidence bundles.
 //!
 //! ```text
 //! pragmatic runs             list runs and their status
@@ -62,7 +62,7 @@ fn serve(args: &Args) -> Result<(), Failure> {
     serve::serve(args.dir(), key, port).map_err(Failure::Error)
 }
 
-const HELP: &str = "pragmatic - tooling for Pragmatic journals and evidence bundles
+const HELP: &str = "pragmatic - tooling for Stet journals and evidence bundles
 
 USAGE:
     pragmatic runs    [--dir DIR]

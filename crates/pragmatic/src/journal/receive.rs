@@ -3,7 +3,7 @@
 //!
 //! # Receiving frames
 //!
-//! Pragmatic Server stores frames that an SDK encoded, salted and hashed. A
+//! Stet Server stores frames that an SDK encoded, salted and hashed. A
 //! server that stored whatever bytes it was sent would turn every client bug
 //! (or every hostile agent) into a journal that no longer reads back, so
 //! [`Journal::append_frames`] holds received frames to the rules a reader

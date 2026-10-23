@@ -1,4 +1,4 @@
-// pragmatic.hpp - C++17 binding for the Pragmatic durable-execution runtime.
+// pragmatic.hpp - C++17 binding for the Stet durable-execution runtime.
 //
 // Header-only RAII wrapper over the C ABI (crates/pragmatic-ffi,
 // include/pragmatic.h). Link against libpragmatic_ffi.
@@ -202,7 +202,7 @@ private:
     PragCtx* raw_;
 };
 
-/// The Pragmatic runtime: journals every step an agent takes under a stable
+/// The Stet runtime: journals every step an agent takes under a stable
 /// run id, so it survives any crash and replays exactly.
 class Runtime {
 public:

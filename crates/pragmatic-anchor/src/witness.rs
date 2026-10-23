@@ -30,7 +30,7 @@
 //! then returns its `cosignature/v1` line: an Ed25519 signature over
 //! `"cosignature/v1\ntime <unix>\n" ‖ checkpoint body`.
 //!
-//! # Witness mode in Pragmatic Server
+//! # Witness mode in Stet Server
 //!
 //! Each origin is configured with the log's public key and bound to the
 //! `witness_client` token that may submit for it; the origin always comes
@@ -49,7 +49,7 @@
 //!
 //! The checks and the cosigning key live in [`WitnessCore`], apart from
 //! the journal, so a store that keeps the record elsewhere runs exactly
-//! the same protocol: Pragmatic Server keeps one record per origin in its
+//! the same protocol: Stet Server keeps one record per origin in its
 //! run store, under that run's lock (design 4.8).
 
 use std::collections::HashMap;
@@ -183,7 +183,7 @@ pub struct WitnessConfig {
     /// Who runs it, canonicalized; defaults to the key name. Never empty,
     /// so a configured witness always counts towards independence.
     pub operator: String,
-    /// A bearer token, if the witness requires one (a Pragmatic Server in
+    /// A bearer token, if the witness requires one (a Stet Server in
     /// witness mode does).
     pub token: Option<String>,
 }
@@ -683,7 +683,7 @@ pub struct Refused {
 /// where the witness keeps its record.
 ///
 /// The anchoring library's own [`WitnessService`] keeps every origin's
-/// record in one journal file; Pragmatic Server keeps one record per
+/// record in one journal file; Stet Server keeps one record per
 /// origin in its run store (design 4.8). Both run the same checks in the
 /// same order through this type:
 ///

@@ -1,7 +1,7 @@
-//! The format 1 journal written by Pragmatic 0.4 and 0.5, kept as a writer
+//! The format 1 journal written by Stet 0.4 and 0.5, kept as a writer
 //! of test fixtures only.
 //!
-//! Pragmatic 0.6 reads format 1 files read-only through
+//! Stet 0.6 reads format 1 files read-only through
 //! [`crate::journal::Journal::parse`]; nothing records into this format any
 //! more. The module is compiled for the crate's own tests and under the
 //! `testing` feature, so test suites can build the 0.4 and 0.5 journals the

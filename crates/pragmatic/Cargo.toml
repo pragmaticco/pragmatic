@@ -1,6 +1,6 @@
 [package]
 name = "pragmatic"
-description = "Durable execution for agents that don't run deterministically. Journals every step an agent takes, so it survives any crash and replays exactly - nondeterministic model behavior included."
+description = "The Stet runtime: durable execution for agents that don't run deterministically. Journals every step an agent takes, so it survives any crash and replays exactly - nondeterministic model behavior included."
 keywords = ["agents", "llm", "durable-execution", "replay", "crash-recovery"]
 categories = ["asynchronous", "development-tools"]
 version.workspace = true

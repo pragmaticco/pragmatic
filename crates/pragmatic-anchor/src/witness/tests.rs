@@ -503,7 +503,7 @@ fn a_damaged_witness_journal_is_refused() {
 }
 
 /// The protocol's state checks run apart from any journal: a store that
-/// keeps the record elsewhere (Pragmatic Server's run store) gets the
+/// keeps the record elsewhere (Stet Server's run store) gets the
 /// same answers, the fork attempt to record, and a cosigned note any
 /// auditor can verify with the witness's vkey.
 #[test]

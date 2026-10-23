@@ -1,6 +1,6 @@
 //! Evidence bundles (design section 5): one run's journal, packaged so a
-//! party who trusts neither the agent's operator nor Pragmatic can check
-//! it offline against trust roots of their own choosing.
+//! party who trusts neither the agent's operator nor Pragmatic Research
+//! can check it offline against trust roots of their own choosing.
 //!
 //! A bundle is one strict JSON file. It carries the journal bytes (with
 //! some slots possibly withheld for privacy), the same journal decoded as

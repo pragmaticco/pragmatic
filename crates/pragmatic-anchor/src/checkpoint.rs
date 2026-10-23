@@ -12,7 +12,7 @@
 //! id>` ([`origin_for`]), and its key id is `SHA-256(name ‖ 0x0A ‖ 0x01 ‖
 //! public key)[:4]`, the signed-note recommendation, so Go's `sumdb/note`,
 //! Sigstore tooling and the public witness network can all verify
-//! Pragmatic checkpoints with a standard vkey.
+//! Stet checkpoints with a standard vkey.
 //!
 //! # Origins are unique
 //!
@@ -54,7 +54,7 @@ const SKEY_PREFIX: &str = "PRIVATE+KEY+";
 /// Hex digits of the log id at the end of an origin.
 const LOG_ID_HEX_LEN: usize = 16;
 
-/// The origin of a new Pragmatic Server log: `pragmatic/<server name>/<log
+/// The origin of a new Stet Server log: `pragmatic/<server name>/<log
 /// id>`, where the log id is the first 8 bytes of SHA-256 of the log's
 /// first public key, as 16 lowercase hex digits. See the module
 /// documentation for why the origin is not just the server name.

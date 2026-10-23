@@ -1,4 +1,4 @@
-// pragmatic.js - Node.js binding for the Pragmatic durable-execution runtime.
+// pragmatic.js - Node.js binding for the Stet durable-execution runtime.
 //
 // Binds the C ABI (crates/pragmatic-ffi) through koffi (Node has no built-in
 // FFI). Build the library first: cargo build -p pragmatic-ffi. Point the
@@ -255,7 +255,7 @@ function readReport(raw) {
 }
 
 /**
- * The Pragmatic runtime: journals every step an agent takes under a stable
+ * The Stet runtime: journals every step an agent takes under a stable
  * run id, so it survives any crash and replays exactly.
  */
 class Runtime {

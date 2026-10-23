@@ -1,6 +1,6 @@
-//! # pragmatic-anchor: anchoring for Pragmatic Server
+//! # pragmatic-anchor: anchoring for Stet Server
 //!
-//! Pragmatic Server keeps every run's journal tamper-evident on its own; an
+//! Stet Server keeps every run's journal tamper-evident on its own; an
 //! *anchor* makes it tamper-evident against the server's operator too. This
 //! crate is the anchoring library the server calls (design sections 4.7 and
 //! 4.8):
@@ -35,7 +35,7 @@
 //!
 //! # License
 //!
-//! This crate is part of Pragmatic's commercial layer. Its source is public
+//! This crate is part of Stet's commercial layer. Its source is public
 //! under the Business Source License 1.1 (see `LICENSE` in this directory):
 //! non-production use is free; production use needs a commercial license
 //! from Pragmatic Research, Inc. Each version becomes Apache-2.0 four years

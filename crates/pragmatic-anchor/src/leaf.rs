@@ -10,7 +10,7 @@
 //! Integers are little-endian, like every integer in journal format 2. The
 //! Merkle leaf hash is the RFC 6962 one, `SHA-256(0x00 ‖ leaf_data)`
 //! ([`pragmatic::merkle::leaf_hash`]), so the domain prefix inside the
-//! data separates Pragmatic leaves from any other log's, and the `0x00`
+//! data separates Stet leaves from any other log's, and the `0x00`
 //! separates leaves from interior nodes.
 //!
 //! `prev_leaf_index` links a run's leaves into a chain. An evidence bundle

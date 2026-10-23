@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# The Pragmatic demo, in one command:
+# The Stet demo, in one command:
 #
 #   examples/demo/run.sh            # add --open to open the auditor's report at the end
 #
 # It checks for the free developer tools it needs (Rust, Python 3.10 or
 # later, OpenSSL 3) and says how to install any that are missing, builds
-# Pragmatic from this checkout, then tells the whole product story step by
+# Stet from this checkout, then tells the whole product story step by
 # step. See README.md next to this file.
 set -euo pipefail
 
@@ -32,7 +32,7 @@ else
   # The workspace needs Rust 1.89 or later.
   rust_minor="$(rustc --version 2>/dev/null | sed -E 's/^rustc 1\.([0-9]+).*/\1/')"
   if [[ -n "$rust_minor" && "$rust_minor" =~ ^[0-9]+$ && "$rust_minor" -lt 89 ]]; then
-    echo "Rust $(rustc --version | cut -d' ' -f2) is too old for Pragmatic (1.89 or later)."
+    echo "Rust $(rustc --version | cut -d' ' -f2) is too old for Stet (1.89 or later)."
     echo "Update it with:  rustup update   (or, if Homebrew installed it: brew upgrade rust)"
     exit 1
   fi
@@ -95,7 +95,7 @@ step() {
   fi
 }
 
-echo "Preparing the demo. The first run builds Pragmatic from source, which takes"
+echo "Preparing the demo. The first run builds Stet from source, which takes"
 echo "a few minutes and downloads its dependencies; later runs start in seconds."
 if ! python_ok "$VENV/bin/python"; then
   step "creating a Python environment" "$PYTHON" -m venv --clear "$VENV"
@@ -108,15 +108,15 @@ step "installing the Anthropic and OpenAI SDKs" \
 # hidden, and iCloud Drive marks every file of a virtual environment hidden
 # when the checkout is in Desktop or Documents.
 WHEELS="$(mktemp -d -t pragmatic-demo-wheels.XXXXXX)"
-step "building the Pragmatic Python SDK" \
+step "building the Stet Python SDK" \
   "$VENV/bin/maturin" build --quiet --manifest-path "$ROOT/crates/pragmatic-python/Cargo.toml" \
   --interpreter "$VENV/bin/python" --out "$WHEELS"
 wheel=("$WHEELS"/*.whl)
-step "installing the Pragmatic Python SDK" \
+step "installing the Stet Python SDK" \
   "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check \
   --force-reinstall --no-deps "${wheel[0]}"
 rm -rf "$WHEELS"
-step "building Pragmatic Server and the pragmatic CLI" \
+step "building Stet Server and the pragmatic CLI" \
   cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p pragmatic-server -p pragmatic-cli
 rm -f "$LOG"
 echo

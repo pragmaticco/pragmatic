@@ -1,7 +1,7 @@
 //! Detect and redact personal data and secrets in free text.
 //!
 //! Journals hold whatever agents saw and said: prompts, completions, tool
-//! inputs and outputs. Pragmatic Server shows that content to auditors and
+//! inputs and outputs. Stet Server shows that content to auditors and
 //! operators who are not entitled to the personal data or credentials in
 //! it, so content is served through [`redact`] unless the viewer may see it
 //! raw. Redaction is a view, never a write: the journal keeps the original

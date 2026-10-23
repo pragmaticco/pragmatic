@@ -5,7 +5,7 @@
 //! else, so the fonts the crate bundles travel with the page: inlined as
 //! `data:` URIs in a single-file page (an exported run, an evidence
 //! report), or served from the console's own origin with a year-long
-//! immutable cache (Pragmatic Server and `pragmatic serve`, whose policy
+//! immutable cache (Stet Server and `pragmatic serve`, whose policy
 //! then allows `font-src 'self'`).
 //!
 //! The crate bundles all four faces the design uses, as unmodified Latin

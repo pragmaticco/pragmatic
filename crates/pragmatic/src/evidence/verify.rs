@@ -71,8 +71,9 @@ pub struct TsaRoot {
 
 /// A pinned witness key and the operator it counts for. A key may carry a
 /// validity window (Unix seconds): a cosignature timestamped outside it is
-/// not trusted. The hosted Pragmatic Witness keys built into the CLI use
-/// windows; keys given on the command line normally do not.
+/// not trusted. The keys of the hosted witness that Pragmatic Research
+/// runs, built into the CLI, use windows; keys given on the command line
+/// normally do not.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WitnessKey {
     pub operator: String,

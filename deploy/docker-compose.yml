@@ -1,4 +1,4 @@
-# Pragmatic Server with Docker Compose (design 4.15).
+# Stet Server with Docker Compose (design 4.15).
 #
 #   1. Write a configuration next to this file, starting from
 #      pragmatic.example.toml:

@@ -1,6 +1,6 @@
-/* pragmatic.h - C ABI for the Pragmatic durable-execution runtime.
+/* pragmatic.h - C ABI for the Stet durable-execution runtime.
  *
- * Pragmatic journals every step an agent takes (model calls, effects,
+ * Stet journals every step an agent takes (model calls, effects,
  * receives, clock reads) to an append-only hash-chained log, so a run
  * survives any crash and replays exactly - nondeterministic model behavior
  * included.

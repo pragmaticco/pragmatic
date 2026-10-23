@@ -1,7 +1,7 @@
 //! RFC 6962 Merkle trees over SHA-256: roots, inclusion proofs and
 //! consistency proofs.
 //!
-//! Pragmatic Server anchors many journals at once by building a Merkle tree
+//! Stet Server anchors many journals at once by building a Merkle tree
 //! whose leaves commit to each run's head, then timestamping only the root.
 //! An evidence bundle then carries one leaf plus its audit path, and anyone
 //! can check that the run was part of the anchored batch without seeing the

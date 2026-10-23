@@ -1,7 +1,7 @@
 //! Anchor log leaves and the logs an auditor checks a bundle against
 //! (design 4.7 and 5.3 step 11).
 //!
-//! Pragmatic Server keeps one append-only RFC 6962 Merkle log. Each leaf
+//! Stet Server keeps one append-only RFC 6962 Merkle log. Each leaf
 //! commits to one run's (or the access log's) journal prefix:
 //!
 //! ```text

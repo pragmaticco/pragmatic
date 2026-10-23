@@ -1,6 +1,6 @@
 """``python -m pragmatic push DIR [RUN ... | --all] [--url URL]``
 
-Uploads local journals to a Pragmatic Server (spec 6.7). The server URL
+Uploads local journals to a Stet Server (spec 6.7). The server URL
 comes from ``--url`` or ``PRAGMATIC_URL`` and the token from
 ``PRAGMATIC_TOKEN`` (never from the command line, where other users of the
 machine can read it).
@@ -95,7 +95,7 @@ def push(directory: str, run_ids: Sequence[str], store: ServerStore, out=sys.std
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m pragmatic")
     sub = parser.add_subparsers(dest="command", required=True)
-    p = sub.add_parser("push", help="upload local journals to a Pragmatic Server")
+    p = sub.add_parser("push", help="upload local journals to a Stet Server")
     p.add_argument("dir", help="the journal directory")
     p.add_argument("runs", nargs="*", help="run ids to push")
     p.add_argument("--all", action="store_true", help="push every run in the directory")

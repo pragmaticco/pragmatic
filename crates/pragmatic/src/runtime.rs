@@ -299,7 +299,7 @@ impl OwnedAttempt {
 
 static REFUSING: RefusingOracle = RefusingOracle;
 
-/// The Pragmatic runtime: owns the oracle (your model client) and the
+/// The Stet runtime: owns the oracle (your model client) and the
 /// backend the journals of every run live in.
 pub struct Runtime<O> {
     oracle: O,

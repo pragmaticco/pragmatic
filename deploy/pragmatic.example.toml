@@ -1,4 +1,4 @@
-# Pragmatic Server configuration.
+# Stet Server configuration.
 #
 # Every key is shown with its default unless the comment says otherwise.
 # Unknown keys are refused at startup, so a typo cannot silently fall back
@@ -75,8 +75,8 @@ tsa = [
   { url = "http://timestamp.sectigo.com", operator = "sectigo", name = "Sectigo", roots_pem = "/etc/pragmatic/tsa-roots/sectigo.pem" },
 ]
 # C2SP tlog-witness cosigners, configured by their cosignature/v1 vkey, for
-# example another Pragmatic Server in witness mode or the hosted Pragmatic
-# Witness. operator = "" counts the witness under its key name.
+# example another Stet Server in witness mode or the hosted witness that
+# Pragmatic Research runs. operator = "" counts the witness under its key name.
 # witness = [ { url = "https://witness.example", vkey = "witness.example+<key id>+<base64>", operator = "example", token_file = "/etc/pragmatic/witness.token" } ]
 witness = []
 allow_self_anchoring = false

@@ -1,4 +1,4 @@
-"""``ServerStore``: journals on a Pragmatic Server (spec 4.4 to 4.6, 6.3).
+"""``ServerStore``: journals on a Stet Server (spec 4.4 to 4.6, 6.3).
 
 Standard library only. The store speaks the server's HTTP API v1:
 
@@ -210,7 +210,7 @@ def _frames(frames: bytes) -> List[Tuple[int, int]]:
 
 
 class ServerStore:
-    """Runs on a Pragmatic Server. See the module documentation.
+    """Runs on a Stet Server. See the module documentation.
 
     ``ServerStore(url, token, *, timeout=30.0, ssl_context=None)``;
     ``ssl_context`` verifies a server whose certificate a private CA issued

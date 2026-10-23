@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reference verifier for Pragmatic evidence bundles (pragmatic-evidence/1).
+"""Reference verifier for Stet evidence bundles (pragmatic-evidence/1).
 
     python3 verify_evidence.py BUNDLE [--tsa-roots OPERATOR=PEM]...
         [--witness-key OPERATOR=VKEY]... [--log-key VKEY]...
@@ -9,7 +9,7 @@ An independent implementation of the checks in docs/evidence-format.md,
 using only the Python standard library and the `openssl` command (for RFC
 3161 time-stamp tokens). It reimplements journal format 2 parsing, strict
 DER, Merkle proofs, C2SP signed notes and Ed25519 verification (RFC 8032,
-in pure Python) from the specifications rather than calling Pragmatic, so a
+in pure Python) from the specifications rather than calling Stet, so a
 bundle that passes both this and `pragmatic verify-evidence` has been
 checked by two programs that share no code.
 
@@ -546,7 +546,7 @@ def commitment(salt, content):
 def parse_journal(data):
     """Return (entries, heads) where heads[n] is the head after n entries."""
     if len(data) < 12 or data[:8] != b"PRAGJRNL":
-        raise Invalid("journal_parse", "not a Pragmatic journal (bad magic)")
+        raise Invalid("journal_parse", "not a Stet journal (bad magic)")
     version = int.from_bytes(data[8:12], "little")
     if version == 1:
         raise Invalid("journal_format", "evidence journals are format 2; this one is format 1")

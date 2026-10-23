@@ -1,4 +1,4 @@
-"""An in-process stand-in for Pragmatic Server, for the ServerStore tests.
+"""An in-process stand-in for Stet Server, for the ServerStore tests.
 
 It implements the parts of the HTTP API v1 (spec 4.4 to 4.6) the Python
 client relies on: info and whoami, run creation with a lease, lease

@@ -16,7 +16,7 @@ paid for) is written to ``model-calls.jsonl``. Every perform of the refund
 tool is written to ``tool-calls.jsonl``, and every refund the provider
 issues to ``payments.jsonl``: the story counts all three across processes.
 
-Run as a program, it is one process of the story, talking to Pragmatic
+Run as a program, it is one process of the story, talking to Stet
 Server through ``PRAGMATIC_URL`` and ``PRAGMATIC_TOKEN``:
 
     python support_agent.py MODE RUN_ID WORK [--crash-in-refund] [--gate CALL:NAME]

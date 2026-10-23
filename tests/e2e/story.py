@@ -1,7 +1,7 @@
 """The whole product story, end to end, against real processes.
 
 A support agent built on the Anthropic and OpenAI SDKs refunds a damaged
-order through Pragmatic Server. Its process dies in the middle of the
+order through Stet Server. Its process dies in the middle of the
 refund; a second process resumes the run without paying for a model call
 twice or refunding twice, and a third is turned away while the second
 holds the run. Two independent time-stamping authorities anchor the
@@ -272,7 +272,7 @@ class Story:
         self.n.step(
             1,
             "Two independent timestamp authorities",
-            "A record is only as trustworthy as the outsiders who vouch for it. Pragmatic "
+            "A record is only as trustworthy as the outsiders who vouch for it. Stet "
             "Server asks independent timestamp authorities (the same kind of service that "
             "timestamps signed software and legal documents) to countersign its records. "
             "Here we start two of them on this machine, standing in for two different "
@@ -302,7 +302,7 @@ class Story:
     def step2_server(self) -> None:
         self.n.step(
             2,
-            "Pragmatic Server starts, with tokens for each role",
+            "Stet Server starts, with tokens for each role",
             "The server is the system of record: every step an agent takes is stored "
             "there, in order, chained by hashes so that nothing can be changed or "
             "removed without it showing. Each person or program gets a token that says "

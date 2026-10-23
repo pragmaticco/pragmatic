@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-auditor_verify.py - offline verification of a Pragmatic anchor evidence bundle.
+auditor_verify.py - offline verification of a Stet anchor evidence bundle.
 Needs only: python3 (stdlib) + openssl >= 3.0. No network access.
 
   python3 auditor_verify.py <bundle_dir> <trust_dir> [--min-tsa 2]

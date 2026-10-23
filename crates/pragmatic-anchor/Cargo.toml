@@ -1,6 +1,6 @@
 [package]
 name = "pragmatic-anchor"
-description = "Anchoring for Pragmatic Server: the cumulative RFC 6962 anchor log, C2SP checkpoints, RFC 3161 time-stamps and tlog-witness cosigning."
+description = "Anchoring for Stet Server: the cumulative RFC 6962 anchor log, C2SP checkpoints, RFC 3161 time-stamps and tlog-witness cosigning."
 keywords = ["transparency-log", "rfc3161", "merkle", "witness", "anchoring"]
 categories = ["cryptography"]
 version.workspace = true
@@ -11,7 +11,7 @@ homepage.workspace = true
 authors.workspace = true
 # Part of the commercial layer (design section 1.5): the source is public
 # so auditors can read it, under the Business Source License 1.1 in this
-# directory's LICENSE file. It ships inside Pragmatic Server and is never
+# directory's LICENSE file. It ships inside Stet Server and is never
 # published to a registry, which also keeps it out of
 # `cargo publish --workspace`.
 license = "BUSL-1.1"

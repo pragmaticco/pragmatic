@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 merkle_ref.py - RFC 6962 / RFC 9162 Merkle tree hashing, inclusion and
-consistency proofs, plus a Pragmatic leaf encoding with domain separation.
+consistency proofs, plus a Stet leaf encoding with domain separation.
 Zero dependencies. Template for the Rust port.
 
 Tree hashing (RFC 9162 2.1.1, identical to RFC 6962 2.1):
@@ -12,7 +12,7 @@ Tree hashing (RFC 9162 2.1.1, identical to RFC 6962 2.1):
                    = node(MTH(D[0:k]), MTH(D[k:n]))
   Odd tails are NOT duplicated (avoids the Bitcoin CVE-2012-2459 ambiguity).
 
-Pragmatic leaf_data (proposal, v1), fixed 96 bytes, no parsing ambiguity:
+Stet leaf_data (proposal, v1), fixed 96 bytes, no parsing ambiguity:
   domain   : 24 bytes  b"pragmatic/anchor-leaf/v1" (exactly 24 ASCII bytes)
   tenant   : 16 bytes  tenant/deployment id (UUID bytes)
   run_id   : 16 bytes  run UUID

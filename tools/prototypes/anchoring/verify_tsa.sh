@@ -1,6 +1,6 @@
 #!/bin/sh
 # verify_tsa.sh <bundle_dir> <trust_dir>
-# openssl-only verification of every RFC 3161 token in a Pragmatic anchor bundle.
+# openssl-only verification of every RFC 3161 token in a Stet anchor bundle.
 # trust_dir/<tsa>.pem = the ONE root the auditor pins for that TSA.
 set -eu
 B=$1; T=$2; OPENSSL=${OPENSSL:-openssl}

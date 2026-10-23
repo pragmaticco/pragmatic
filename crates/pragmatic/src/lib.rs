@@ -1,11 +1,11 @@
-//! # Pragmatic - durable execution for agents that don't run deterministically
+//! # Stet - durable execution for agents that don't run deterministically
 //!
 //! A zero-dependency Rust runtime that journals every step an agent takes, so
 //! it survives any crash and replays exactly - nondeterministic model
 //! behavior included.
 //!
 //! Every durable-execution engine assumes deterministic replay and hacks
-//! around LLMs by caching model outputs as opaque activities. Pragmatic
+//! around LLMs by caching model outputs as opaque activities. Stet
 //! models each LLM call as a first-class probability distribution (the
 //! [`Oracle`]) and journals every realized outcome to an append-only,
 //! hash-chained log (the [`Journal`]). Recovery becomes replay: read back
@@ -92,7 +92,7 @@
 //!
 //! ## Building blocks
 //!
-//! Self-contained, zero-dependency modules shared by the journal, Pragmatic
+//! Self-contained, zero-dependency modules shared by the journal, Stet
 //! Server and evidence verification:
 //!
 //! - [`merkle`]: RFC 6962 Merkle tree hashes, inclusion and consistency

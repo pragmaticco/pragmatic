@@ -1,6 +1,6 @@
 [package]
 name = "pragmatic-python"
-description = "Python bindings for the Pragmatic durable-execution runtime."
+description = "Python bindings for the Stet durable-execution runtime."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

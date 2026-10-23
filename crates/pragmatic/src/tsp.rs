@@ -1,7 +1,7 @@
 //! RFC 3161 Time-Stamp Protocol: build requests, parse responses and
 //! tokens. No signature verification.
 //!
-//! Pragmatic Server anchors each batch's Merkle root with one or more
+//! Stet Server anchors each batch's Merkle root with one or more
 //! public Time-Stamp Authorities, and evidence bundles carry the resulting
 //! tokens so an auditor can prove the journal existed no later than the
 //! TSA's clock says. This module covers the parts of that exchange that

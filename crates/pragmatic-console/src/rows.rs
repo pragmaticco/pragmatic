@@ -53,16 +53,16 @@ pub const SHOWN: usize = 5;
 pub enum Liveness {
     /// A local journal: nothing says whether a process still writes it.
     Unknown,
-    /// Pragmatic Server holds a live lease for it.
+    /// Stet Server holds a live lease for it.
     Running,
-    /// Pragmatic Server holds no lease and the run's last effect is open.
+    /// Stet Server holds no lease and the run's last effect is open.
     Dangling,
-    /// Pragmatic Server holds no lease.
+    /// Stet Server holds no lease.
     Stopped,
 }
 
 impl Liveness {
-    /// From a Pragmatic Server run status.
+    /// From a Stet Server run status.
     pub fn of_status(status: &str) -> Liveness {
         match status {
             "active" => Liveness::Running,
@@ -81,7 +81,7 @@ pub struct Attempt {
     pub at: u64,
     pub mode: String,
     pub pid: String,
-    /// The Pragmatic Server token that held the run's lease when the
+    /// The Stet Server token that held the run's lease when the
     /// attempt began, from the server's custody notes (empty for a local
     /// journal, or while the lease is still held). The SDK's own identity
     /// (principal and host) stays in the attempt's note.

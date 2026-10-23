@@ -1,4 +1,4 @@
-// Package pragmatic is the Go binding for the Pragmatic durable-execution
+// Package pragmatic is the Go binding for the Stet durable-execution
 // runtime: a journal of every step an agent takes (model calls, effects,
 // receives, clock reads), so a run survives any crash and replays exactly -
 // nondeterministic model behavior included.

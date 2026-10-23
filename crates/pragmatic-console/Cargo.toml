@@ -1,6 +1,6 @@
 [package]
 name = "pragmatic-console"
-description = "The Pragmatic console: HTML and CSV views of agent journals and evidence bundles, shared by the CLI and Pragmatic Server."
+description = "The Stet console: HTML and CSV views of agent journals and evidence bundles, shared by the CLI and Stet Server."
 keywords = ["agents", "llm", "audit", "journal", "evidence"]
 categories = ["development-tools", "visualization"]
 version.workspace = true

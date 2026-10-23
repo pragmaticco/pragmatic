@@ -3,13 +3,13 @@ name: Release
 # Tag a release (e.g. `git tag v0.3.0 && git push --tags`) to publish:
 #   - the publishable Rust crates to crates.io (dependency order handled by
 #     cargo; publish=false crates like pragmatic-ffi/-python are skipped).
-#     Pragmatic Server (crates/pragmatic-server) and its anchoring library
+#     Stet Server (crates/pragmatic-server) and its anchoring library
 #     (crates/pragmatic-anchor) are commercial software under the Business
 #     Source License and are never published to crates.io: they have
 #     publish = false, and the job below checks that before publishing
 #     anything. The server ships as a container image and binaries instead.
 #   - abi3 wheels + sdist for `pragmatic-runtime` to PyPI
-#   - the Pragmatic Server container image, built for every tag and pushed
+#   - the Stet Server container image, built for every tag and pushed
 #     only when a registry is configured (secrets below); never on its own
 #     from a branch
 #

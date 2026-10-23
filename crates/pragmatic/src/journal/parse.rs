@@ -193,7 +193,7 @@ fn parse_inner(
 ) -> Result<Lenient, JournalError> {
     if bytes.len() < legacy::HEADER_LEN || &bytes[..8] != MAGIC {
         return Err(JournalError::InvalidData(
-            "not a Pragmatic journal (bad magic)".into(),
+            "not a Stet journal (bad magic)".into(),
         ));
     }
     match u32::from_le_bytes(bytes[8..12].try_into().unwrap()) {

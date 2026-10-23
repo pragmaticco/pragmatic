@@ -659,7 +659,7 @@ fn pages_keep_to_their_budget() {
 }
 
 /// One intent with a great many results (a journal that passes audit, and
-/// one an agent token can write on Pragmatic Server): the intent's section
+/// one an agent token can write on Stet Server): the intent's section
 /// names its first few results and counts the rest, so every page keeps to
 /// its budget and the intent shares its page with its results.
 #[test]

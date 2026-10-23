@@ -1,6 +1,6 @@
 [package]
 name = "pragmatic-anthropic"
-description = "Anthropic Messages API adapter for the Pragmatic durable-execution runtime: Claude as a journaled Oracle."
+description = "Anthropic Messages API adapter for the Stet durable-execution runtime: Claude as a journaled Oracle."
 keywords = ["anthropic", "claude", "llm", "agents", "durable-execution"]
 categories = ["api-bindings"]
 version.workspace = true

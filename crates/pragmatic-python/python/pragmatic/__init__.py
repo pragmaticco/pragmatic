@@ -1,7 +1,7 @@
-"""Pragmatic: the system of record for AI agents.
+"""Stet: the system of record for AI agents.
 
 Every model call, tool call, channel receive, random draw and clock read an
-agent makes through Pragmatic is journaled to an append-only, hash-chained
+agent makes through Stet is journaled to an append-only, hash-chained
 log before its result reaches the agent. A crashed run resumes where it
 stopped without re-paying for a single token or repeating a tool call, and
 any run replays exactly for debugging and audit.

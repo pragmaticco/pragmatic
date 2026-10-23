@@ -1,4 +1,4 @@
-# Pragmatic Server as a systemd service (design 4.15).
+# Stet Server as a systemd service (design 4.15).
 #
 #   install -m 0755 pragmatic-server /usr/local/bin/
 #   useradd --system --home-dir /var/lib/pragmatic --shell /usr/sbin/nologin pragmatic
@@ -14,7 +14,7 @@
 # vkey auditors pin with `pragmatic verify-evidence --log-key`.
 
 [Unit]
-Description=Pragmatic Server
+Description=Stet Server
 Documentation=https://github.com/pragmaticco/pragmatic/blob/main/docs/server.md
 After=network-online.target
 Wants=network-online.target

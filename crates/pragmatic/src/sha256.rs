@@ -1,6 +1,6 @@
 //! SHA-256 and HMAC-SHA-256, implemented in-crate (FIPS 180-4 / RFC 2104).
 //!
-//! Pragmatic's Journal is a hash-chained, optionally keyed (HMAC) log. The core
+//! Stet's Journal is a hash-chained, optionally keyed (HMAC) log. The core
 //! crate is zero-dependency, so the hash lives here rather than pulling in a
 //! crypto crate. This is the standard SHA-256 compression function; test
 //! vectors from FIPS 180-4 are checked in the unit tests below.
