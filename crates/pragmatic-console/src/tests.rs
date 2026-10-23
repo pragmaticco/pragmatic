@@ -726,9 +726,11 @@ fn hostile_content_is_escaped_everywhere() {
     assert_only_own_markup(&page);
 }
 
-/// A journal with one entry of every kind the rows describe.
+/// A journal with one entry of every kind the rows describe, written on
+/// the day of its clock read (`AT`), whatever day the test runs.
 fn every_kind() -> Journal {
     let mut j = Journal::new(None);
+    j.set_clock(|| AT);
     j.append(
         META,
         Event::Note {
